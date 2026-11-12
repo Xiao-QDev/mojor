@@ -1,0 +1,34 @@
+// MCPE 0.14 的包 ID 为固定单字节 无 VarInt
+pub const LOGIN: u8 = 0x8f;
+pub const PLAY_STATUS: u8 = 0x90;
+pub const DISCONNECT: u8 = 0x91;
+pub const BATCH: u8 = 0x92;
+pub const TEXT: u8 = 0x93;
+pub const SET_TIME: u8 = 0x94;
+pub const START_GAME: u8 = 0x95;
+pub const ADD_PLAYER: u8 = 0x96;
+pub const REMOVE_PLAYER: u8 = 0x97;
+pub const REMOVE_ENTITY: u8 = 0x99;
+pub const ADD_ITEM_ENTITY: u8 = 0x9a;
+pub const TAKE_ITEM_ENTITY: u8 = 0x9b;
+pub const MOVE_ENTITY: u8 = 0x9c;
+pub const MOVE_PLAYER: u8 = 0x9d;
+pub const REMOVE_BLOCK: u8 = 0x9e;
+pub const UPDATE_BLOCK: u8 = 0x9f;
+pub const UPDATE_ATTRIBUTES: u8 = 0xa6;
+pub const USE_ITEM: u8 = 0xaa;
+pub const PLAYER_ACTION: u8 = 0xab;
+pub const SET_ENTITY_DATA: u8 = 0xad;
+pub const ANIMATE: u8 = 0xb2;
+pub const SET_SPAWN_POSITION: u8 = 0xb1;
+pub const RESPAWN: u8 = 0xb3;
+pub const ADVENTURE_SETTINGS: u8 = 0xbc;
+pub const FULL_CHUNK_DATA: u8 = 0xbf;
+pub const SET_DIFFICULTY: u8 = 0xc0;
+pub const SET_PLAYER_GAMETYPE: u8 = 0xc2;
+pub const CONTAINER_SET_CONTENT: u8 = 0xb9;
+pub const PLAYER_LIST: u8 = 0xc3;
+pub const REQUEST_CHUNK_RADIUS: u8 = 0xc8;
+pub const CHUNK_RADIUS_UPDATE: u8 = 0xc9;
+
+pub const CURRENT_PROTOCOL: i32 = 70;

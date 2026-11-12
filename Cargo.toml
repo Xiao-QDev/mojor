@@ -1,0 +1,15 @@
+[package]
+name = "mojor"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+bytes = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+crc32fast = "1"
+flate2 = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

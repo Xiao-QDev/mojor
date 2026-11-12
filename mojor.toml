@@ -1,0 +1,20 @@
+# 后台区块加载线程数 0 = 按可用逻辑处理器(vCPU)数 上限固定为该数
+io-workers = 0
+# tokio worker 线程数 0 = 按 vCPU 目前通过 TOKIO_WORKER_THREADS 环境变量生效
+tokio-workers = 0
+# 区块离开视野后再等多少个 tick 才卸载
+unload-delay-ticks = 40
+# 每 tick 最多卸载多少个区块 压住大批量卸载的抖动
+max-unload-per-tick = 96
+# 每 tick 最多编码写出多少个脏块 平滑大批量改动
+max-flush-per-tick = 16
+# 每多少个 tick 触发一次周期保存
+save-interval-ticks = 200
+# 后台刷盘间隔 秒
+sync-interval-secs = 12
+# 分片连续空闲多少个 tick 后上报回收
+idle-shutdown-ticks = 40
+# 是否开启加载圈预取
+prefetch-enabled = true
+# tracing 过滤表达式 如 mojor=debug,info
+log-level = "mojor=info"
