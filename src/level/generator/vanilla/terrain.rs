@@ -132,20 +132,8 @@ impl TerrainGenerator {
     }
 
     pub fn generate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
-        self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
-        let base_x = chunk_x * 16;
-        let base_z = chunk_z * 16;
-
-        // 4 格分辨率 biome，覆盖 -2..+7（aet.java:52）
-        let mut bio = [[0u8; 10]; 10];
-        for i in 0..10 {
-            for j in 0..10 {
-                bio[i][j] = self.pick_biome(
-                    base_x + (i as i32 - 2) * 4,
-                    base_z + (j as i32 - 2) * 4,
-                );
-            }
-        }
+        // 4 格分辨率 biome（MCPE `fillRawBiomeData` = 1:4 主层 getInts(cx*4-2, cz*4-2, 10, 10)）
+        let bio = self.biomes.raw_chunk(chunk_x, chunk_z);
         self.build_chunk(world, chunk_x, chunk_z, &bio);
     }
 
@@ -459,13 +447,12 @@ mod tests {
     // 注：地形密度算法已与真实存档对齐（RMSE 2.47），但 biome 仍用 Nukkit 的
     // pick_biome 近似，不产生海洋。等 GenLayer 实现后恢复。
     #[test]
-    #[ignore = "等待 GenLayer biome 实现（pick_biome 不产生海洋）"]
     fn has_ocean_land_and_relief() {
         let mut min = i32::MAX;
         let mut max = i32::MIN;
         let mut water = 0;
         for cx in -4..=4 {
-            let chunks = build(1337, cx, 0);
+            let chunks = build(1152860609, cx, 0);
             let chunk = at(&chunks, cx, 0);
             for x in 0..CHUNK_WIDTH {
                 for z in 0..CHUNK_WIDTH {
