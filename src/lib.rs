@@ -1,4 +1,3 @@
-pub mod block;
 pub mod command;
 pub mod config;
 pub mod entity;
