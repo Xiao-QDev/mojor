@@ -20,6 +20,9 @@ use crate::raknet::server::session::{Session, SessionEvent};
 
 pub const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub const SESSION_TICK_MS: u64 = 50;
+/// 同时存在的会话上限。UDP 无连接，任何源地址都能凭空建一个会话，
+/// 不设上限的话伪造源地址的洪泛包可以瞬间把内存和线程打爆。
+pub const MAX_SESSIONS: usize = 1024;
 
 // 事件都带会话 id 上层据此区分同端点上的新旧连接
 #[derive(Debug)]
@@ -96,7 +99,18 @@ impl RakNetServer {
         loop {
             tokio::select! {
                 received = socket.recv_from(&mut buf) => {
-                    let (len, peer) = received?;
+                    // Windows 上 ICMP port unreachable 会让 recv_from 返回
+                    // WSAECONNRESET(10054)，Linux/macOS 上对应 ECONNREFUSED。
+                    // 这类错误只影响本次收包，socket 依然可用，绝不能退出循环
+                    // ——否则客户端在服务器列表里刷新一次就能把服务端打挂。
+                    let (len, peer) = match received {
+                        Ok(v) => v,
+                        Err(e) if crate::raknet::udp_compat::is_transient_udp_error(&e) => {
+                            tracing::trace!(error = %e, "UDP 收到 ICMP 不可达，忽略本次收包");
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     let packet = &buf[..len];
                     if packet.is_empty() {
                         continue;
@@ -116,6 +130,17 @@ impl RakNetServer {
                     // 握手首包一律开新会话 同端点旧会话立刻退役
                     // 新任务马上接管 旧任务在后台收尾 它的 Closed 带旧 id 不会影响新玩家
                     if packet[0] == ID_OPEN_CONNECTION_REQUEST_1 {
+                        // 会话数上限：UDP 无连接，伪造源地址的洪泛包能凭空建会话，
+                        // 不设上限的话内存和线程都会被瞬间打爆。
+                        // 已有会话的端点重连不受影响（下面会先 remove 再 insert）。
+                        if !self.sessions.contains_key(&peer) && self.sessions.len() >= MAX_SESSIONS {
+                            tracing::trace!(
+                                %peer,
+                                limit = MAX_SESSIONS,
+                                "会话数已达上限，丢弃新连接"
+                            );
+                            continue;
+                        }
                         if let Some(old) = self.sessions.remove(&peer) {
                             let _ = old.tx.try_send(ConnCmd::Shutdown);
                         }

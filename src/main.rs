@@ -206,6 +206,12 @@ async fn main() -> Result<()> {
         Ok(addr) => UdpSocket::bind(addr).await?,
         Err(_) => UdpSocket::bind(config.bind.as_str()).await?,
     });
+
+    // Windows 上必须关掉 SIO_UDP_CONNRESET，否则 ICMP port unreachable
+    // 会让后续 recv_from 返回 10054 并打挂收包循环。
+    // Linux/macOS 上是空操作，编译后零开销。
+    mojor::raknet::udp_compat::fix_udp_socket(&*socket)?;
+
     let server_id = std::env::var("MOJOR_SERVER_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
