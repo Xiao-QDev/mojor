@@ -1336,6 +1336,19 @@ impl BiomeGen {
         self.main.get(x4, z4, w, h)
     }
 
+    /// 1:1 分辨率（VoronoiZoom）`getInts`，`[dx + dz * w]`
+    pub fn blocks(&self, x: i32, z: i32, w: i32, h: i32) -> Vec<i32> {
+        // Java 的 VoronoiZoom 只在 w/h 与对齐配合时才不越界（MCPE 只取 16×16 区块）；
+        // 这里多取一圈再裁剪，结果只依赖绝对坐标，与窗口大小无关
+        let (pw, ph) = ((w + 7) & !3, (h + 7) & !3);
+        let v = self.voronoi.get(x, z, pw, ph);
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for k in 0..h {
+            out.extend_from_slice(&v[(k * pw) as usize..(k * pw + w) as usize]);
+        }
+        out
+    }
+
     /// `fillRawBiomeData`：地形密度用的 10×10，`out[i][j]` = 网格 (x=i, z=j)，
     /// 覆盖 1:4 坐标 `(cx*4-2 .. cx*4+7, cz*4-2 .. cz*4+7)`
     pub fn raw_chunk(&self, cx: i32, cz: i32) -> [[u8; 10]; 10] {
@@ -1354,7 +1367,7 @@ impl BiomeGen {
         if let Some(v) = self.cache.lock().unwrap().get(&(cx, cz)) {
             return v.clone();
         }
-        let src = self.voronoi.get(cx * 16, cz * 16, 16, 16);
+        let src = self.blocks(cx * 16, cz * 16, 16, 16);
         let mut out = [0u8; 256];
         for (o, s) in out.iter_mut().zip(src.iter()) {
             *o = (*s & 0xFF) as u8;

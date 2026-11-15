@@ -19,34 +19,58 @@ const S_LIMIT: (f64, f64, f64) = (684.412, 684.412, 684.412);
 // 试过 y=10 + yScale=1.0 会把 RMSE 从 2.47 拉到 4.37）
 const S_DEPTH: (f64, f64, f64) = (200.0, 200.0, 0.5);
 
-/// biome 的 depth / scale（acq.java:7-29，另加 1.7 的 24/25）
+/// biome 的 (rootHeight, heightVariation)，即 JE 1.7.10 `BiomeGenBase.Height`
+///（`ahu.java` 的 a..m 十三档 + 各 biome 的 `.a(ahv)`；变种按 `ain`/`k()` 的规则推出）。
+/// MCPE 0.14 的 biome 链是 1.7.10 的，高度表必须与之配套；密度公式本身 1.6.4/1.7 相同。
 fn biome_de(id: u8) -> (f64, f64) {
-    match id {
-        0 => (-1.0, 0.4),
-        1 => (0.1, 0.3),
-        2 => (0.1, 0.2),
-        3 => (0.3, 1.5),
-        4 => (0.1, 0.3),
-        5 => (0.1, 0.4),
-        6 => (-0.2, 0.1),
-        7 => (-0.5, 0.0),
-        10 => (-1.0, 0.5),
-        11 => (-0.5, 0.0),
-        12 => (0.1, 0.3),
-        13 => (0.3, 1.3),
-        14 => (0.2, 1.0),
-        15 => (-1.0, 0.1),
-        16 => (0.0, 0.1),
-        17 => (0.3, 0.8),
-        18 => (0.3, 0.7),
-        19 => (0.3, 0.8),
-        20 => (0.2, 0.3),
-        21 => (0.2, 0.4),
-        22 => (1.8, 0.5),
-        24 => (-1.8, 0.1),
-        25 => (0.1, 0.8),
-        _ => (0.1, 0.3),
+    const DEFAULT: (f32, f32) = (0.1, 0.2);
+    const SHALLOW_WATERS: (f32, f32) = (-0.5, 0.0);
+    const OCEANS: (f32, f32) = (-1.0, 0.1);
+    const DEEP_OCEANS: (f32, f32) = (-1.8, 0.1);
+    const LOW_PLAINS: (f32, f32) = (0.125, 0.05);
+    const MID_PLAINS: (f32, f32) = (0.2, 0.2);
+    const LOW_HILLS: (f32, f32) = (0.45, 0.3);
+    const HIGH_PLATEAUS: (f32, f32) = (1.5, 0.025);
+    const MID_HILLS: (f32, f32) = (1.0, 0.5);
+    const SHORES: (f32, f32) = (0.0, 0.025);
+    const ROCKY_WATERS: (f32, f32) = (0.1, 0.8);
+    const LOW_ISLANDS: (f32, f32) = (0.2, 0.3);
+    const PARTIALLY_SUBMERGED: (f32, f32) = (-0.2, 0.1);
+    /// `ain`（BiomeGenMutated）：基础 biome +0.1 / +0.2
+    const fn m(b: (f32, f32)) -> (f32, f32) {
+        (b.0 + 0.1, b.1 + 0.2)
     }
+    let v: (f32, f32) = match id {
+        0 | 10 => OCEANS,
+        1 | 2 | 12 | 35 => LOW_PLAINS,
+        3 | 34 => MID_HILLS,
+        5 | 30 | 32 => MID_PLAINS,
+        6 => PARTIALLY_SUBMERGED,
+        7 | 11 => SHALLOW_WATERS,
+        13 | 17 | 18 | 19 | 22 | 28 | 31 | 33 => LOW_HILLS,
+        14 => LOW_ISLANDS,
+        15 | 16 | 26 => SHORES,
+        20 => (MID_HILLS.0 * 0.8, MID_HILLS.1 * 0.6), // i.a()
+        24 => DEEP_OCEANS,
+        25 => ROCKY_WATERS,
+        36 | 38 | 39 => HIGH_PLATEAUS,
+        // 变种
+        129 => LOW_PLAINS,                                // new aip → a(e)
+        130 => m(LOW_PLAINS),                             // desert M
+        131 | 162 => MID_HILLS,                           // aid.b(this)：照抄基础
+        132 => (DEFAULT.0, DEFAULT.1 + 0.2),              // flower forest
+        133 | 158 => m(MID_PLAINS),                       // taiga M / cold taiga M
+        134 => m(PARTIALLY_SUBMERGED),                    // swamp M
+        140 => (LOW_PLAINS.0 + 0.3, LOW_PLAINS.1 + 0.4),  // ice plains spikes
+        149 | 151 | 155 | 157 => m(DEFAULT),              // jungle/jungleEdge/birch/roofed M
+        156 => m(LOW_HILLS),                              // birch forest hills M
+        160 | 161 => MID_PLAINS,                          // mega spruce taiga (161 与 160 同一对象)
+        163 => (LOW_PLAINS.0 * 0.5 + 0.3, LOW_PLAINS.1 * 0.5 + 1.2), // savanna M
+        164 => (HIGH_PLATEAUS.0 * 0.5 + 0.3, HIGH_PLATEAUS.1 * 0.5 + 1.2),
+        166 | 167 => LOW_HILLS,                           // mesa plateau (F) M: .a(g)
+        _ => DEFAULT, // 4 21 23 27 29 37 165 及 8/9
+    };
+    (v.0 as f64, v.1 as f64)
 }
 
 pub struct TerrainGenerator {
