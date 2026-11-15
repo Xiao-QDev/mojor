@@ -13,65 +13,95 @@ pub const SEA_LEVEL: i32 = 62;
 pub const BEDROCK_DEPTH: i32 = 5;
 
 // JE 1.6.4 的 scale 三元组（aet.java:217-223）
-const S_MAIN: (f64, f64, f64) = (684.412 / 80.0, 684.412 / 160.0, 684.412 / 80.0);
-const S_LIMIT: (f64, f64, f64) = (684.412, 684.412, 684.412);
+// getHeights 里的比例尺立即数（0x4108e1e5 / 0x4088e1e5 / 0x442b1a5e / 0x4455e0f6）
+const S_MAIN: (f32, f32, f32) = (8.55515, 4.277575, 8.55515);
+const S_LO: (f32, f32, f32) = (684.412, 855.515, 684.412); // +0x20
+const S_HI: (f32, f32, f32) = (684.412, 684.412, 684.412); // +0x24
 // MCPE 的 C++ 版 2D 噪声实测按 y=0 / yScale=0.5 处理（Java 的 y=10 语义不适用，
 // 试过 y=10 + yScale=1.0 会把 RMSE 从 2.47 拉到 4.37）
-const S_DEPTH: (f64, f64, f64) = (200.0, 200.0, 0.5);
+const S_DEPTH: (f32, f32) = (200.0, 200.0); // +0x34，2D
 
-/// biome 的 (rootHeight, heightVariation)，即 JE 1.7.10 `BiomeGenBase.Height`
-///（`ahu.java` 的 a..m 十三档 + 各 biome 的 `.a(ahv)`；变种按 `ain`/`k()` 的规则推出）。
-/// MCPE 0.14 的 biome 链是 1.7.10 的，高度表必须与之配套；密度公式本身 1.6.4/1.7 相同。
-fn biome_de(id: u8) -> (f64, f64) {
-    const DEFAULT: (f32, f32) = (0.1, 0.2);
-    const SHALLOW_WATERS: (f32, f32) = (-0.5, 0.0);
-    const OCEANS: (f32, f32) = (-1.0, 0.1);
-    const DEEP_OCEANS: (f32, f32) = (-1.8, 0.1);
-    const LOW_PLAINS: (f32, f32) = (0.125, 0.05);
-    const MID_PLAINS: (f32, f32) = (0.2, 0.2);
-    const LOW_HILLS: (f32, f32) = (0.45, 0.3);
-    const HIGH_PLATEAUS: (f32, f32) = (1.5, 0.025);
-    const MID_HILLS: (f32, f32) = (1.0, 0.5);
-    const SHORES: (f32, f32) = (0.0, 0.025);
-    const ROCKY_WATERS: (f32, f32) = (0.1, 0.8);
-    const LOW_ISLANDS: (f32, f32) = (0.2, 0.3);
-    const PARTIALLY_SUBMERGED: (f32, f32) = (-0.2, 0.1);
-    /// `ain`（BiomeGenMutated）：基础 biome +0.1 / +0.2
-    const fn m(b: (f32, f32)) -> (f32, f32) {
-        (b.0 + 0.1, b.1 + 0.2)
+/// biome 的 (depth, scale) = `Biome+0x64 / +0x68`。
+/// 直接在 unicorn 里运行原版 `Biome::initBiomes`（含 `.init_array` 里的 `BiomeHeight` 常量）后
+/// 逐个读出的 f32 位模式，与 MCPE 0.14 逐位相同（与 JE 1.7.10 有 5/20/38/133/161 等几处不同）。
+fn biome_de(id: u8) -> (f32, f32) {
+    match id {
+        0 => (f32::from_bits(0xbf800000), f32::from_bits(0x3dcccccd)),
+        1 => (f32::from_bits(0x3e000000), f32::from_bits(0x3d4ccccd)),
+        2 => (f32::from_bits(0x3e000000), f32::from_bits(0x3d4ccccd)),
+        3 => (f32::from_bits(0x3f800000), f32::from_bits(0x3f000000)),
+        4 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        5 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        6 => (f32::from_bits(0xbe4ccccd), f32::from_bits(0x3dcccccd)),
+        7 => (f32::from_bits(0xbf000000), f32::from_bits(0x00000000)),
+        8 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        9 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        10 => (f32::from_bits(0xbf800000), f32::from_bits(0x3dcccccd)),
+        11 => (f32::from_bits(0xbf000000), f32::from_bits(0x00000000)),
+        12 => (f32::from_bits(0x3e000000), f32::from_bits(0x3d4ccccd)),
+        13 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        14 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3e99999a)),
+        15 => (f32::from_bits(0x00000000), f32::from_bits(0x3ccccccd)),
+        16 => (f32::from_bits(0x00000000), f32::from_bits(0x3ccccccd)),
+        17 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        18 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        19 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        20 => (f32::from_bits(0x3f4ccccd), f32::from_bits(0x3ecccccd)),
+        21 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        22 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        23 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        24 => (f32::from_bits(0xbfe66666), f32::from_bits(0x3dcccccd)),
+        25 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3f4ccccd)),
+        26 => (f32::from_bits(0x00000000), f32::from_bits(0x3ccccccd)),
+        27 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        28 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        29 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        30 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3e4ccccd)),
+        31 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        32 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3e4ccccd)),
+        33 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        34 => (f32::from_bits(0x3f800000), f32::from_bits(0x3f000000)),
+        35 => (f32::from_bits(0x3e000000), f32::from_bits(0x3d4ccccd)),
+        36 => (f32::from_bits(0x3fc00000), f32::from_bits(0x3ccccccd)),
+        37 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        38 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        39 => (f32::from_bits(0x3fc00000), f32::from_bits(0x3ccccccd)),
+        129 => (f32::from_bits(0x3e000000), f32::from_bits(0x3d4ccccd)),
+        130 => (f32::from_bits(0x3e666666), f32::from_bits(0x3e800000)),
+        131 => (f32::from_bits(0x3f800000), f32::from_bits(0x3f000000)),
+        132 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3ecccccd)),
+        133 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3ecccccd)),
+        134 => (f32::from_bits(0xbdcccccd), f32::from_bits(0x3e99999a)),
+        140 => (f32::from_bits(0x3ed9999a), f32::from_bits(0x3ee66667)),
+        149 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3ecccccd)),
+        151 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3ecccccd)),
+        155 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3ecccccd)),
+        156 => (f32::from_bits(0x3f0ccccd), f32::from_bits(0x3f000000)),
+        157 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3ecccccd)),
+        158 => (f32::from_bits(0x3e99999a), f32::from_bits(0x3ecccccd)),
+        160 => (f32::from_bits(0x3e4ccccd), f32::from_bits(0x3e4ccccd)),
+        161 => (f32::from_bits(0x3f0ccccd), f32::from_bits(0x3f000000)),
+        162 => (f32::from_bits(0x3f800000), f32::from_bits(0x3f000000)),
+        163 => (f32::from_bits(0x3eb9999a), f32::from_bits(0x3f9ccccd)),
+        164 => (f32::from_bits(0x3f866666), f32::from_bits(0x3f9b3334)),
+        165 => (f32::from_bits(0x3dcccccd), f32::from_bits(0x3e4ccccd)),
+        166 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+        167 => (f32::from_bits(0x3ee66666), f32::from_bits(0x3e99999a)),
+
+        _ => (f32::from_bits(0xbf800000), f32::from_bits(0x3dcccccd)), // 未注册 id → ocean
     }
-    let v: (f32, f32) = match id {
-        0 | 10 => OCEANS,
-        1 | 2 | 12 | 35 => LOW_PLAINS,
-        3 | 34 => MID_HILLS,
-        5 | 30 | 32 => MID_PLAINS,
-        6 => PARTIALLY_SUBMERGED,
-        7 | 11 => SHALLOW_WATERS,
-        13 | 17 | 18 | 19 | 22 | 28 | 31 | 33 => LOW_HILLS,
-        14 => LOW_ISLANDS,
-        15 | 16 | 26 => SHORES,
-        20 => (MID_HILLS.0 * 0.8, MID_HILLS.1 * 0.6), // i.a()
-        24 => DEEP_OCEANS,
-        25 => ROCKY_WATERS,
-        36 | 38 | 39 => HIGH_PLATEAUS,
-        // 变种
-        129 => LOW_PLAINS,                                // new aip → a(e)
-        130 => m(LOW_PLAINS),                             // desert M
-        131 | 162 => MID_HILLS,                           // aid.b(this)：照抄基础
-        132 => (DEFAULT.0, DEFAULT.1 + 0.2),              // flower forest
-        133 | 158 => m(MID_PLAINS),                       // taiga M / cold taiga M
-        134 => m(PARTIALLY_SUBMERGED),                    // swamp M
-        140 => (LOW_PLAINS.0 + 0.3, LOW_PLAINS.1 + 0.4),  // ice plains spikes
-        149 | 151 | 155 | 157 => m(DEFAULT),              // jungle/jungleEdge/birch/roofed M
-        156 => m(LOW_HILLS),                              // birch forest hills M
-        160 | 161 => MID_PLAINS,                          // mega spruce taiga (161 与 160 同一对象)
-        163 => (LOW_PLAINS.0 * 0.5 + 0.3, LOW_PLAINS.1 * 0.5 + 1.2), // savanna M
-        164 => (HIGH_PLATEAUS.0 * 0.5 + 0.3, HIGH_PLATEAUS.1 * 0.5 + 1.2),
-        166 | 167 => LOW_HILLS,                           // mesa plateau (F) M: .a(g)
-        _ => DEFAULT, // 4 21 23 27 29 37 165 及 8/9
-    };
-    (v.0 as f64, v.1 as f64)
 }
+
+/// `RandomLevelSource` ctor 写入 this+0x3c 的 5×5 核（10/sqrt(dx²+dz²+0.2) 的 f32 立即数）
+const KERNEL: [[f32; 5]; 5] = {
+    const A: f32 = f32::from_bits(0x405f7f69);
+    const B: f32 = f32::from_bits(0x408c544c);
+    const C: f32 = f32::from_bits(0x409c24de);
+    const D: f32 = f32::from_bits(0x40d7be73);
+    const E: f32 = f32::from_bits(0x41120f31);
+    const F: f32 = f32::from_bits(0x41b2e2ac);
+    [[A, B, C, B, A], [B, D, E, D, B], [C, E, F, E, C], [B, D, E, D, B], [A, B, C, B, A]]
+};
 
 pub struct TerrainGenerator {
     seed: u32,
@@ -119,46 +149,83 @@ impl TerrainGenerator {
         (base as i64) ^ self.seed as i64
     }
 
-    /// 5×5 网格点的 biome 加权 depth/scale（aet.java:229-254）
-    fn biome_grid(&self, bio: &[[u8; 10]; 10]) -> ([[f64; 5]; 5], [[f64; 5]; 5]) {
-        let mut kern = [[0.0f64; 5]; 5];
-        for dx in -2i32..=2 {
-            for dz in -2i32..=2 {
-                kern[(dx + 2) as usize][(dz + 2) as usize] =
-                    10.0 / (((dx * dx + dz * dz) as f64) + 0.2).sqrt();
-            }
-        }
-        let mut dm = [[0.1f64; 5]; 5];
-        let mut em = [[0.3f64; 5]; 5];
-        for i in 0..5usize {
-            for j in 0..5usize {
-                let (cd, _) = biome_de(bio[i + 2][j + 2]);
-                let (mut se, mut sd, mut sw) = (0.0f64, 0.0f64, 0.0f64);
-                for dx in -2i32..=2 {
-                    for dz in -2i32..=2 {
-                        let (d, e) = biome_de(
-                            bio[(i as i32 + dx + 2) as usize][(j as i32 + dz + 2) as usize],
-                        );
-                        let mut w = kern[(dx + 2) as usize][(dz + 2) as usize] / (d + 2.0);
-                        if d > cd {
-                            w /= 2.0;
-                        }
-                        se += e * w;
-                        sd += d * w;
-                        sw += w;
-                    }
-                }
-                em[i][j] = se / sw * 0.9 + 0.1;
-                dm[i][j] = (sd / sw * 4.0 - 1.0) / 8.0;
-            }
-        }
-        (dm, em)
-    }
-
     pub fn generate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
         // 4 格分辨率 biome（MCPE `fillRawBiomeData` = 1:4 主层 getInts(cx*4-2, cz*4-2, 10, 10)）
         let bio = self.biomes.raw_chunk(chunk_x, chunk_z);
         self.build_chunk(world, chunk_x, chunk_z, &bio);
+    }
+
+    /// 5×5×17 密度网格 = `RandomLevelSource::getHeights`（@0x7cc6a0）逐条移植，`[x*5+z][k]`。
+    /// 全程 f32、运算顺序与原版一致；biome 核是 3×3（取 5×5 抛物线核的中心 3×3）。
+    pub fn density(&self, chunk_x: i32, chunk_z: i32, bio: &[[u8; 10]; 10]) -> [[f32; 17]; 25] {
+        let (px, pz) = ((chunk_x * 4) as f32, (chunk_z * 4) as f32);
+        let depth_n = self.stack.depth_noise.get_region_2d((px, pz), 5, 5, S_DEPTH);
+        let pos = (px, 0.0, pz);
+        let main_n = self.stack.main_noise.get_region(pos, 5, 17, 5, S_MAIN);
+        let lo_n = self.stack.min_limit.get_region(pos, 5, 17, 5, S_LO);
+        let hi_n = self.stack.max_limit.get_region(pos, 5, 17, 5, S_HI);
+
+        let mut dens = [[0.0f32; 17]; 25];
+        for i in 0..5usize {
+            for j in 0..5usize {
+                let idx = i * 5 + j;
+                let cd = biome_de(bio[i + 2][j + 2]).0;
+                let (mut sw, mut ss, mut sd) = (0.0f32, 0.0f32, 0.0f32);
+                for a in 0..3usize {
+                    // 一次处理一列的 3 个 dz（-1, 0, +1），累加顺序照原版
+                    let mut w = [0.0f32; 3];
+                    let mut d = [0.0f32; 3];
+                    let mut sc = [0.0f32; 3];
+                    for b in 0..3usize {
+                        let (dd, s) = biome_de(bio[i + 1 + a][j + 1 + b]);
+                        let raw = KERNEL[1 + b][1 + a] / (2.0 + dd);
+                        w[b] = if cd < dd { 0.5 * raw } else { raw };
+                        d[b] = dd;
+                        sc[b] = s;
+                    }
+                    sw = (sw + w[2]) + (w[0] + w[1]);
+                    ss = (sc[2] * w[2] + ss) + (sc[0] * w[0] + sc[1] * w[1]);
+                    sd = (d[1] * w[1] + d[0] * w[0]) + (w[2] * d[2] + sd);
+                }
+                let avg_s = ss / sw;
+                let avg_d = sd / sw;
+                let scale = avg_s * 0.9 + 0.1;
+                let dt = (avg_d * 4.0 + -1.0) * 0.125;
+                let mut dn = 0.000125f32 * depth_n[idx];
+                if dn < 0.0 {
+                    dn = -dn * 0.3;
+                }
+                dn = dn * 3.0 - 2.0;
+                dn = if dn < 0.0 {
+                    (dn * 0.5).max(-1.0) * 0.357_142_87
+                } else {
+                    dn.min(1.0) * 0.125
+                };
+                let off = dn * 0.2 + dt;
+                let base = -8.5f32 - off * 4.25;
+                let ys = 12.0f32 / scale;
+                for k in 0..17usize {
+                    let mut v = (k as f32 + base) * ys;
+                    if v < 0.0 {
+                        v *= 4.0;
+                    }
+                    let t = (0.1f32 * main_n[idx * 17 + k] + 1.0) * 0.5;
+                    let lo = 0.003_906_25f32 * lo_n[idx * 17 + k];
+                    let mut val = lo;
+                    if t >= 0.0 {
+                        let hi = 0.001_953_125f32 * hi_n[idx * 17 + k];
+                        val = if t > 1.0 { hi } else { (hi - lo) * t + lo };
+                    }
+                    let mut dv = val - v;
+                    if k > 13 {
+                        let q = (k - 13) as f32 * 0.333_333_34;
+                        dv = dv * (1.0 - q) + q * -10.0;
+                    }
+                    dens[idx][k] = dv;
+                }
+            }
+        }
+        dens
     }
 
     /// 用给定 4 格分辨率 biome 生成区块（biome 由外部提供时用，便于定点验证）
@@ -172,60 +239,11 @@ impl TerrainGenerator {
         self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
-        let (dm, em) = self.biome_grid(bio);
-
-        // 5×17×5 高度场
-        let pos = (chunk_x as f64 * 4.0, 0.0, chunk_z as f64 * 4.0);
-        let min_l = self.stack.min_limit.get_region(pos, 5, 17, 5, S_LIMIT);
-        let max_l = self.stack.max_limit.get_region(pos, 5, 17, 5, S_LIMIT);
-        let main_n = self.stack.main_noise.get_region(pos, 5, 17, 5, S_MAIN);
-        let depth_n = self.stack.depth_noise.get_region(pos, 5, 1, 5, S_DEPTH);
-
-        // 密度（aet.java:255-308）
-        let mut dens = [[0.0f64; 17]; 25];
-        for i in 0..5usize {
-            for j in 0..5usize {
-                let idx = i * 5 + j;
-                let d50 = {
-                    let v = depth_n[idx] / 8000.0;
-                    let v = (if v < 0.0 { -v * 0.3 } else { v }) * 3.0 - 2.0;
-                    if v < 0.0 {
-                        (v / 2.0).max(-1.0) / 1.4 / 2.0
-                    } else {
-                        v.min(1.0) / 8.0
-                    }
-                };
-                let v56 = (dm[i][j] + d50 * 0.2) * 17.0 / 16.0;
-                let anchor = 8.5 + v56 * 4.0;
-                let scale = em[i][j];
-                for k in 0..17usize {
-                    let mut v32 = (k as f64 - anchor) * 12.0 / scale;
-                    if v32 < 0.0 {
-                        v32 *= 4.0;
-                    }
-                    let v34 = min_l[idx * 17 + k] / 512.0;
-                    let v36 = max_l[idx * 17 + k] / 512.0;
-                    let v38 = (main_n[idx * 17 + k] / 10.0 + 1.0) / 2.0;
-                    let base = if v38 < 0.0 {
-                        v34
-                    } else if v38 > 1.0 {
-                        v36
-                    } else {
-                        v34 + (v36 - v34) * v38
-                    };
-                    let mut d = base - v32;
-                    if k > 13 {
-                        let f = (k as f64 - 13.0) / 3.0;
-                        d = d * (1.0 - f) - 10.0 * f;
-                    }
-                    dens[idx][k] = d;
-                }
-            }
-        }
+        let dens = self.density(chunk_x, chunk_z, bio);
 
         // surface 噪声（aet.java:111）：4 八度、scale 0.03125*2
         let surf = self.stack.surface.get_region(
-            (base_x as f64, base_z as f64, 0.0),
+            (base_x as f32, base_z as f32, 0.0),
             16,
             16,
             1,
@@ -267,13 +285,13 @@ impl TerrainGenerator {
                     let c011 = g(i, j + 1, k + 1);
                     let c111 = g(i + 1, j + 1, k + 1);
                     for dy in 0..8usize {
-                        let fy = dy as f64 / 8.0;
+                        let fy = dy as f32 / 8.0;
                         let y = k * 8 + dy;
                         for dx in 0..4usize {
-                            let fx = dx as f64 / 4.0;
+                            let fx = dx as f32 / 4.0;
                             let x = i * 4 + dx;
                             for dz in 0..4usize {
-                                let fz = dz as f64 / 4.0;
+                                let fz = dz as f32 / 4.0;
                                 let z = j * 4 + dz;
                                 let l00 = c000 + (c100 - c000) * fx;
                                 let l10 = c010 + (c110 - c010) * fx;
@@ -305,7 +323,7 @@ impl TerrainGenerator {
         for z in 0..16 {
             for x in 0..16 {
                 thick[x][z] =
-                    (surf[x * 16 + z] / 3.0 + 3.0 + self.random.next_double() * 0.25) as i32;
+                    (surf[x * 16 + z] as f64 / 3.0 + 3.0 + self.random.next_double() * 0.25) as i32;
             }
         }
         let Some(chunk) = world.chunk_mut(chunk_x, chunk_z) else {
