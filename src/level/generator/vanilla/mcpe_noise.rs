@@ -275,12 +275,128 @@ impl OctavesNoise {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SimplexNoise / PerlinSimplexNoise（地表噪声 +0x2c）
+//   SimplexNoise::SimplexNoise(Random&) @0x7c6eb0（初始化同 ImprovedNoise）
+//   SimplexNoise::_getValue(Vec2)       @0x7efb20
+//   SimplexNoise::_add(...)             @0x7eff00
+//   PerlinSimplexNoise::getRegion(Vec2) @0x7f0000
+// ---------------------------------------------------------------------------
+
+/// `SimplexNoise::F2/G2`（静态初始化写入 bss 的 f32 位模式）
+const F2: f32 = f32::from_bits(0x3ebb67ae);
+const G2: f32 = f32::from_bits(0x3e58658c);
+const GRAD3: [[i32; 3]; 12] = [
+    [1, 1, 0], [-1, 1, 0], [1, -1, 0], [-1, -1, 0],
+    [1, 0, 1], [-1, 0, 1], [1, 0, -1], [-1, 0, -1],
+    [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1],
+];
+
+#[derive(Clone)]
+pub struct SimplexNoise {
+    xo: f32,
+    yo: f32,
+    p: [i32; 512],
+}
+
+#[inline]
+fn fastfloor(v: f32) -> i32 {
+    (v as i32) - (v <= 0.0) as i32
+}
+
+impl SimplexNoise {
+    /// 与 ImprovedNoise 同样消耗 3 次 nextFloat + 256 次 nextInt，但三个偏移按**逆序**存放：
+    /// 第 1 次 → zo、第 2 次 → yo、第 3 次 → xo（已用原版对象内存核对）
+    pub fn new(rnd: &mut McpeRandom) -> Self {
+        let n = ImprovedNoise::new(rnd);
+        Self { xo: n.zo, yo: n.yo, p: n.p }
+    }
+
+    #[inline]
+    fn pp(&self, i: i32) -> i32 {
+        self.p[i as usize]
+    }
+
+    /// `_getValue(Vec2)`，含 ×70
+    pub fn value2(&self, x: f32, y: f32) -> f32 {
+        let s = (y + x) * F2;
+        let i = fastfloor(s + x);
+        let j = fastfloor(s + y);
+        let t = ((i + j) as f32) * G2;
+        let y0 = y - (j as f32 - t);
+        let x0 = x - (i as f32 - t);
+        let (i1, j1) = if x0 > y0 { (1, 0) } else { (0, 1) };
+        let y1 = (G2 - j1 as f32) + y0;
+        let x1 = (G2 - i1 as f32) + x0;
+        let g2m1 = (G2 + G2) + -1.0;
+        let y2 = y0 + g2m1;
+        let x2 = g2m1 + x0;
+        let ii = i & 255;
+        let jj = j & 255;
+        let gi0 = self.pp(self.pp(jj) + ii) % 12;
+        let gi1 = self.pp(self.pp(jj + j1) + ii + i1) % 12;
+        let gi2 = self.pp(ii + self.pp(jj + 1) + 1) % 12;
+        let corner = |t: f32, g: i32, x: f32, y: f32| -> f32 {
+            if t < 0.0 {
+                0.0
+            } else {
+                let t2 = t * t;
+                let gg = GRAD3[g as usize];
+                (t2 * t2) * ((gg[1] as f32) * y + (gg[0] as f32) * x)
+            }
+        };
+        let n0 = corner(0.5 - (y0 * y0 + x0 * x0), gi0, x0, y0);
+        let n1 = corner(0.5 - (y1 * y1 + x1 * x1), gi1, x1, y1);
+        let n2 = corner(0.5 - (y2 * y2 + x2 * x2), gi2, x2, y2);
+        ((n0 + n1) + n2) * 70.0
+    }
+
+    /// `_add(out, x, z, w, h, sx, sz, amp)`，out 布局 `[j*w + k]`
+    #[allow(clippy::too_many_arguments)]
+    fn add(&self, out: &mut [f32], x: f32, z: f32, w: usize, h: usize, sx: f32, sz: f32, amp: f32) {
+        for j in 0..h {
+            let yv = (j as f32 + z) * sz + self.yo;
+            for k in 0..w {
+                let xv = (k as f32 + x) * sx + self.xo;
+                out[j * w + k] += self.value2(xv, yv) * amp;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PerlinSimplexNoise {
+    pub levels: Vec<SimplexNoise>,
+}
+
+impl PerlinSimplexNoise {
+    pub fn new(rnd: &mut McpeRandom, octaves: usize) -> Self {
+        Self {
+            levels: (0..octaves).map(|_| SimplexNoise::new(rnd)).collect(),
+        }
+    }
+
+    /// `getRegion(out, Vec2 pos, w, h, Vec2 scale, f1, f2)`，out `[z*w + x]`
+    pub fn get_region(&self, pos: (f32, f32), w: usize, h: usize, scale: (f32, f32), f1: f32, f2: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; w * h];
+        let (mut m1, mut m2) = (1.0f32, 1.0f32);
+        for lvl in &self.levels {
+            let amp = 0.55f32 / m2;
+            let k = m1 * m2;
+            lvl.add(&mut out, pos.0, pos.1, w, h, scale.0 * k, scale.1 * k, amp);
+            m1 *= f1;
+            m2 *= f2;
+        }
+        out
+    }
+}
+
 #[derive(Clone)]
 pub struct NoiseStack {
     pub min_limit: OctavesNoise,   // +0x20 PerlinNoise(16)
     pub max_limit: OctavesNoise,   // +0x24 PerlinNoise(16)
     pub main_noise: OctavesNoise,  // +0x28 PerlinNoise(8)
-    pub surface: OctavesNoise,     // +0x2c 原版是 PerlinSimplexNoise(4)；随机数消耗相同（4×259）
+    pub surface: PerlinSimplexNoise, // +0x2c PerlinSimplexNoise(4)
     pub scale_noise: OctavesNoise, // +0x30 PerlinNoise(10)
     pub depth_noise: OctavesNoise, // +0x34 PerlinNoise(16)
     pub mob_spawner: OctavesNoise, // +0x38 PerlinNoise(8)
@@ -292,7 +408,7 @@ impl NoiseStack {
         let min_limit = OctavesNoise::new(&mut r, 16);
         let max_limit = OctavesNoise::new(&mut r, 16);
         let main_noise = OctavesNoise::new(&mut r, 8);
-        let surface = OctavesNoise::new(&mut r, 4);
+        let surface = PerlinSimplexNoise::new(&mut r, 4);
         let scale_noise = OctavesNoise::new(&mut r, 10);
         let depth_noise = OctavesNoise::new(&mut r, 16);
         let mob_spawner = OctavesNoise::new(&mut r, 8);

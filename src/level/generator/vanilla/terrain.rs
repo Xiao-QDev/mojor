@@ -155,6 +155,18 @@ impl TerrainGenerator {
         self.build_chunk(world, chunk_x, chunk_z, &bio);
     }
 
+    /// `buildSurfaces` 的地表噪声：PerlinSimplexNoise(+0x2c)，`[z*16 + x]`
+    pub fn surface_noise(&self, chunk_x: i32, chunk_z: i32) -> Vec<f32> {
+        self.stack.surface.get_region(
+            ((chunk_x * 16) as f32, (chunk_z * 16) as f32),
+            16,
+            16,
+            (0.125, 0.125),
+            1.0,
+            0.5,
+        )
+    }
+
     /// 5×5×17 密度网格 = `RandomLevelSource::getHeights`（@0x7cc6a0）逐条移植，`[x*5+z][k]`。
     /// 全程 f32、运算顺序与原版一致；biome 核是 3×3（取 5×5 抛物线核的中心 3×3）。
     pub fn density(&self, chunk_x: i32, chunk_z: i32, bio: &[[u8; 10]; 10]) -> [[f32; 17]; 25] {
@@ -242,13 +254,7 @@ impl TerrainGenerator {
         let dens = self.density(chunk_x, chunk_z, bio);
 
         // surface 噪声（aet.java:111）：4 八度、scale 0.03125*2
-        let surf = self.stack.surface.get_region(
-            (base_x as f32, base_z as f32, 0.0),
-            16,
-            16,
-            1,
-            (0.0625, 0.0625, 0.0625),
-        );
+        let surf = self.surface_noise(chunk_x, chunk_z);
 
         // 基岩深度逐列预生成，避免与区块可变借用冲突
         let mut bed = [[0usize; 16]; 16];
@@ -271,47 +277,51 @@ impl TerrainGenerator {
             }
         }
 
-        // 三线性插值 + 填充（aet.java:55-105）
-        for i in 0..4usize {
-            for j in 0..4usize {
-                for k in 0..16usize {
+        // 三线性插值 + 填充 = `RandomLevelSource::prepareHeights`（@0x814220）。
+        // 原版用增量累加（f32）：y 每步 +0.125·Δ，x 每步 +0.25·Δ，z 方向首格直接取角值。
+        // 密度 > 0 → 石头；否则 y ≤ 62 → 静水，其余空气。基岩在 buildSurfaces 里铺。
+        let _ = &bed;
+        for cx in 0..4usize {
+            for cz in 0..4usize {
+                for ck in 0..16usize {
                     let g = |a: usize, b: usize, c: usize| dens[a * 5 + b][c];
-                    let c000 = g(i, j, k);
-                    let c100 = g(i + 1, j, k);
-                    let c010 = g(i, j + 1, k);
-                    let c110 = g(i + 1, j + 1, k);
-                    let c001 = g(i, j, k + 1);
-                    let c101 = g(i + 1, j, k + 1);
-                    let c011 = g(i, j + 1, k + 1);
-                    let c111 = g(i + 1, j + 1, k + 1);
-                    for dy in 0..8usize {
-                        let fy = dy as f32 / 8.0;
-                        let y = k * 8 + dy;
-                        for dx in 0..4usize {
-                            let fx = dx as f32 / 4.0;
-                            let x = i * 4 + dx;
-                            for dz in 0..4usize {
-                                let fz = dz as f32 / 4.0;
-                                let z = j * 4 + dz;
-                                let l00 = c000 + (c100 - c000) * fx;
-                                let l10 = c010 + (c110 - c010) * fx;
-                                let l01 = c001 + (c101 - c001) * fx;
-                                let l11 = c011 + (c111 - c011) * fx;
-                                let l0 = l00 + (l10 - l00) * fz;
-                                let l1 = l01 + (l11 - l01) * fz;
-                                let d = l0 + (l1 - l0) * fy;
-                                let id = if y <= bed[x][z] {
-                                    BEDROCK
-                                } else if d > 0.0 {
+                    let mut a0 = g(cx, cz, ck);
+                    let mut b0 = g(cx, cz + 1, ck);
+                    let mut c0 = g(cx + 1, cz, ck);
+                    let mut d0 = g(cx + 1, cz + 1, ck);
+                    let sa = 0.125f32 * (g(cx, cz, ck + 1) - a0);
+                    let sb = 0.125f32 * (g(cx, cz + 1, ck + 1) - b0);
+                    let sc = 0.125f32 * (g(cx + 1, cz, ck + 1) - c0);
+                    let sd = 0.125f32 * (g(cx + 1, cz + 1, ck + 1) - d0);
+                    for yy in 0..8usize {
+                        let y = ck * 8 + yy;
+                        let xs1 = (c0 - a0) * 0.25;
+                        let xs2 = (d0 - b0) * 0.25;
+                        let mut a = a0;
+                        let mut b = b0;
+                        for xx in 0..4usize {
+                            let step = (b - a) * 0.25;
+                            let mut v = a;
+                            for zz in 0..4usize {
+                                if zz > 0 {
+                                    v += step;
+                                }
+                                let id = if v > 0.0 {
                                     STONE
-                                } else if (y as i32) <= SEA_LEVEL {
+                                } else if y as i32 <= SEA_LEVEL {
                                     STILL_WATER
                                 } else {
                                     AIR
                                 };
-                                chunk.set_block(x, y, z, id);
+                                chunk.set_block(cx * 4 + xx, y, cz * 4 + zz, id);
                             }
+                            a += xs1;
+                            b += xs2;
                         }
+                        a0 += sa;
+                        b0 += sb;
+                        c0 += sc;
+                        d0 += sd;
                     }
                 }
             }
@@ -323,7 +333,7 @@ impl TerrainGenerator {
         for z in 0..16 {
             for x in 0..16 {
                 thick[x][z] =
-                    (surf[x * 16 + z] as f64 / 3.0 + 3.0 + self.random.next_double() * 0.25) as i32;
+                    (surf[z * 16 + x] as f64 / 3.0 + 3.0 + self.random.next_double() * 0.25) as i32;
             }
         }
         let Some(chunk) = world.chunk_mut(chunk_x, chunk_z) else {
