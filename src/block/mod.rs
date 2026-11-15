@@ -1,0 +1,400 @@
+// 方块模块 每个方块一个文件 照搬 Nukkit 的 Block 类层次
+// 注册表 get_block(id) 按运行时 id 返回方块行为 与 world 层的 u8 id 对齐
+// 模块名沿用 Nukkit 方块类名(PascalCase) 关闭 snake_case 检查
+#![allow(non_snake_case)]
+
+// Block.rs 是核心 trait 文件 用内部名 block_def 避免与 trait Block 同名冲突
+#[path = "Block.rs"]
+pub mod block_def;
+pub use block_def::Block;
+
+pub mod BlockIds;
+
+pub mod AcaciaDoor;
+pub mod AcaciaWoodStairs;
+pub mod ActivatorRail;
+pub mod ActiveRedstoneLamp;
+pub mod Air;
+pub mod Anvil;
+pub mod Bed;
+pub mod Bedrock;
+pub mod Beetroot;
+pub mod BirchDoor;
+pub mod BirchWoodStairs;
+pub mod Bookshelf;
+pub mod BrewingStand;
+pub mod BrickStairs;
+pub mod Bricks;
+pub mod BrownMushroom;
+pub mod BrownMushroomBlock;
+pub mod BurningFurnace;
+pub mod Cactus;
+pub mod Cake;
+pub mod Camera;
+pub mod Carpet;
+pub mod Carrot;
+pub mod Cauldron;
+pub mod Chest;
+pub mod Clay;
+pub mod Coal;
+pub mod CoalOre;
+pub mod Cobblestone;
+pub mod CobblestoneStairs;
+pub mod Cobweb;
+pub mod CocoaBlock;
+pub mod Crops;
+pub mod Dandelion;
+pub mod DarkOakDoor;
+pub mod DarkOakWoodStairs;
+pub mod DaylightDetector;
+pub mod DaylightDetectorInverted;
+pub mod DeadBush;
+pub mod DetectorRail;
+pub mod Diamond;
+pub mod DiamondOre;
+pub mod Dirt;
+pub mod Dispenser;
+pub mod Door;
+pub mod DoublePlant;
+pub mod DoubleRedSandstoneSlab;
+pub mod DoubleSlab;
+pub mod DoubleWoodSlab;
+pub mod Dropper;
+pub mod ElectricalAppliance;
+pub mod Emerald;
+pub mod EmeraldOre;
+pub mod EnchantingTable;
+pub mod EndPortalFrame;
+pub mod EndStone;
+pub mod Fallable;
+pub mod Farmland;
+pub mod Fence;
+pub mod FenceGate;
+pub mod FenceGateAcacia;
+pub mod FenceGateBirch;
+pub mod FenceGateDarkOak;
+pub mod FenceGateJungle;
+pub mod FenceGateSpruce;
+pub mod Fire;
+pub mod Flowable;
+pub mod Flower;
+pub mod FlowerBlock;
+pub mod FlowerPot;
+pub mod Furnace;
+pub mod Glass;
+pub mod GlassPane;
+pub mod GlowingObsidian;
+pub mod GlowingRedstoneOre;
+pub mod Glowstone;
+pub mod Gold;
+pub mod GoldOre;
+pub mod Grass;
+pub mod GrassPath;
+pub mod Gravel;
+pub mod HardenedClay;
+pub mod HayBale;
+pub mod HeavyWeightedPressurePlate;
+pub mod Hopper;
+pub mod Ice;
+pub mod InactiveRedstoneLamp;
+pub mod InvisibleBedrock;
+pub mod Iron;
+pub mod IronBars;
+pub mod IronDoor;
+pub mod IronOre;
+pub mod IronTrapdoor;
+pub mod ItemFrame;
+pub mod JungleDoor;
+pub mod JungleWoodStairs;
+pub mod Ladder;
+pub mod Lapis;
+pub mod LapisOre;
+pub mod Lava;
+pub mod Leaves;
+pub mod Leaves2;
+pub mod Lever;
+pub mod LightWeightedPressurePlate;
+pub mod Liquid;
+pub mod LitPumpkin;
+pub mod Melon;
+pub mod MelonStem;
+pub mod MonsterEgg;
+pub mod MonsterSpawner;
+pub mod MossStone;
+pub mod Mycelium;
+pub mod NetherBrick;
+pub mod NetherBrickFence;
+pub mod NetherBrickStairs;
+pub mod NetherQuartzOre;
+pub mod NetherReactor;
+pub mod NetherWart;
+pub mod Netherrack;
+pub mod Noteblock;
+pub mod Obsidian;
+pub mod PackedIce;
+pub mod Planks;
+pub mod Podzol;
+pub mod Portal;
+pub mod Potato;
+pub mod PoweredComparator;
+pub mod PoweredRail;
+pub mod PoweredRepeater;
+pub mod PressurePlate;
+pub mod Pumpkin;
+pub mod PumpkinStem;
+pub mod Quartz;
+pub mod QuartzStairs;
+pub mod Rail;
+pub mod RedMushroom;
+pub mod RedMushroomBlock;
+pub mod RedSandstone;
+pub mod RedSandstoneSlab;
+pub mod RedSandstoneStairs;
+pub mod Redstone;
+pub mod RedstoneOre;
+pub mod RedstoneSource;
+pub mod RedstoneTorch;
+pub mod RedstoneWire;
+pub mod Sand;
+pub mod Sandstone;
+pub mod SandstoneStairs;
+pub mod Sapling;
+pub mod SignPost;
+pub mod SkullBlock;
+pub mod Slab;
+pub mod SlimeBlock;
+pub mod Snow;
+pub mod SnowLayer;
+pub mod Solid;
+pub mod SoulSand;
+pub mod Sponge;
+pub mod SpruceDoor;
+pub mod SpruceWoodStairs;
+pub mod StainedClay;
+pub mod Stair;
+pub mod StillLava;
+pub mod StillWater;
+pub mod Stone;
+pub mod StoneBrickStairs;
+pub mod StoneBricks;
+pub mod StoneButton;
+pub mod StonePressurePlate;
+pub mod StoneWall;
+pub mod Stonecutter;
+pub mod Sugarcane;
+pub mod TNT;
+pub mod TallGrass;
+pub mod TallGrassBlock;
+pub mod Thin;
+pub mod Torch;
+pub mod Transparent;
+pub mod Trapdoor;
+pub mod TrappedChest;
+pub mod Tripwire;
+pub mod TripwireHook;
+pub mod UnlitRedstoneTorch;
+pub mod UnpoweredComparator;
+pub mod UnpoweredRepeater;
+pub mod Vine;
+pub mod WallSign;
+pub mod Water;
+pub mod WaterLily;
+pub mod Wheat;
+pub mod Wood;
+pub mod Wood2;
+pub mod WoodDoor;
+pub mod WoodSlab;
+pub mod WoodStairs;
+pub mod WoodenButton;
+pub mod WoodenPressurePlate;
+pub mod Wool;
+pub mod Workbench;
+
+// 按运行时 id 查方块行为 找不到返回 None
+// 变种(如 FenceGateSpruce)与主类(FenceGate)共享 id 这里返回主类
+pub fn get_block(id: u8) -> Option<&'static dyn block_def::Block> {
+    match id {
+        0 => Some(&Air::INSTANCE),
+        1 => Some(&Stone::INSTANCE),
+        2 => Some(&Grass::INSTANCE),
+        3 => Some(&Dirt::INSTANCE),
+        4 => Some(&Cobblestone::INSTANCE),
+        5 => Some(&Planks::INSTANCE),
+        6 => Some(&Sapling::INSTANCE),
+        7 => Some(&Bedrock::INSTANCE),
+        8 => Some(&Water::INSTANCE),
+        9 => Some(&StillWater::INSTANCE),
+        10 => Some(&Lava::INSTANCE),
+        11 => Some(&StillLava::INSTANCE),
+        12 => Some(&Sand::INSTANCE),
+        13 => Some(&Gravel::INSTANCE),
+        14 => Some(&GoldOre::INSTANCE),
+        15 => Some(&IronOre::INSTANCE),
+        16 => Some(&CoalOre::INSTANCE),
+        17 => Some(&Wood::INSTANCE),
+        18 => Some(&Leaves::INSTANCE),
+        19 => Some(&Sponge::INSTANCE),
+        20 => Some(&Glass::INSTANCE),
+        21 => Some(&LapisOre::INSTANCE),
+        22 => Some(&Lapis::INSTANCE),
+        23 => Some(&Dispenser::INSTANCE),
+        24 => Some(&Sandstone::INSTANCE),
+        25 => Some(&Noteblock::INSTANCE),
+        26 => Some(&Bed::INSTANCE),
+        27 => Some(&PoweredRail::INSTANCE),
+        28 => Some(&DetectorRail::INSTANCE),
+        30 => Some(&Cobweb::INSTANCE),
+        31 => Some(&TallGrass::INSTANCE),
+        32 => Some(&DeadBush::INSTANCE),
+        35 => Some(&Wool::INSTANCE),
+        37 => Some(&Dandelion::INSTANCE),
+        39 => Some(&BrownMushroom::INSTANCE),
+        40 => Some(&RedMushroom::INSTANCE),
+        41 => Some(&Gold::INSTANCE),
+        42 => Some(&Iron::INSTANCE),
+        43 => Some(&DoubleSlab::INSTANCE),
+        45 => Some(&Bricks::INSTANCE),
+        46 => Some(&TNT::INSTANCE),
+        47 => Some(&Bookshelf::INSTANCE),
+        48 => Some(&MossStone::INSTANCE),
+        49 => Some(&Obsidian::INSTANCE),
+        50 => Some(&Torch::INSTANCE),
+        51 => Some(&Fire::INSTANCE),
+        52 => Some(&MonsterSpawner::INSTANCE),
+        53 => Some(&WoodStairs::INSTANCE),
+        54 => Some(&Chest::INSTANCE),
+        55 => Some(&RedstoneWire::INSTANCE),
+        56 => Some(&DiamondOre::INSTANCE),
+        57 => Some(&Diamond::INSTANCE),
+        58 => Some(&Workbench::INSTANCE),
+        59 => Some(&Crops::INSTANCE),
+        60 => Some(&Farmland::INSTANCE),
+        61 => Some(&Furnace::INSTANCE),
+        62 => Some(&BurningFurnace::INSTANCE),
+        63 => Some(&SignPost::INSTANCE),
+        64 => Some(&WoodDoor::INSTANCE),
+        65 => Some(&Ladder::INSTANCE),
+        66 => Some(&Rail::INSTANCE),
+        67 => Some(&CobblestoneStairs::INSTANCE),
+        68 => Some(&WallSign::INSTANCE),
+        69 => Some(&Lever::INSTANCE),
+        70 => Some(&StonePressurePlate::INSTANCE),
+        71 => Some(&IronDoor::INSTANCE),
+        72 => Some(&WoodenButton::INSTANCE),
+        73 => Some(&RedstoneOre::INSTANCE),
+        74 => Some(&GlowingRedstoneOre::INSTANCE),
+        75 => Some(&UnlitRedstoneTorch::INSTANCE),
+        76 => Some(&RedstoneTorch::INSTANCE),
+        77 => Some(&StoneButton::INSTANCE),
+        78 => Some(&SnowLayer::INSTANCE),
+        79 => Some(&Ice::INSTANCE),
+        80 => Some(&Snow::INSTANCE),
+        81 => Some(&Cactus::INSTANCE),
+        82 => Some(&Clay::INSTANCE),
+        83 => Some(&Sugarcane::INSTANCE),
+        85 => Some(&Fence::INSTANCE),
+        86 => Some(&Pumpkin::INSTANCE),
+        87 => Some(&Netherrack::INSTANCE),
+        88 => Some(&SoulSand::INSTANCE),
+        89 => Some(&Glowstone::INSTANCE),
+        90 => Some(&Portal::INSTANCE),
+        91 => Some(&LitPumpkin::INSTANCE),
+        92 => Some(&Cake::INSTANCE),
+        93 => Some(&UnpoweredRepeater::INSTANCE),
+        94 => Some(&PoweredRepeater::INSTANCE),
+        95 => Some(&InvisibleBedrock::INSTANCE),
+        97 => Some(&MonsterEgg::INSTANCE),
+        98 => Some(&StoneBricks::INSTANCE),
+        99 => Some(&BrownMushroomBlock::INSTANCE),
+        100 => Some(&RedMushroomBlock::INSTANCE),
+        101 => Some(&IronBars::INSTANCE),
+        102 => Some(&GlassPane::INSTANCE),
+        103 => Some(&Melon::INSTANCE),
+        104 => Some(&PumpkinStem::INSTANCE),
+        105 => Some(&MelonStem::INSTANCE),
+        106 => Some(&Vine::INSTANCE),
+        107 => Some(&FenceGate::INSTANCE),
+        108 => Some(&BrickStairs::INSTANCE),
+        109 => Some(&StoneBrickStairs::INSTANCE),
+        110 => Some(&Mycelium::INSTANCE),
+        111 => Some(&WaterLily::INSTANCE),
+        112 => Some(&NetherBrick::INSTANCE),
+        113 => Some(&NetherBrickFence::INSTANCE),
+        114 => Some(&NetherBrickStairs::INSTANCE),
+        115 => Some(&NetherWart::INSTANCE),
+        116 => Some(&EnchantingTable::INSTANCE),
+        117 => Some(&BrewingStand::INSTANCE),
+        118 => Some(&Cauldron::INSTANCE),
+        120 => Some(&EndPortalFrame::INSTANCE),
+        121 => Some(&EndStone::INSTANCE),
+        123 => Some(&InactiveRedstoneLamp::INSTANCE),
+        124 => Some(&ActiveRedstoneLamp::INSTANCE),
+        125 => Some(&Dropper::INSTANCE),
+        126 => Some(&ActivatorRail::INSTANCE),
+        127 => Some(&CocoaBlock::INSTANCE),
+        128 => Some(&SandstoneStairs::INSTANCE),
+        129 => Some(&EmeraldOre::INSTANCE),
+        131 => Some(&TripwireHook::INSTANCE),
+        132 => Some(&Tripwire::INSTANCE),
+        133 => Some(&Emerald::INSTANCE),
+        134 => Some(&SpruceWoodStairs::INSTANCE),
+        135 => Some(&BirchWoodStairs::INSTANCE),
+        136 => Some(&JungleWoodStairs::INSTANCE),
+        139 => Some(&StoneWall::INSTANCE),
+        140 => Some(&FlowerPot::INSTANCE),
+        141 => Some(&Carrot::INSTANCE),
+        142 => Some(&Potato::INSTANCE),
+        144 => Some(&SkullBlock::INSTANCE),
+        145 => Some(&Anvil::INSTANCE),
+        146 => Some(&TrappedChest::INSTANCE),
+        147 => Some(&LightWeightedPressurePlate::INSTANCE),
+        148 => Some(&HeavyWeightedPressurePlate::INSTANCE),
+        149 => Some(&UnpoweredComparator::INSTANCE),
+        150 => Some(&PoweredComparator::INSTANCE),
+        151 => Some(&DaylightDetector::INSTANCE),
+        152 => Some(&Redstone::INSTANCE),
+        153 => Some(&NetherQuartzOre::INSTANCE),
+        154 => Some(&Hopper::INSTANCE),
+        155 => Some(&Quartz::INSTANCE),
+        156 => Some(&QuartzStairs::INSTANCE),
+        157 => Some(&DoubleWoodSlab::INSTANCE),
+        158 => Some(&WoodSlab::INSTANCE),
+        159 => Some(&StainedClay::INSTANCE),
+        161 => Some(&Leaves2::INSTANCE),
+        162 => Some(&Wood2::INSTANCE),
+        163 => Some(&AcaciaWoodStairs::INSTANCE),
+        164 => Some(&DarkOakWoodStairs::INSTANCE),
+        165 => Some(&SlimeBlock::INSTANCE),
+        167 => Some(&IronTrapdoor::INSTANCE),
+        170 => Some(&HayBale::INSTANCE),
+        171 => Some(&Carpet::INSTANCE),
+        172 => Some(&HardenedClay::INSTANCE),
+        173 => Some(&Coal::INSTANCE),
+        174 => Some(&PackedIce::INSTANCE),
+        175 => Some(&DoublePlant::INSTANCE),
+        178 => Some(&DaylightDetectorInverted::INSTANCE),
+        179 => Some(&RedSandstone::INSTANCE),
+        180 => Some(&RedSandstoneStairs::INSTANCE),
+        181 => Some(&DoubleRedSandstoneSlab::INSTANCE),
+        182 => Some(&RedSandstoneSlab::INSTANCE),
+        183 => Some(&FenceGateSpruce::INSTANCE),
+        184 => Some(&FenceGateBirch::INSTANCE),
+        185 => Some(&FenceGateJungle::INSTANCE),
+        186 => Some(&FenceGateDarkOak::INSTANCE),
+        187 => Some(&FenceGateAcacia::INSTANCE),
+        193 => Some(&SpruceDoor::INSTANCE),
+        194 => Some(&BirchDoor::INSTANCE),
+        195 => Some(&JungleDoor::INSTANCE),
+        196 => Some(&AcaciaDoor::INSTANCE),
+        197 => Some(&DarkOakDoor::INSTANCE),
+        198 => Some(&GrassPath::INSTANCE),
+        199 => Some(&ItemFrame::INSTANCE),
+        237 => Some(&Camera::INSTANCE),
+        243 => Some(&Podzol::INSTANCE),
+        244 => Some(&Beetroot::INSTANCE),
+        245 => Some(&Stonecutter::INSTANCE),
+        246 => Some(&GlowingObsidian::INSTANCE),
+        247 => Some(&NetherReactor::INSTANCE),
+        _ => None,
+    }
+}

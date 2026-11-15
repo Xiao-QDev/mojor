@@ -7,6 +7,10 @@ pub const GRASS: u8 = 2;
 // 平坦世界 基岩 + 3 层泥土 + 草方块 地表 y = 4
 pub const SURFACE_Y: u8 = 4;
 
+// Nukkit Flat 默认预设 2;7,2x3,2;1; 里的群系是平原
+pub const BIOME: u8 = 1;
+pub const BIOME_COLOR: i32 = 0x92_bc59;
+
 pub fn generate(chunk_x: i32, chunk_z: i32) -> Chunk {
     let mut chunk = Chunk::empty(chunk_x, chunk_z);
 
@@ -18,6 +22,7 @@ pub fn generate(chunk_x: i32, chunk_z: i32) -> Chunk {
             chunk.set_block(x, 3, z, DIRT);
             chunk.set_block(x, 4, z, GRASS);
             chunk.set_height(x, z, SURFACE_Y);
+            chunk.set_biome(x, z, BIOME, BIOME_COLOR);
         }
     }
 

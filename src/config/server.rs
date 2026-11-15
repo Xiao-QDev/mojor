@@ -7,6 +7,9 @@ use super::DEFAULT_VIEW_DISTANCE;
 // 这个版本就是 0.14.3 不再走配置 改版本时只改这里
 pub const VERSION: &str = "0.14.3";
 
+// 玩家上限的默认值 与 server.properties 的 max-players 一致
+pub const DEFAULT_MAX_PLAYERS: u32 = 20;
+
 // 键名统一 kebab-case 与 server.properties 风格一致 少写字段由 Default 兜底
 // 部分字段(刷怪/白名单/PVP 等)是给玩法层预留的 目前尚未接入逻辑
 #[derive(Debug, Clone, Deserialize)]
@@ -54,10 +57,10 @@ impl Default for ServerConfig {
             bind: "0.0.0.0:19132".into(),
             motd: "Mojor Server For Minecraft:PE".into(),
             online_players: 0,
-            max_players: 20,
+            max_players: DEFAULT_MAX_PLAYERS,
             gamemode: 1,
             world: "world".into(),
-            generator: "terrain".into(),
+            generator: "realistic".into(),
             seed: 1337,
             view_distance: DEFAULT_VIEW_DISTANCE,
             spawn_protection: 16,

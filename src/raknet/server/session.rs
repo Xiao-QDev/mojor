@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tracing::trace;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::raknet::GAME_PACKET_PREFIX;
 use crate::raknet::protocol::frame::{
     Ack, DataFrame, EncapsulatedPacket, ID_ACK, ID_DATA_PACKET_BASE, ID_NACK, RELIABILITY_RELIABLE,
     RELIABILITY_RELIABLE_ORDERED, SplitInfo,
@@ -31,11 +34,43 @@ pub enum SessionState {
     Connected,
 }
 
+// 0.14 服务端的两种下行形态 与 Nukkit RakNetInterface.putPacket 一致
+// 小于 BATCH_THRESHOLD 的包直接发单包 [0x8e][pid][body]
+// 大包才套 BatchPacket 0x8e 0x92 [i32 压缩长度] zlib([i32 帧长][pid][body])
+// 注意 batch 帧内不带 0x8e 那层只有单包路径才有 多写会让客户端把 0x8e 当包 id 整批丢弃
+const BATCH_THRESHOLD: usize = 512;
+
+fn batch(payload: &[u8]) -> Result<Bytes> {
+    let mut raw = Vec::with_capacity(payload.len() + 4);
+    raw.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+    raw.extend_from_slice(payload);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw).map_err(|_| Error::Zlib)?;
+    let compressed = encoder.finish().map_err(|_| Error::Zlib)?;
+
+    // 0x92 为 BatchPacket 的包 id
+    let mut out = Vec::with_capacity(1 + 4 + compressed.len());
+    out.push(0x92);
+    out.extend_from_slice(&(compressed.len() as i32).to_be_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(Bytes::from(out))
+}
+
+// 单包路径 小包不压缩也不批 只在包体前补 0x8e
+fn single(payload: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(GAME_PACKET_PREFIX);
+    out.extend_from_slice(payload);
+    Bytes::from(out)
+}
+
+// 每条连接有独立的会话 id 老会话收尾时上层按 id 区分 不会误伤同端点的新连接
 #[derive(Debug)]
 pub enum SessionEvent {
-    Opened { addr: SocketAddr, client_id: u64 },
-    Closed { addr: SocketAddr, reason: String },
-    Game { addr: SocketAddr, payload: Bytes },
+    Opened { id: u64, addr: SocketAddr, client_id: u64 },
+    Closed { id: u64, addr: SocketAddr, reason: String },
+    Game { id: u64, addr: SocketAddr, payload: Bytes },
 }
 
 struct SentFrame {
@@ -78,6 +113,8 @@ impl SplitAssembler {
 }
 
 pub struct Session {
+    // 会话唯一 id 由 RakNetServer 递增分配
+    pub id: u64,
     pub addr: SocketAddr,
     pub server_id: u64,
     pub state: SessionState,
@@ -86,6 +123,8 @@ pub struct Session {
 
     last_update: Instant,
     active: bool,
+    // 客户端主动断开(0x15) 收包循环据此立刻移除会话 不等 10 秒超时
+    closed: bool,
 
     send_seq: u32,
     message_index: u32,
@@ -110,8 +149,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(addr: SocketAddr, server_id: u64) -> Self {
+    pub fn new(id: u64, addr: SocketAddr, server_id: u64) -> Self {
         Self {
+            id,
             addr,
             server_id,
             state: SessionState::Unconnected,
@@ -119,6 +159,7 @@ impl Session {
             client_id: 0,
             last_update: Instant::now(),
             active: false,
+            closed: false,
             send_seq: 0,
             message_index: 0,
             channel_index: [0; 32],
@@ -165,7 +206,7 @@ impl Session {
             pid if (ID_DATA_PACKET_BASE..=0x8f).contains(&pid) => {
                 self.on_data_frame(buf, out, events)?
             }
-            pid => trace!(pid, "忽略未知数据包"),
+            _ => {},
         }
 
         self.flush_send_queue(out);
@@ -175,6 +216,7 @@ impl Session {
     pub fn tick(&mut self, now: Instant, out: &mut Vec<Bytes>, events: &mut Vec<SessionEvent>) {
         if !self.active && now.duration_since(self.last_update) > SESSION_TIMEOUT {
             events.push(SessionEvent::Closed {
+                id: self.id,
                 addr: self.addr,
                 reason: "timeout".into(),
             });
@@ -223,25 +265,46 @@ impl Session {
     }
 
     pub fn send_game(&mut self, payload: Bytes, out: &mut Vec<Bytes>) -> Result<()> {
+        let body = if payload.len() >= BATCH_THRESHOLD {
+            // batch 外层同样要有 0x8e 内层才是 0x92 压缩块
+            let batched = batch(&payload)?;
+            let mut out = Vec::with_capacity(batched.len() + 1);
+            out.push(GAME_PACKET_PREFIX);
+            out.extend_from_slice(&batched);
+            Bytes::from(out)
+        } else {
+            single(&payload)
+        };
         let pk = EncapsulatedPacket {
             reliability: RELIABILITY_RELIABLE_ORDERED,
             message_index: None,
             order_index: None,
             order_channel: 0,
             split: None,
-            payload,
+            payload: body,
         };
         self.add_to_queue(pk, out)?;
         self.flush_send_queue(out);
         Ok(())
     }
 
-    #[cfg(test)]
-    fn recovery_len(&self) -> usize {
+    // 已发出但还没被客户端确认的数据帧数量 用来判断下行是否真的送达
+    pub fn recovery_len(&self) -> usize {
         self.recovery.len()
     }
 
+    // 当前发送序号 与 recovery 配合判断客户端按序确认到了哪里
+    pub fn send_seq(&self) -> u32 {
+        self.send_seq
+    }
+
+    // 客户端已主动断开 收包循环据此立刻移除会话
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     fn on_open_connection_request_1(&mut self, buf: &[u8], out: &mut Vec<Bytes>) -> Result<()> {
+        // 同端点重连由 RakNetServer 直接换一条新会话 这里只处理首包
         if self.state != SessionState::Unconnected {
             return Ok(());
         }
@@ -406,7 +469,6 @@ impl Session {
         if entry.complete() {
             let data = entry.assemble();
             self.splits.remove(&split.id);
-            trace!(client = %self.addr, split_id = split.id, count = split.count, "分片重组完成");
             self.route(data, out, events)?;
         }
         Ok(())
@@ -440,12 +502,15 @@ impl Session {
                     ClientHandshake::decode(&payload)?;
                     self.state = SessionState::Connected;
                     events.push(SessionEvent::Opened {
+                        id: self.id,
                         addr: self.addr,
                         client_id: self.client_id,
                     });
                 }
                 ID_CLIENT_DISCONNECT => {
+                    self.closed = true;
                     events.push(SessionEvent::Closed {
+                        id: self.id,
                         addr: self.addr,
                         reason: "client disconnect".into(),
                     });
@@ -457,10 +522,11 @@ impl Session {
                     };
                     self.add_to_queue(EncapsulatedPacket::unreliable(pong.encode()), out)?;
                 }
-                _ => trace!(id, "未处理的内部包"),
+                _ => {},
             }
         } else if self.state == SessionState::Connected {
             events.push(SessionEvent::Game {
+                id: self.id,
                 addr: self.addr,
                 payload,
             });
@@ -626,7 +692,7 @@ mod tests {
     }
 
     fn connected_session() -> Session {
-        let mut session = Session::new(peer(), 42);
+        let mut session = Session::new(0, peer(), 42);
         let mut out = Vec::new();
         let mut events = Vec::new();
         session
@@ -661,10 +727,10 @@ mod tests {
         let mut session = connected_session();
         let mut out = Vec::new();
         session
-            .send_game(Bytes::from_static(b"\x8e\x90"), &mut out)
+            .send_game(Bytes::from_static(b"\x90\x00\x00\x00\x00"), &mut out)
             .unwrap();
         session
-            .send_game(Bytes::from_static(b"\x8e\x95"), &mut out)
+            .send_game(Bytes::from_static(b"\x95\x00"), &mut out)
             .unwrap();
 
         let orders: Vec<u32> = out
@@ -677,9 +743,45 @@ mod tests {
         assert_eq!(orders, vec![0, 1]);
     }
 
+    // 与 Nukkit RakNetInterface 一致 小包单发 大包才 batch 帧内不带 0x8e
+    #[test]
+    fn small_packets_are_single_and_large_are_batched() {
+        let mut session = connected_session();
+        let mut out = Vec::new();
+        session
+            .send_game(Bytes::from_static(b"\x90\x00\x00\x00\x00"), &mut out)
+            .unwrap();
+        let frame = DataFrame::decode(&out[0]).unwrap();
+        assert_eq!(&frame.packets[0].payload[..], b"\x8e\x90\x00\x00\x00\x00");
+
+        out.clear();
+        session
+            .send_game(Bytes::from(vec![0x95u8; 1024]), &mut out)
+            .unwrap();
+        let first = DataFrame::decode(&out[0]).unwrap();
+        let payload = &first.packets[0].payload;
+        assert_eq!(payload[0], 0x8e);
+        assert_eq!(payload[1], 0x92);
+    }
+
+    // 新架构下同端点重连由 RakNetServer 换新会话 旧会话不再复用协议状态
+    // 这里只保证旧会话收到重复首包时不会打乱已经建立的连接
+    #[test]
+    fn duplicate_request_1_on_connected_session_is_ignored() {
+        let mut session = connected_session();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        session
+            .handle_datagram(&request_1(1492), &mut out, &mut events)
+            .unwrap();
+        assert!(out.is_empty());
+        assert!(events.is_empty());
+        assert_eq!(session.state, SessionState::Connected);
+    }
+
     #[test]
     fn unconnected_handshake_completes() {
-        let mut session = Session::new(peer(), 42);
+        let mut session = Session::new(0, peer(), 42);
         let mut out = Vec::new();
         let mut events = Vec::new();
 
@@ -702,7 +804,7 @@ mod tests {
 
     #[test]
     fn client_connect_gets_server_handshake_and_then_opens() {
-        let mut session = Session::new(peer(), 42);
+        let mut session = Session::new(0, peer(), 42);
         let mut out = Vec::new();
         let mut events = Vec::new();
 
@@ -856,7 +958,7 @@ mod tests {
 
         let base = session.recovery_len();
         session
-            .send_game(Bytes::from_static(b"\x8e\x93hi"), &mut out)
+            .send_game(Bytes::from_static(b"\x93hi"), &mut out)
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(session.recovery_len(), base + 1);
@@ -873,7 +975,7 @@ mod tests {
 
         out.clear();
         session
-            .send_game(Bytes::from_static(b"\x8e\x93yo"), &mut out)
+            .send_game(Bytes::from_static(b"\x93yo"), &mut out)
             .unwrap();
         let seq = out[0][1] as u32 | ((out[0][2] as u32) << 8) | ((out[0][3] as u32) << 16);
         out.clear();

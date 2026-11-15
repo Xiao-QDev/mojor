@@ -340,6 +340,19 @@ pub fn decode(chunk_x: i32, chunk_z: i32, data: &[u8]) -> Option<Chunk> {
     let heights = reader.bytes(CHUNK_WIDTH * CHUNK_WIDTH)?;
     let biomes = reader.bytes(CHUNK_WIDTH * CHUNK_WIDTH)?;
 
+    // 旧版 RTG 曾把 Java 灰化土（dirt:2）原样落成 id 3 / meta 2。
+    // Bedrock 的灰化土是独立方块 243，加载旧存档时迁移一次。
+    for x in 0..CHUNK_WIDTH {
+        for z in 0..CHUNK_WIDTH {
+            for y in 0..CHUNK_HEIGHT {
+                if chunk.block(x, y, z) == 3 && chunk.meta(x, y, z) == 2 {
+                    chunk.set_block(x, y, z, 243);
+                    chunk.set_meta(x, y, z, 0);
+                }
+            }
+        }
+    }
+
     chunk.set_height_map(heights);
     for z in 0..CHUNK_WIDTH {
         for x in 0..CHUNK_WIDTH {
@@ -350,6 +363,9 @@ pub fn decode(chunk_x: i32, chunk_z: i32, data: &[u8]) -> Option<Chunk> {
 
     chunk.generated = true;
     chunk.populated = true;
+    // 存档里的光照是之前算好的 直接信任 lit=true 首屏零延迟
+    // 玩家后续改动由异步光照增量修正
+    chunk.lit = true;
     Some(chunk)
 }
 
@@ -379,6 +395,18 @@ mod tests {
                 assert_eq!(a.biome_id(x, z), b.biome_id(x, z));
             }
         }
+    }
+
+    #[test]
+    fn legacy_podzol_is_migrated_to_block_243() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.fill_sky_light(15);
+        // 旧 RTG 的落盘结果：dirt id 3、meta 2
+        chunk.set_block(2, 64, 3, 3);
+        chunk.set_meta(2, 64, 3, 2);
+        let back = decode(0, 0, &encode(&chunk)).unwrap();
+        assert_eq!(back.block(2, 64, 3), 243);
+        assert_eq!(back.meta(2, 64, 3), 0);
     }
 
     #[test]

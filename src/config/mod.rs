@@ -103,27 +103,20 @@ impl Config {
 }
 
 // 配置模板随二进制一起编译进来 首次启动按模板生成带注释的文件
-const DEFAULT_SERVER_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/server.toml"));
-const DEFAULT_MOJOR_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/mojor.toml"));
+const DEFAULT_SERVER_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/seting/server.toml"));
+const DEFAULT_MOJOR_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/seting/mojor.toml"));
 
 // 文件不存在就按模板创建 然后读取解析 失败都回退默认值 不让坏配置挡住启动
 fn load_or_create<T: serde::de::DeserializeOwned + Default>(path: &str, template: &str) -> T {
     tracing::info!("Loading {path}");
-    if !std::path::Path::new(path).exists()
-        && let Err(e) = std::fs::write(path, template)
-    {
-        tracing::warn!(path, error = %e, "配置文件创建失败 使用默认值");
+    if !std::path::Path::new(path).exists() {
+        let _ = std::fs::write(path, template);
     }
     match std::fs::read_to_string(path) {
-        Ok(text) => match toml::from_str::<T>(&text) {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(path, error = %e, "配置文件解析失败 使用默认值");
-                T::default()
-            }
-        },
-        Err(e) => {
-            tracing::warn!(path, error = %e, "配置文件读取失败 使用默认值");
+        Ok(text) => toml::from_str::<T>(&text).unwrap_or_else(|_| {
+            T::default()
+        }),
+        Err(_) => {
             T::default()
         }
     }
@@ -137,7 +130,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.server_name(),
-            format!("MCPE;{};70;{};0;20", c.motd, crate::config::server::VERSION)
+            format!("MCPE;{};70;{};0;20", c.motd, server::VERSION)
         );
     }
 

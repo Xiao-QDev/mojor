@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tracing::warn;
 
-use crate::entity::{ItemDrop, PlayerDirectory, RegionPlayer};
+use crate::entity::{ItemDrop, PlayerDirectory, RegionPlayer, within_view_distance};
 use crate::entity::{ITEM_LIFETIME, ITEM_PICKUP_DELAY};
 use crate::network::protocol::item::ItemStack;
 use crate::network::protocol::item_entity::TakeItemEntityPacket;
@@ -22,6 +22,7 @@ use crate::level::chunk_loader::ChunkLoader;
 use crate::level::chunk_io::ChunkIoPool;
 use crate::level::chunk_manager::ChunkManager;
 use crate::level::format::chunk::Chunk;
+use crate::level::light::{LightReceipt, LightService};
 use crate::level::generator::Generator;
 use crate::level::region::RegionId;
 use crate::level::region_handler::{self, PacketResult};
@@ -254,6 +255,10 @@ pub(crate) enum RegionMsg {
     Prefetch {
         chunks: Vec<(i32, i32)>,
     },
+    // 光照 worker 把算好的光照发回来 写回缓存后让等待的玩家重新排队
+    LightDone {
+        receipt: LightReceipt,
+    },
     Stop,
 }
 
@@ -314,6 +319,7 @@ impl RegionHandle {
         idle_ticks: u64,
         view_distance: i32,
         io: Arc<ChunkIoPool>,
+        light: Arc<LightService>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         registry.register(id, tx.clone());
@@ -344,6 +350,7 @@ impl RegionHandle {
                     idle_ticks,
                     view_distance,
                     io,
+                    light,
                 );
             })
             .expect("创建 region 线程失败");
@@ -580,6 +587,7 @@ fn run(
     idle_ticks: u64,
     view_distance: i32,
     io: Arc<ChunkIoPool>,
+    light: Arc<LightService>,
 ) {
     let mut io = IoState {
         pool: io,
@@ -631,13 +639,16 @@ fn run(
         if now >= next_tick {
             ticks += 1;
             manager.tick(&gc_chunks);
+            // 攒下的光照任务交给异步引擎 快照已在 region 线程抓好
+            for job in manager.take_light_jobs(&tx) {
+                light.submit(job);
+            }
             // 异步落盘请求到了就每 tick 分批写一点 平滑掉大批量改动的抖动
             if flush_pending {
                 match manager.flush_limited(MAX_FLUSH_PER_TICK) {
                     Ok(0) => flush_pending = false,
                     Ok(_) => {}
-                    Err(e) => {
-                        warn!(region_x = id.x, region_z = id.z, error = %e, "区块落盘失败");
+                    Err(_) => {
                         flush_pending = false;
                     }
                 }
@@ -798,6 +809,14 @@ fn tick_players(
             let Some(pos) = view.pending_chunks.pop_front() else {
                 break;
             };
+            // 视野移走之后队列里还留着旧坐标。属主分片可能已经按空闲回收，
+            // 继续投递只会每 tick 报一次警。直接丢掉并清掉已下发记录，
+            // 以后重新走进视野时还能再次入队。
+            if !within_view_distance(view.chunk_center, pos, view.radius) {
+                view.sent_chunks.remove(&pos);
+                view.awaiting_light.remove(&pos);
+                continue;
+            }
             batch.push(pos);
         }
         if batch.is_empty() {
@@ -811,7 +830,16 @@ fn tick_players(
         for pos in batch {
             if manager.owns(pos.0, pos.1) {
                 if manager.is_cached(pos.0, pos.1) {
-                    owned.push(pos);
+                    // 光照没回填的先退回队列 等下一轮 LightDone 重排后再发
+                    // sent_chunks 保留 入队判重靠它 awaiting_light 标记等光照
+                    if manager.is_lit(pos.0, pos.1) {
+                        // 真正要发了 摘掉等待标记 后续邻居回执不能再把它重排
+                        view.awaiting_light.remove(&pos);
+                        owned.push(pos);
+                    } else {
+                        view.awaiting_light.insert(pos);
+                        view.pending_chunks.push_back(pos);
+                    }
                 } else {
                     io.request(pos.0, pos.1, Waiter::Owned(*addr), tx);
                     view.pending_load += 1;
@@ -1070,8 +1098,7 @@ fn dispatch(
             Ok(n) => {
                 let _ = reply.send(n);
             }
-            Err(e) => {
-                warn!(region_x = id.x, region_z = id.z, error = %e, "区块落盘失败");
+            Err(_) => {
                 let _ = reply.send(0);
             }
         },
@@ -1346,6 +1373,23 @@ fn dispatch(
         RegionMsg::PlayerCount { reply } => {
             let _ = reply.send(players.len());
         }
+        // 光照算完了 写回缓存 让等它的玩家重新排队下发
+        RegionMsg::LightDone { receipt } => {
+            let keys: Vec<(i32, i32)> =
+                receipt.chunks.iter().map(|data| (data.x, data.z)).collect();
+            manager.apply_light_receipt(receipt);
+            for key in keys {
+                for player in players.values_mut() {
+                    let view = &mut player.view;
+                    // 只补弹过队发现没光照的那个窗口：awaiting_light 在退回时插入、
+                    // 真正发送时摘除。已发送过的区块不在里面 邻居回执带着它的边缘
+                    // 脏数据也不会把已下发的区块重发一遍
+                    if view.awaiting_light.remove(&key) && !view.pending_chunks.contains(&key) {
+                        view.pending_chunks.push_back(key);
+                    }
+                }
+            }
+        }
         RegionMsg::Stop => return false,
     }
     true
@@ -1383,6 +1427,7 @@ mod tests {
             IDLE_SHUTDOWN_TICKS,
             crate::config::DEFAULT_VIEW_DISTANCE,
             ChunkIoPool::new(None, 1),
+            LightService::start(),
         )
     }
 
@@ -1449,9 +1494,21 @@ mod tests {
     #[test]
     fn payload_reflects_edits() {
         let region = spawn_flat(0, 0);
-        // 先触发生成让区块进缓存 payload 现在只读缓存不触发读盘
+        // 先触发生成让区块进缓存 payload 只回已照亮(lit)的区块
         assert_eq!(region.block(0, 4, 0), GRASS);
-        assert_eq!(region.payload(0, 0).expect("区块已生成")[5], 0);
+        // 光照异步算 轮询等 LightDone 回填
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if region
+                .payload(0, 0)
+                .map(|data| data[5])
+                .is_some_and(|value| value == 0)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "光照没有按时回填");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // 点草方块的上表面 往上面放一块石头
         assert!(place_and_wait(&region, (0, 4, 0), (0, 5, 0), 3));
         assert_eq!(region.payload(0, 0).expect("区块已生成")[5], 3);

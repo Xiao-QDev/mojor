@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::RwLock;
 
 use bytes::Bytes;
+use md5::{Digest, Md5};
+use uuid::{Builder, Uuid};
 
 use crate::entity::SPAWN_POSITION;
 use crate::network::protocol::add_player::AddPlayerPacket;
@@ -18,7 +20,7 @@ pub struct PlayerState {
     // 出生状态已下发 之后参与互相可见
     pub(crate) spawned: bool,
     pub(crate) eid: i64,
-    pub(crate) uuid: [u8; 16],
+    pub(crate) uuid: Uuid,
     pub(crate) username: String,
     pub(crate) skin: Skin,
     // 区块队列清空后由 region 通知 再补出生状态
@@ -28,7 +30,7 @@ pub struct PlayerState {
     pub(crate) pitch: f32,
     // 背包 27 个主格
     pub(crate) inventory: Vec<Option<ItemStack>>,
-    // 快捷栏位置 -> 包内槽位 + 9 与 Nukkit 的换算一致
+    // 快捷栏位置 -> 包内槽位 + 36 与 Nukkit 的换算一致
     pub(crate) hotbar: Vec<i32>,
     pub(crate) sneaking: bool,
     pub(crate) sprinting: bool,
@@ -41,7 +43,7 @@ impl Default for PlayerState {
             spawned: false,
             // 0 保留给客户端自己的实体 StartGame 里固定为 0
             eid: 0,
-            uuid: [0; 16],
+            uuid: Uuid::nil(),
             username: String::new(),
             skin: Skin {
                 model: String::new(),
@@ -52,11 +54,30 @@ impl Default for PlayerState {
             yaw: 0.0,
             pitch: 0.0,
             inventory: vec![None; 27],
-            hotbar: (0..9).map(|slot| slot + 9).collect(),
+            hotbar: (0..36).map(|slot| slot + 36).collect(),
             sneaking: false,
             sprinting: false,
         }
     }
+}
+
+// 服务端给玩家分配 uuid 它是玩家列表与存档的唯一身份
+// 优先用登录包里的客户端 uuid 与 Nukkit 的 this.uuid = loginPacket.clientUUID 一致
+// 客户端没带(全零)时退化成 Java 版离线 uuid 免得同一台设备每次登录都换身份
+pub(crate) fn assign_uuid(client_uuid: [u8; 16], username: &str) -> Uuid {
+    let client = Uuid::from_bytes(client_uuid);
+    if client.is_nil() {
+        offline_uuid(username)
+    } else {
+        client
+    }
+}
+
+// Java 版离线模式的 UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(UTF_8))
+// 也就是 MD5 之后把版本置 3 变体置 RFC 4122 与 uuid::Uuid::new_v3 的差别只在没有命名空间前缀
+pub(crate) fn offline_uuid(username: &str) -> Uuid {
+    let digest = Md5::digest(format!("OfflinePlayer:{username}").as_bytes());
+    Builder::from_md5_bytes(digest.into()).into_uuid()
 }
 
 // 玩家摘要 由 global region 维护 相当于 Folia 的 player list
@@ -65,7 +86,7 @@ impl Default for PlayerState {
 #[allow(dead_code)]
 pub(crate) struct PlayerSnapshot {
     pub(crate) eid: i64,
-    pub(crate) uuid: [u8; 16],
+    pub(crate) uuid: Uuid,
     pub(crate) username: String,
     pub(crate) skin: Skin,
     pub(crate) position: (f32, f32, f32),
@@ -208,7 +229,7 @@ impl PlayerState {
 
     pub(crate) fn list_entry(&self) -> PlayerListEntry {
         PlayerListEntry {
-            uuid: self.uuid,
+            uuid: *self.uuid.as_bytes(),
             eid: self.eid,
             username: self.username.clone(),
             skin: self.skin.clone(),
@@ -217,7 +238,7 @@ impl PlayerState {
 
     pub(crate) fn add_packet(&self) -> Bytes {
         AddPlayerPacket {
-            uuid: self.uuid,
+            uuid: *self.uuid.as_bytes(),
             username: self.username.clone(),
             eid: self.eid,
             position: self.position,
@@ -255,6 +276,9 @@ pub(crate) struct PlayerView {
     // 已下发过的区块 移动时只补新进入视野的部分
     pub(crate) sent_chunks: HashSet<(i32, i32)>,
     pub(crate) pending_chunks: VecDeque<(i32, i32)>,
+    // 弹出后发现光照没回填被退回的区块 精确标记"排队等光照"
+    // sent_chunks 发送后不清除 拿它判重排会把已发送的区块再发一遍
+    pub(crate) awaiting_light: HashSet<(i32, i32)>,
     // 已经投给别的 region 代发的区块数 等对方回执到了才算交付完
     pub(crate) pending_foreign: usize,
     // 已经交给 IO 池在后台加载的区块数 回执到了重新入队才算交付完
@@ -291,6 +315,7 @@ impl PlayerView {
             radius,
             sent_chunks: HashSet::new(),
             pending_chunks: VecDeque::new(),
+            awaiting_light: HashSet::new(),
             pending_foreign: 0,
             pending_load: 0,
             completed: false,
@@ -316,6 +341,21 @@ impl PlayerView {
         // 否则走过的区块坐标会一直留在集合里 玩家探索越久内存越大
         self.sent_chunks
             .retain(|&(x, z)| within_view_distance(center, (x, z), radius + 2));
+        // 旧视野里还没投递的坐标一起清掉 否则它们占着每 tick 的下发名额；
+        // 同步丢掉下发记录，重新走进视野时才能正常再排一次
+        let mut dropped = Vec::new();
+        self.pending_chunks.retain(|&position| {
+            if within_view_distance(center, position, radius) {
+                true
+            } else {
+                dropped.push(position);
+                false
+            }
+        });
+        for position in dropped {
+            self.sent_chunks.remove(&position);
+            self.awaiting_light.remove(&position);
+        }
         self.completed = false;
     }
 
@@ -336,6 +376,27 @@ impl PlayerView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 客户端带了 uuid 就直接用 它是玩家列表与存档的身份
+    #[test]
+    fn assign_uuid_keeps_client_identity() {
+        let client = Uuid::from_bytes([0x5a; 16]);
+        assert_eq!(assign_uuid([0x5a; 16], "alice"), client);
+    }
+
+    // 客户端没带 uuid 时退回 Java 版离线 uuid 同一个名字永远得到同一个值
+    // 期望值就是 Java 的 UUID.nameUUIDFromBytes("OfflinePlayer:alice")
+    #[test]
+    fn assign_uuid_falls_back_to_java_offline_uuid() {
+        let alice = assign_uuid([0; 16], "alice");
+        assert_eq!(alice.to_string(), "40f5db53-a47a-33ee-b1f6-db0e20deded4");
+        assert_eq!(alice, offline_uuid("alice"));
+        assert_ne!(alice, offline_uuid("bob"));
+        assert_ne!(alice, Uuid::nil());
+        // RFC 4122 的 version 3 与 variant 位
+        assert_eq!(alice.get_version_num(), 3);
+        assert_eq!(alice.as_bytes()[8] & 0xc0, 0x80);
+    }
 
     // 半径 2 时下发圈是完整的 5x5 25 块 与 vanilla 的 ChunkTrackingView 一致
     #[test]
@@ -366,6 +427,27 @@ mod tests {
             .count();
         assert_eq!(count, 49);
         assert!(within_view_distance((0, 0), (3, 3), 3));
+    }
+
+    // 视野移动后，还没投递的旧坐标不能留在队列里占下发名额
+    #[test]
+    fn moving_view_drops_undelivered_chunks_outside_the_circle() {
+        // 出生在区块 (0,0) 半径 2，队列里是完整的 25 块
+        let mut view = PlayerView::new((8.0, 5.0, 8.0), 2);
+        assert_eq!(view.pending_chunks.len(), 25);
+
+        // 中心移到区块 (4,0)：旧中心 (0,0) 出了下发圈，但还在两圈缓冲里，
+        // 只有清理队列时才会被丢掉
+        view.update((72.0, 5.0, 8.0), 2);
+        assert!(
+            view.pending_chunks
+                .iter()
+                .all(|&pos| within_view_distance(view.chunk_center, pos, 2)),
+            "移出视野的旧坐标还留在下发队列里"
+        );
+        assert!(!view.pending_chunks.contains(&(0, 0)));
+        // 下发记录也要清掉，重新走进视野时才能再排一次
+        assert!(!view.sent_chunks.contains(&(0, 0)));
     }
 
     // 半径 4 时切掉四角 delta 3+3 平方和 18 >= 16 欧氏圆的形状才显出来

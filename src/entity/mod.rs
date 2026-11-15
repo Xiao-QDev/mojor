@@ -2,11 +2,14 @@
 // 这里只放状态与物理 收发包一律走 network 层
 pub mod item_drop;
 pub mod player;
+pub mod player_data;
 
 pub(crate) use item_drop::ItemDrop;
 pub(crate) use player::{
-    PlayerDirectory, PlayerSnapshot, PlayerState, RegionPlayer,
+    PlayerDirectory, PlayerSnapshot, PlayerState, RegionPlayer, assign_uuid,
+    within_view_distance,
 };
+pub(crate) use player_data::PlayerData;
 
 // 玩家出生坐标 世界坐标常量
 pub const SPAWN_POSITION: (f32, f32, f32) = (0.5, 5.0, 0.5);

@@ -3,9 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub use crate::config::{DEFAULT_VIEW_DISTANCE, MAX_VIEW_DISTANCE};
+use crate::config::server::DEFAULT_MAX_PLAYERS;
 use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::generator::Generator;
@@ -13,7 +14,7 @@ use crate::level::generator::terrain::SEA_LEVEL;
 use crate::level::level::Level;
 use crate::level::region::RegionId;
 use crate::network::protocol::move_player::MovePlayerPacket;
-use crate::command::{self, Command, TimeOp};
+use crate::command::{self, Command, CommandSay};
 use crate::network::protocol::pid::{BATCH, LOGIN, MOVE_PLAYER, TEXT};
 use crate::network::protocol::player_list::{PlayerListEntry, PlayerListPacket};
 use crate::network::protocol::remove_player::RemovePlayerPacket;
@@ -26,12 +27,11 @@ pub mod protocol;
 mod broadcast;
 mod handlers;
 mod login;
-mod world_time;
 
 use broadcast::reply;
-use world_time::WorldTime;
-use crate::entity::{ItemDrop, PlayerDirectory, PlayerSnapshot, PlayerState};
+use crate::entity::{ItemDrop, PlayerData, PlayerDirectory, PlayerSnapshot, PlayerState};
 use crate::level::distance::PlayerChunkTracker;
+use crate::level::WorldTime;
 use login::spawn_sequence;
 
 #[cfg(test)]
@@ -43,6 +43,11 @@ pub use crate::entity::{
     ITEM_PICKUP_GROW_VERTICAL, PLAYER_HALF_WIDTH, PLAYER_HEIGHT, SPAWN_POSITION,
 };
 
+// SendCmd / CommandOutput 的定义在 command 层 这里只做再导出
+// 让 network 内外的既有引用(region_handler/broadcast/handlers/tests/tick_manager)无需改动
+pub use crate::command::SendCmd;
+pub(crate) use crate::command::CommandOutput;
+
 pub const SPAWN_BLOCK: (i32, i32, i32) = (0, 4, 0);
 
 pub const GAMEMODE_SURVIVAL: u8 = 0;
@@ -51,13 +56,6 @@ pub const GAMEMODE_CREATIVE: u8 = 1;
 pub const CHUNKS_PER_TICK: usize = 4;
 // 距离场每 tick 最多传播多少个节点 超了留给下 tick 单帧不卡死
 const MAX_DISTANCE_UPDATES: usize = 4096;
-
-// 主循环发给 RakNet 层的下行命令
-// 只带游戏包包体 0x8e 前缀由 RakNet 层封装时补 避免多一次整包拷贝
-#[derive(Debug)]
-pub enum SendCmd {
-    GamePackets { addr: SocketAddr, bodies: Vec<Bytes> },
-}
 
 pub struct NetworkState {
     players: HashMap<SocketAddr, PlayerState>,
@@ -69,6 +67,8 @@ pub struct NetworkState {
     seed: u32,
     // 服务端允许的区块半径 越大一次进服要下发的区块越多
     view_distance: i32,
+    // 玩家上限 来自 server.toml 的 max-players list 命令与 pong 共用
+    max_players: u32,
     // 世界里现存的掉落物 由各 region 回报的只读镜像
     drops: Vec<ItemDrop>,
     drops_by_region: HashMap<RegionId, Vec<ItemDrop>>,
@@ -76,6 +76,9 @@ pub struct NetworkState {
     directory: Arc<PlayerDirectory>,
     // 玩家归属分片 包按这个表投递
     player_index: HashMap<SocketAddr, RegionId>,
+    // 每个 UDP 端点当前生效的会话 id 同端点重连时新会话直接顶替旧会话
+    // 旧会话的关闭/残留包带旧 id 会被忽略 不会误删或覆盖新玩家
+    session_of: HashMap<SocketAddr, u64>,
     // 上一轮 GC 的根集合 只在变化时重新标记
     last_gc_roots: HashMap<RegionId, HashSet<(i32, i32)>>,
     // 玩家区块距离场 照搬 vanilla DistanceManager 手电筒照到哪加载到哪
@@ -85,11 +88,20 @@ pub struct NetworkState {
     spawn_cache: Option<((i32, i32, i32), (f32, f32, f32))>,
     // 服务端世界时间 照搬 Nukkit Level 的 checkTime/sendTime
     world_time: WorldTime,
+    // stop 命令触发 主循环据此优雅停机
+    shutdown_requested: bool,
+    // 世界名称 来自 server.toml 的 world 用于玩家上下线日志
+    world_name: String,
 }
 
 impl NetworkState {
+    // 启动时把 server.toml 的 max-players 灌进来 构造时先用默认值
+    pub(crate) fn set_max_players(&mut self, max_players: u32) {
+        self.max_players = max_players;
+    }
+
     pub fn new(gamemode: u8) -> Self {
-        Self::with_world(gamemode, Level::new(), 0, DEFAULT_VIEW_DISTANCE)
+        Self::with_world(gamemode, Level::new(), 0, DEFAULT_VIEW_DISTANCE, "world".to_string())
     }
 
     // 带存档与地形生成器的世界 区块缺失时按生成器创建
@@ -100,13 +112,20 @@ impl NetworkState {
         seed: u32,
         view_distance: i32,
         io_workers: usize,
+        world_name: String,
     ) -> Self {
         let mut level = Level::with_loader(loader, io_workers);
         level.set_generator(generator);
-        Self::with_world(gamemode, level, seed, view_distance)
+        Self::with_world(gamemode, level, seed, view_distance, world_name)
     }
 
-    pub fn with_world(gamemode: u8, mut level: Level, seed: u32, view_distance: i32) -> Self {
+    pub fn with_world(
+        gamemode: u8,
+        mut level: Level,
+        seed: u32,
+        view_distance: i32,
+        world_name: String,
+    ) -> Self {
         let view_distance = view_distance.clamp(1, MAX_VIEW_DISTANCE);
         level.set_view_distance(view_distance);
         let directory = level.directory();
@@ -117,15 +136,19 @@ impl NetworkState {
             level,
             seed,
             view_distance,
+            max_players: DEFAULT_MAX_PLAYERS,
             drops: Vec::new(),
             drops_by_region: HashMap::new(),
             directory,
             player_index: HashMap::new(),
+            session_of: HashMap::new(),
             last_gc_roots: HashMap::new(),
             chunk_tracker: PlayerChunkTracker::with_view_distance(MAX_VIEW_DISTANCE, view_distance),
             gc_ticks: 0,
             spawn_cache: None,
             world_time: WorldTime::default(),
+            shutdown_requested: false,
+            world_name,
         }
     }
 
@@ -198,11 +221,62 @@ impl NetworkState {
         self.level.loader()
     }
 
+    // 停机兜底 把在线玩家的最新状态全部写盘
+    // 照搬 Nukkit Server.shutdown 的 saveOnlinePlayerData:
+    // Ctrl+C 直接终止进程时不会走 SessionClosed 不兜底的话 players/ 永远不会出现
+    pub fn save_all_players(&self) {
+        let Some(dir) = self.level.data_dir().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        for state in self.players.values().filter(|s| s.logged_in) {
+            let data = PlayerData::from_state(state);
+            if let Err(e) = data.save(&dir, state.uuid) {
+                warn!("保存玩家数据失败 {}: {e}", state.username);
+            }
+        }
+    }
+
+    // RakNet 握手完成 记录该端点当前生效的会话
+    // 同端点重连时新会话直接顶替旧会话 旧会话收尾时靠 id 区分
+    pub fn on_session_opened(&mut self, id: u64, addr: &SocketAddr) {
+        self.session_of.insert(*addr, id);
+    }
+
+    // 事件是否来自当前生效的会话 测试里未登记会话时放行
+    pub fn session_matches(&self, id: u64, addr: &SocketAddr) -> bool {
+        self.session_of.get(addr).is_none_or(|current| *current == id)
+    }
+
     // 下线时通知其他玩家 移除实体与玩家列表项
-    pub fn on_session_closed(&mut self, addr: &SocketAddr) -> Vec<SendCmd> {
+    pub fn on_session_closed(&mut self, id: u64, addr: &SocketAddr, reason: &str) -> Vec<SendCmd> {
+        // 旧会话退役时新连接可能已经接管这个端点 不能按 addr 直接清掉新玩家
+        if !self.session_matches(id, addr) {
+            return Vec::new();
+        }
+        self.session_of.remove(addr);
         let Some(state) = self.players.remove(addr) else {
             return Vec::new();
         };
+        // 同一 uuid 的玩家已经用新端点重新上线 旧端点超时收尾时不能再写盘或广播
+        // 否则会覆盖新会话刚写的存档 还会发出错误的 left the game
+        // 同名但 uuid 不同是另一台设备上的另一个人 两份存档各写各的 不能当重连吞掉
+        let reconnected = state.logged_in
+            && self
+                .players
+                .values()
+                .any(|other| other.logged_in && other.uuid == state.uuid);
+
+        // 下线存档 照搬 Nukkit saveOfflinePlayerData(username)
+        // 位置朝向背包按 uuid 写回 playerdata/<uuid>.dat 下次登录读回
+        if let Some(dir) = self.level.data_dir().filter(|_| !reconnected) {
+            let data = PlayerData::from_state(&state);
+            if let Err(e) = data.save(dir, state.uuid) {
+                warn!("保存玩家数据失败 {}: {e}", state.username);
+            }
+        }
+        // 断开原因优先于是否进过世界 没进服也照常记一笔
+        info!("{} lost connection: {}", state.username, reason);
+
         self.player_index.remove(addr);
         // 最后一个玩家退出就立刻撤掉全部分片 区块缓存与线程一起释放
         // 不等 2 秒空闲判定 退出即回收 尽快回到冷启动基线
@@ -226,19 +300,22 @@ impl NetworkState {
             );
             self.chunk_tracker.remove_player(*addr, chunk);
         }
-        if !state.spawned {
+        // 新连接已经接管同名玩家 旧端点不再广播离开 也不记 left the game
+        if reconnected || !state.spawned {
             return Vec::new();
         }
+        // 进过世界才记 "left the game" 与游戏内广播对应
+        info!("{} left the game", state.username);
 
         // 实体移除只给看得见他的人 列表项与离开提示全服都发
         let entity_gone = RemovePlayerPacket {
             eid: state.eid,
-            uuid: state.uuid,
+            uuid: *state.uuid.as_bytes(),
         }
         .encode();
         let radius = (self.view_distance * 16) as f32;
         let center = state.position;
-        let list_gone = PlayerListPacket::remove(vec![state.uuid]).encode();
+        let list_gone = PlayerListPacket::remove(vec![*state.uuid.as_bytes()]).encode();
         let notice = TextPacket::raw(&format!("{} left the game", state.username)).encode();
         self.players
             .iter()
@@ -260,6 +337,11 @@ impl NetworkState {
 
     pub fn player_count(&self) -> usize {
         self.players.len()
+    }
+
+    // stop 命令是否已被触发 主循环据此 break
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested
     }
 
     #[cfg(test)]
@@ -387,8 +469,20 @@ impl NetworkState {
             state.position
         };
 
-        out.push(reply(addr, spawn_sequence(position)));
+        // 玩家列表必须先于出生包 照搬 Nukkit doFirstSpawn 的次序
+        // 0.14 客户端收到 PLAYER_SPAWN 时会按列表里自己的条目构建实体
+        // 顺序反了会因为找不到条目而一直停在加载界面
         out.extend(self.on_player_spawned(addr));
+        let spawn = spawn_sequence(position, self.gamemode);
+        // 临时诊断 出生批次的包类型序列
+        info!(
+            "[{addr}] spawn batch pids {:02x?}",
+            spawn
+                .iter()
+                .filter_map(|body| body.first().copied())
+                .collect::<Vec<_>>()
+        );
+        out.push(reply(addr, spawn));
     }
 
     // 新玩家出生后 与自己和其他玩家互换玩家列表项与实体
@@ -397,6 +491,10 @@ impl NetworkState {
         let Some(me) = self.players.get(&addr) else {
             return Vec::new();
         };
+        info!(
+            "{}[{}] logged in with entity id {} at ([{}]{:.1}, {:.1}, {:.1})",
+            me.username, addr, me.eid, self.world_name, me.position.0, me.position.1, me.position.2
+        );
         let my_entry = me.list_entry();
         let my_add = me.add_packet();
         let radius = (self.view_distance * 16) as f32;
@@ -453,7 +551,7 @@ impl NetworkState {
                         self.dispatch(addr, packet, &mut out);
                     }
                 }
-                Err(e) => warn!(%addr, error = %e, "批处理包解压失败"),
+                Err(_) => {},
             }
         } else {
             self.dispatch(addr, payload, &mut out);
@@ -466,6 +564,16 @@ impl NetworkState {
             return;
         }
 
+        // 临时诊断 打印客户端上行的游戏包类型 移动包除外避免刷屏
+        if packet[1] != MOVE_PLAYER {
+            info!(
+                "[{addr}] up pid 0x{:02x} len {} spawned {:?}",
+                packet[1],
+                packet.len(),
+                self.players.get(&addr).map(|s| s.spawned)
+            );
+        }
+
         // 登录由 global region 引导 移动要维护归属表 其余包全部投给属主分片消费
         match packet[1] {
             LOGIN => {
@@ -473,7 +581,7 @@ impl NetworkState {
                 return;
             }
             MOVE_PLAYER => {
-                // 只为路由 不改状态 跨区时先把目标视野涉及的分片建好
+                // 记录最新位置与朝向(供下线存档) 同时做跨区块路由
                 if let Ok(mv) = MovePlayerPacket::decode(&packet[1..]) {
                     let position = mv.feet_position();
                     self.level.ensure_view(position, self.view_distance);
@@ -482,13 +590,22 @@ impl NetworkState {
                         position.0.floor() as i32 >> 4,
                         position.2.floor() as i32 >> 4,
                     );
-                    if let Some(old) = self
-                        .players
-                        .get(&addr)
-                        .map(|s| ((s.position.0.floor() as i32) >> 4, (s.position.2.floor() as i32) >> 4))
+                    let old = self.players.get(&addr).map(|s| {
+                        (
+                            (s.position.0.floor() as i32) >> 4,
+                            (s.position.2.floor() as i32) >> 4,
+                        )
+                    });
+                    if let Some(old) = old
                         && old != new_chunk
                     {
                         self.chunk_tracker.move_player(addr, old, new_chunk);
+                    }
+                    // global 侧只保留最新快照 真正的物理模拟仍在 region 里
+                    if let Some(state) = self.players.get_mut(&addr) {
+                        state.position = position;
+                        state.yaw = mv.yaw;
+                        state.pitch = mv.pitch;
                     }
                 }
             }
@@ -499,7 +616,11 @@ impl NetworkState {
                 {
                     let message = text.message.trim();
                     if message.starts_with('/') {
-                        self.execute_command(addr, message, out);
+                        let output = self.run_command_from(message, Some(addr));
+                        for line in &output.messages {
+                            out.push(reply(addr, vec![TextPacket::raw(line).encode()]));
+                        }
+                        out.extend(output.sync);
                         return;
                     }
                 }
@@ -520,75 +641,83 @@ impl NetworkState {
         out.extend(result.commands);
     }
 
-    // 斜杠命令在 global 层直接执行 时间类照搬 Nukkit TimeCommand 语义
-    // Nukkit 的 Command.broadcastCommandMessage 需要权限系统 这里先只回给发起者
-    fn execute_command(&mut self, addr: SocketAddr, input: &str, out: &mut Vec<SendCmd>) {
-        let Some(parsed) = command::parse(input) else {
-            return;
+    // 命令执行与发送者解耦 玩家回文本包 控制台打印到终端
+    // 时间类照搬 Nukkit TimeCommand 语义 权限广播暂缺
+    pub(crate) fn run_command(&mut self, input: &str) -> CommandOutput {
+        // 控制台发送者是 "Server"
+        self.run_command_from(input, None)
+    }
+
+    // sender 是发起命令的玩家 控制台传 None
+    // /say 这类广播命令需要知道是谁发的 才能照 Nukkit 填上显示名
+    pub(crate) fn run_command_from(
+        &mut self,
+        input: &str,
+        sender: Option<SocketAddr>,
+    ) -> CommandOutput {
+        // 控制台不带斜杠也能用 统一补上再解析
+        let input = input.trim();
+        let normalized = if input.starts_with('/') {
+            input.to_string()
+        } else {
+            format!("/{input}")
         };
+        let Some(parsed) = command::parse(&normalized) else {
+            return CommandOutput {
+                messages: Vec::new(),
+                sync: Vec::new(),
+            };
+        };
+        let mut messages = Vec::new();
+        let mut sync = Vec::new();
         match parsed {
-            Command::Help => {
-                for line in command::help_lines() {
-                    out.push(reply(addr, vec![TextPacket::raw(line).encode()]));
-                }
-            }
-            Command::List => {
-                let names: Vec<&str> = self
-                    .players
-                    .values()
-                    .filter(|state| state.spawned)
+            Command::Help(_) => messages.extend(command::CommandHelp::Help.execute()),
+            Command::List(_) => messages.extend(
+                command::CommandList::List.execute(&self.players, self.max_players),
+            ),
+            Command::Say(cmd) => {
+                let name = sender
+                    .and_then(|addr| self.players.get(&addr))
                     .map(|state| state.username.as_str())
-                    .collect();
-                let message = format!("在线玩家 ({}): {}", names.len(), names.join(", "));
-                out.push(reply(addr, vec![TextPacket::raw(&message).encode()]));
-            }
-            Command::Seed => {
-                let message = format!("Seed: {}", self.seed);
-                out.push(reply(addr, vec![TextPacket::raw(&message).encode()]));
-            }
-            Command::Time(op) => {
-                let message = match op {
-                    TimeOp::Start => {
-                        self.world_time.start_time();
-                        "Restarted the time".to_string()
-                    }
-                    TimeOp::Stop => {
-                        self.world_time.stop_time();
-                        "Stopped the time".to_string()
-                    }
-                    TimeOp::Query => format!("Time is {}", self.world_time.time()),
-                    TimeOp::Set(value) => {
-                        let value = value.resolve();
-                        self.world_time.set_time(value);
-                        format!("Set the time to {value}")
-                    }
-                    TimeOp::Add(value) => {
-                        let now = self.world_time.time();
-                        self.world_time.set_time(now + value);
-                        format!("Added {value} to the time")
-                    }
-                };
-                // set/add/start/stop 立即同步 照搬 setTime/startTime/stopTime 里的 sendTime
-                if !matches!(op, TimeOp::Query) {
-                    let bodies = self.world_time.time_packets();
-                    for peer in self.players.keys() {
-                        out.push(reply(*peer, bodies.clone()));
-                    }
+                    .unwrap_or("Server");
+                let output = cmd.execute(name, &self.players);
+                sync.extend(output.sync);
+                // 广播包已经发给全体玩家(含发起者) 玩家侧不再单独回一条
+                // 只有控制台和用法提示需要回 messages
+                if sender.is_none() || matches!(cmd, CommandSay::Usage) {
+                    messages.extend(output.messages);
                 }
-                out.push(reply(addr, vec![TextPacket::raw(&message).encode()]));
             }
-            Command::Version(op) => {
-                out.push(reply(addr, vec![TextPacket::raw(op.message()).encode()]));
+            Command::Tell(cmd) => {
+                let name = sender
+                    .and_then(|addr| self.players.get(&addr))
+                    .map(|state| state.username.as_str())
+                    .unwrap_or("Server");
+                let output = cmd.execute(name, &self.players);
+                sync.extend(output.sync);
+                // 私聊回执始终发给发送者(玩家回客户端 控制台打终端) 不进全服广播
+                messages.extend(output.messages);
+            }
+            Command::Seed(_) => messages.extend(command::CommandSeed::Seed.execute(self.seed)),
+            Command::Time(cmd) => {
+                let output = cmd.execute(&mut self.world_time, &self.players);
+                messages.extend(output.messages);
+                sync.extend(output.sync);
+            }
+            Command::Version(op) => messages.push(op.message().to_string()),
+            Command::Stop(_) => {
+                self.shutdown_requested = true;
+                messages.push(command::stop::CommandStop::Stop.message().to_string());
             }
             Command::Unknown(name) => {
-                let message = if name.starts_with('/') {
+                messages.push(if name.starts_with('/') {
                     name
                 } else {
                     format!("Unknown command: /{name}")
-                };
-                out.push(reply(addr, vec![TextPacket::raw(&message).encode()]));
+                });
             }
         }
+        CommandOutput { messages, sync }
     }
 
 }

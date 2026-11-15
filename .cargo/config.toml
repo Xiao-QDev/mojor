@@ -1,3 +1,14 @@
+# C 运行库全部静态链入 二进制不再依赖 libc.so/libgcc_s.so
+# Linux 用 glibc 静态版 以便保留 malloc_trim/mallopt 的内存回收行为
+# 显式 target 让 cargo 把 proc-macro/build script 按 host 编译 否则 crt-static 会报错
+# 产物路径 target/x86_64-unknown-linux-gnu/release/mojor
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
 # cargo build --release --target x86_64-pc-windows-gnu

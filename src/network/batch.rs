@@ -6,12 +6,14 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
 use crate::error::{Error, Result};
+use crate::raknet::GAME_PACKET_PREFIX;
 
 // 解压上限 防止压缩炸弹
 pub const MAX_BATCH_SIZE: usize = 64 * 1024 * 1024;
 
 // buf 为 BatchPacket 去掉 0x8e 0x92 之后的内容 即 [i32 BE 长度][zlib 数据]
-// 解压后内部结构为若干 [i32 BE 长度][0x8e][pid][body]
+// 解压后内部结构为若干 [i32 BE 长度][pid][body] 帧内不带 0x8e
+// 返回统一补好 0x8e 的帧 方便上层按单包处理
 pub fn decode(buf: &[u8]) -> Result<Vec<Bytes>> {
     if buf.len() < 4 {
         return Err(Error::TooShort {
@@ -53,9 +55,19 @@ pub fn decode(buf: &[u8]) -> Result<Vec<Bytes>> {
 
         let packet = &data[offset..offset + len];
         offset += len;
-        if packet[0] == 0x8e {
-            packets.push(Bytes::copy_from_slice(packet));
+        // batch 帧内是 [pid][body] 兼容个别实现多写的 0x8e 统一剥掉后补回
+        let body = if packet.first() == Some(&GAME_PACKET_PREFIX) {
+            &packet[1..]
+        } else {
+            packet
+        };
+        if body.len() < 2 {
+            continue;
         }
+        let mut frame = Vec::with_capacity(body.len() + 1);
+        frame.push(GAME_PACKET_PREFIX);
+        frame.extend_from_slice(body);
+        packets.push(Bytes::from(frame));
     }
     Ok(packets)
 }
@@ -101,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_skips_packets_without_prefix() {
+    fn batch_adds_prefix_to_frames_without_it() {
         let raw = {
             let mut raw = Vec::new();
             raw.extend_from_slice(&(2i32).to_be_bytes());
@@ -117,7 +129,8 @@ mod tests {
         framed.extend_from_slice(&compressed);
 
         let decoded = decode(&framed).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(&decoded[0][..], b"\x8eab");
     }
 
     #[test]

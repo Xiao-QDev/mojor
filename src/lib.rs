@@ -1,5 +1,8 @@
+pub mod block;
 pub mod command;
+pub mod item;
 pub mod config;
+pub mod console;
 pub mod entity;
 pub mod error;
 pub mod level;

@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tracing::warn;
 
 use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
@@ -10,12 +10,33 @@ use crate::level::format::chunk::{CHUNK_HEIGHT, Chunk};
 use crate::level::format::mojoregion::blob;
 use crate::level::generator::Generator;
 use crate::level::generator::world::GenWorld;
-use crate::level::light;
+use crate::level::actor::RegionMsg;
+use crate::level::light::{BlockChange, LightJob, LightKind, LightReceipt, Snapshot};
 
 // 业务 GC 的宽限期 不可达之后留 2 秒 防玩家在区块边界反复横跳导致重复生成
 // 原样照搬 Nukkit 的 30 秒会让"走出旧区域"后旧区块驻留太久
 const UNLOAD_DELAY_TICKS: u64 = 40;
 const MAX_UNLOAD_PER_TICK: usize = 96;
+// 纯地形缓存 装饰目标连续时 7x7 的窗口每走一格只换掉一条边
+const TERRAIN_CACHE: usize = 256;
+// 装饰结果缓存 工作量上限就是一个起源区块只模拟一次
+const DECORATION_CACHE: usize = 256;
+
+// 装饰在一个区块上写下的一个方块（全局坐标）
+struct BlockWrite {
+    x: i32,
+    y: i32,
+    z: i32,
+    id: u8,
+    meta: u8,
+}
+
+// 一个起源区块的装饰差异。writes 按目标区块排好序，chunks 记录每个目标
+// 区块对应的下标区间，合并时只取落在自己身上的那一段。
+struct Decoration {
+    writes: Vec<BlockWrite>,
+    chunks: HashMap<(i32, i32), (usize, usize)>,
+}
 
 // 区块集合 对齐 Nukkit 的 ChunkManager：内存缓存 + 按需从存档加载 + 脏区块回收
 #[derive(Default)]
@@ -31,6 +52,18 @@ pub struct ChunkManager {
     // 本分片负责的区块范围 闭区间 越界的读写一律丢弃
     // 这样同一个区块只会存在于一个 region 里 不会出现两份副本
     bounds: Option<((i32, i32), (i32, i32))>,
+    // 纯地形缓存（未装饰）。population 的只读基层，也是正式区块的地形来源；
+    // 不受 region 边界限制，边界外的地形只是装饰上下文，不进世界。
+    terrain: HashMap<(i32, i32), Chunk>,
+    terrain_order: VecDeque<(i32, i32)>,
+    // 每个起源区块的装饰差异。同一区块只模拟一次，之后平移到任何目标区块复用。
+    decorations: HashMap<(i32, i32), Arc<Decoration>>,
+    decoration_order: VecDeque<(i32, i32)>,
+    // 等光照引擎全量计算的新区块 生成后 lit=false 算完回执才 lit=true
+    pending_light_init: HashSet<(i32, i32)>,
+    // 玩家改动批量收集 攒到 tick 交给光照引擎做增量修正
+    // 只记已 lit 区块的改动 未 lit 区块的改动会被 Init 全量覆盖
+    light_changes: HashMap<(i32, i32), Vec<BlockChange>>,
 }
 
 impl ChunkManager {
@@ -51,9 +84,13 @@ impl ChunkManager {
         }
     }
 
-    // 换生成器只影响之后没加载过的区块
+    // 换生成器只影响之后没加载过的区块 地形与装饰缓存全部作废
     pub fn set_generator(&mut self, generator: Generator) {
         self.generator = generator;
+        self.terrain.clear();
+        self.terrain_order.clear();
+        self.decorations.clear();
+        self.decoration_order.clear();
     }
 
     // region 边界 传 None 表示不限
@@ -89,13 +126,9 @@ impl ChunkManager {
     // 存档里有就用存档 否则先放一个空区块等生成
     fn insert_loaded(&mut self, chunk_x: i32, chunk_z: i32) {
         let data = match self.loader.as_ref() {
-            Some(loader) => match loader.load(chunk_x, chunk_z) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(chunk_x, chunk_z, error = %e, "读取区块失败 重新生成");
-                    None
-                }
-            },
+            Some(loader) => loader.load(chunk_x, chunk_z).unwrap_or_else(|_| {
+                None
+            }),
             None => None,
         };
 
@@ -113,6 +146,13 @@ impl ChunkManager {
         }
         let key = (chunk_x, chunk_z);
         if self.chunks.get(&key).is_some_and(|chunk| chunk.generated) {
+            return;
+        }
+        // 装饰阶段已经算过这个区块的地形，直接克隆，不再重复生成
+        if let Some(terrain) = self.terrain.get(&key) {
+            let mut chunk = terrain.clone();
+            chunk.generated = true;
+            self.chunks.insert(key, chunk);
             return;
         }
         self.chunks
@@ -136,11 +176,134 @@ impl ChunkManager {
         }
     }
 
+    // 取纯地形（未装饰）。与正式区块不同，不受 region 边界限制：
+    // 边界另一侧的地形只是装饰上下文，用来判断树冠或建筑能不能伸过来。
+    fn ensure_terrain(&mut self, chunk_x: i32, chunk_z: i32) {
+        let key = (chunk_x, chunk_z);
+        if self.terrain.contains_key(&key) {
+            return;
+        }
+        self.terrain.insert(key, Chunk::empty(chunk_x, chunk_z));
+        {
+            // 拆开字段 生成时只需要地形表和生成器
+            let Self {
+                terrain, generator, ..
+            } = self;
+            let mut world = GenWorld::new(terrain);
+            generator.generate_chunk(&mut world, chunk_x, chunk_z);
+        }
+        self.terrain_order.push_back(key);
+        while self.terrain.len() > TERRAIN_CACHE {
+            if let Some(oldest) = self.terrain_order.pop_front() {
+                self.terrain.remove(&oldest);
+            }
+        }
+    }
+
+    // 一个起源区块的装饰差异（相对纯地形的最终状态）。
+    // 每个起源区块只在固定的 ±2 地形上下文里模拟一次：同一区块无论从哪个
+    // 目标窗口看过来，写入都完全一样，所以缓存可以跨目标复用。
+    fn decoration_writes(&mut self, chunk_x: i32, chunk_z: i32) -> Arc<Decoration> {
+        let key = (chunk_x, chunk_z);
+        if let Some(cached) = self.decorations.get(&key) {
+            return cached.clone();
+        }
+
+        let mut working = HashMap::new();
+        {
+            let Self {
+                generator, terrain, ..
+            } = self;
+            let bounds = Some(((chunk_x - 2, chunk_z - 2), (chunk_x + 2, chunk_z + 2)));
+            let mut world = GenWorld::with_base(&mut working, terrain).with_bounds(bounds);
+            generator.populate_chunk(&mut world, chunk_x, chunk_z);
+        }
+
+        // 只记最终状态与地形的差异。同一个方块被同一棵树多次写过也只留一条。
+        // 装饰只改地表附近，绝大部分 16 层高的段完全一样，所以按段整块比较，
+        // 只有段内有差异时才逐格展开。
+        let mut writes = Vec::new();
+        for (source, decorated) in working {
+            let Some(original) = self.terrain.get(&source) else {
+                continue;
+            };
+            let (ids, meta, ..) = decorated.parts();
+            let (base_ids, base_meta, ..) = original.parts();
+            for z in 0..16usize {
+                for x in 0..16usize {
+                    let column = (x << 11) | (z << 7);
+                    for offset in (0..CHUNK_HEIGHT).step_by(16) {
+                        let nibble = (x << 10) | (z << 6) | (offset >> 1);
+                        if ids[column + offset..column + offset + 16]
+                            == base_ids[column + offset..column + offset + 16]
+                            && meta[nibble..nibble + 8] == base_meta[nibble..nibble + 8]
+                        {
+                            continue;
+                        }
+                        for y in offset..offset + 16 {
+                            let block = decorated.block(x, y, z);
+                            let block_meta = decorated.meta(x, y, z);
+                            if block != original.block(x, y, z)
+                                || block_meta != original.meta(x, y, z)
+                            {
+                                writes.push(BlockWrite {
+                                    x: source.0 * 16 + x as i32,
+                                    y: y as i32,
+                                    z: source.1 * 16 + z as i32,
+                                    id: block,
+                                    meta: block_meta,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 按目标区块排序，合并时按区间取，避免每个目标都扫整份写入
+        writes.sort_unstable_by_key(|write| (write.x >> 4, write.z >> 4));
+        let mut chunks: HashMap<(i32, i32), (usize, usize)> = HashMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            let entry = chunks
+                .entry((write.x >> 4, write.z >> 4))
+                .or_insert((index, index));
+            entry.1 = index + 1;
+        }
+
+        let writes = Arc::new(Decoration { writes, chunks });
+        self.decorations.insert(key, writes.clone());
+        self.decoration_order.push_back(key);
+        while self.decorations.len() > DECORATION_CACHE {
+            if let Some(oldest) = self.decoration_order.pop_front() {
+                self.decorations.remove(&oldest);
+            }
+        }
+        writes
+    }
+
     // 第二阶段：装饰 需要周围一圈区块已经铺好地形
     fn ensure_populated(&mut self, chunk_x: i32, chunk_z: i32) {
         let key = (chunk_x, chunk_z);
         if self.chunks.get(&key).is_some_and(|chunk| chunk.populated) {
             return;
+        }
+
+        // RTG 的每个起源区块按自己的 ±2 上下文模拟；装饰落点从区块中心 +8 开始，
+        // 树冠最远再伸出十几格，写入最远能落到起源的 +2 区块。目标区块合并
+        // origin-2..origin+1 的 4x4 起源，每个起源要 ±2 的地形上下文，
+        // 合起来正好是目标 -4..+3，不用多准备一圈。
+        if matches!(self.generator, Generator::Realistic(_)) {
+            for dx in -4..=3 {
+                for dz in -4..=3 {
+                    self.ensure_terrain(chunk_x + dx, chunk_z + dz);
+                }
+            }
+        } else {
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    self.ensure_terrain(chunk_x + dx, chunk_z + dz);
+                }
+            }
         }
 
         for dx in -1..=1 {
@@ -149,20 +312,66 @@ impl ChunkManager {
             }
         }
 
-        {
-            let Self {
-                chunks,
-                generator,
-                bounds,
-                ..
-            } = self;
-            let mut world = GenWorld::new(chunks).with_bounds(*bounds);
-            generator.populate_chunk(&mut world, chunk_x, chunk_z);
-        }
+        let completed = {
+            let mut chunk = if matches!(self.generator, Generator::Realistic(_)) {
+                // 树和村庄会跨区块写入。每个起源区块只装饰一次并缓存差异，
+                // 目标区块按 dx/dz 顺序合并 16 份落在自己身上的写入；同一区块
+                // 无论从哪个窗口加载，结果都完全一致，跨界的树不会被砍半。
+                let mut center = self
+                    .terrain
+                    .get(&key)
+                    .expect("目标区块的地形已经准备好")
+                    .clone();
+                for dx in -2..=1 {
+                    for dz in -2..=1 {
+                        let decoration = self.decoration_writes(chunk_x + dx, chunk_z + dz);
+                        let Some(&(start, end)) = decoration.chunks.get(&key) else {
+                            continue;
+                        };
+                        for write in &decoration.writes[start..end] {
+                            let (lx, lz) = ((write.x & 15) as usize, (write.z & 15) as usize);
+                            center.set_block(lx, write.y as usize, lz, write.id);
+                            center.set_meta(lx, write.y as usize, lz, write.meta);
+                        }
+                    }
+                }
+                center
+            } else {
+                // 其他生成器只写自己的区块，共享视图里直接装饰即可。
+                let mut working = HashMap::new();
+                {
+                    let Self {
+                        generator, terrain, ..
+                    } = self;
+                    let bounds = Some(((chunk_x - 2, chunk_z - 2), (chunk_x + 2, chunk_z + 2)));
+                    let mut world = GenWorld::with_base(&mut working, terrain).with_bounds(bounds);
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            generator.populate_chunk(&mut world, chunk_x + dx, chunk_z + dz);
+                        }
+                    }
+                }
+                working
+                    .remove(&key)
+                    .unwrap_or_else(|| self.terrain[&key].clone())
+            };
 
-        if let Some(chunk) = self.chunks.get_mut(&key) {
+            chunk.generated = true;
             chunk.populated = true;
-            light::rebuild(chunk);
+            // 装饰写入不走 ChunkManager::set_block 高度图在这里统一刷
+            // 出生点与碰撞查询直接读它 不能等异步光照
+            chunk.refresh_heights();
+            // 光照交给异步引擎 lit=false 的区块不下发也不落盘
+            chunk.lit = false;
+            chunk
+        };
+
+        self.chunks.insert(key, completed);
+        self.pending_light_init.insert(key);
+        // 装饰完成才算"完整区块" 标脏交给 unload/flush 落盘
+        // 只标本分片内的区块 越界的由属主 region 自己负责
+        if self.in_bounds(chunk_x, chunk_z) {
+            self.dirty.insert(key);
         }
     }
 
@@ -196,10 +405,17 @@ impl ChunkManager {
 
     // 只读缓存 未命中返回 None 不触发磁盘加载
     // 给同步调用方(global tick)用 避免在非 region 线程上做同步读盘
+    // 光照没算完(lit=false)也回 None 复用同一套重试 下轮再来
     pub fn payload_cached(&self, chunk_x: i32, chunk_z: i32) -> Option<Bytes> {
         self.chunks
             .get(&(chunk_x, chunk_z))
+            .filter(|chunk| chunk.lit)
             .map(|chunk| chunk.payload())
+    }
+
+    // 只读窥探 光照快照抓取用 不触发生成
+    pub fn peek_chunk(&self, chunk_x: i32, chunk_z: i32) -> Option<&Chunk> {
+        self.chunks.get(&(chunk_x, chunk_z))
     }
 
     pub fn block(&mut self, x: i32, y: i32, z: i32) -> u8 {
@@ -223,13 +439,30 @@ impl ChunkManager {
         );
         let (lx, ly, lz) = ((x & 0xf) as usize, y as usize, (z & 0xf) as usize);
 
-        let chunk = self.get(chunk_x, chunk_z);
-        if chunk.block(lx, ly, lz) == id {
-            return false;
+        let old = {
+            let chunk = self.get(chunk_x, chunk_z);
+            let old = chunk.block(lx, ly, lz);
+            if old == id {
+                return false;
+            }
+            chunk.set_block(lx, ly, lz, id);
+            // 高度图同步刷新 碰撞与出生点查询不能等异步光照
+            chunk.refresh_height(lx, lz);
+            old
+        };
+        // 已 lit 的区块记增量修正交给光照引擎 未 lit 的改动会被 Init 全量覆盖
+        if self.chunks.get(&(chunk_x, chunk_z)).is_some_and(|chunk| chunk.lit) {
+            self.light_changes
+                .entry((chunk_x, chunk_z))
+                .or_default()
+                .push(BlockChange {
+                    x,
+                    y,
+                    z,
+                    old_id: old,
+                    new_id: id,
+                });
         }
-        chunk.set_block(lx, ly, lz, id);
-        // 光照按列算 改一格只重算这一列 挖开方块后光马上就能漏下去
-        light::rebuild_column(chunk, lx, lz);
         self.dirty.insert((chunk_x, chunk_z));
         true
     }
@@ -269,6 +502,11 @@ impl ChunkManager {
                 continue;
             }
             if in_use.contains(&key) || Self::is_spawn_chunk(key.0, key.1) {
+                continue;
+            }
+            // 光照没算完的不卸载 全 0 光照写进存档就是污染
+            // 等 LightDone 回填 lit=true 之后走正常卸载
+            if !self.chunks.get(&key).is_some_and(|chunk| chunk.lit) {
                 continue;
             }
             expired.push(key);
@@ -348,9 +586,19 @@ impl ChunkManager {
                 return None;
             }
             chunk.set_block(lx, y as usize, lz, 0);
-            light::rebuild_column(chunk, lx, lz);
+            chunk.refresh_height(lx, lz);
             id
         };
+        // 已 lit 的区块记增量修正交给光照引擎
+        if self.chunks.get(&key).is_some_and(|chunk| chunk.lit) {
+            self.light_changes.entry(key).or_default().push(BlockChange {
+                x,
+                y,
+                z,
+                old_id: id,
+                new_id: 0,
+            });
+        }
         self.dirty.insert(key);
         Some(id)
     }
@@ -392,11 +640,13 @@ impl ChunkManager {
             return Ok(0);
         }
         let keys: Vec<(i32, i32)> = self.dirty.iter().take(limit).copied().collect();
+        // lit=false 的区块跳过编码 留在 dirty 里等光照回执
         let batch: Vec<((i32, i32), Vec<u8>)> = keys
             .iter()
             .filter_map(|key| {
                 self.chunks
                     .get(key)
+                    .filter(|chunk| chunk.lit)
                     .map(|chunk| (*key, blob::encode(chunk)))
             })
             .collect();
@@ -420,12 +670,14 @@ impl ChunkManager {
             return Ok(0);
         }
 
+        // lit=false 的区块跳过编码 留在 dirty 里等光照回执
         let batch: Vec<((i32, i32), Vec<u8>)> = self
             .dirty
             .iter()
             .filter_map(|key| {
                 self.chunks
                     .get(key)
+                    .filter(|chunk| chunk.lit)
                     .map(|chunk| (*key, blob::encode(chunk)))
             })
             .collect();
@@ -444,6 +696,67 @@ impl ChunkManager {
         Ok(batch.len())
     }
 
+    // 取走待处理的光照任务提交给异步引擎
+    // 快照抓取必须在 region 线程做（ChunkManager 是 region 私有的） 整体 move 给 worker
+    pub fn take_light_jobs(&mut self, reply: &Sender<RegionMsg>) -> Vec<LightJob> {
+        let mut jobs = Vec::new();
+        let inits: Vec<(i32, i32)> = self.pending_light_init.drain().collect();
+        for key in inits {
+            // lit=false 的区块不会进卸载队列 这里只是防御
+            if !self.chunks.contains_key(&key) {
+                continue;
+            }
+            let snap = Snapshot::grab(self, key.0, key.1);
+            jobs.push(LightJob {
+                kind: LightKind::Init(snap),
+                reply: reply.clone(),
+            });
+        }
+        let updates: Vec<((i32, i32), Vec<BlockChange>)> = self.light_changes.drain().collect();
+        for (key, changes) in updates {
+            if !self.chunks.contains_key(&key) {
+                continue;
+            }
+            let snap = Snapshot::grab(self, key.0, key.1);
+            jobs.push(LightJob {
+                kind: LightKind::Update { snap, changes },
+                reply: reply.clone(),
+            });
+        }
+        jobs
+    }
+
+    // 光照回执写回 只合入还在内存里的区块 已卸载的直接丢弃
+    // 拿到光照才算完整区块 打开下发门槛并标脏落盘
+    pub fn apply_light_receipt(&mut self, receipt: LightReceipt) {
+        for data in receipt.chunks {
+            let key = (data.x, data.z);
+            if let Some(chunk) = self.chunks.get_mut(&key) {
+                let (_, _, sky, light) = chunk.parts_mut();
+                sky.copy_from_slice(&data.sky_light);
+                light.copy_from_slice(&data.block_light);
+                chunk.lit = true;
+                self.dirty.insert(key);
+            }
+        }
+    }
+
+    // 下发门槛 光照回填之前区块不下发
+    pub fn is_lit(&self, chunk_x: i32, chunk_z: i32) -> bool {
+        self.chunks
+            .get(&(chunk_x, chunk_z))
+            .is_some_and(|chunk| chunk.lit)
+    }
+
+    // 测试跳过异步光照 直接把内存里的区块全标成已照亮
+    #[cfg(test)]
+    pub fn mark_all_lit_for_test(&mut self) {
+        for chunk in self.chunks.values_mut() {
+            chunk.lit = true;
+        }
+        self.pending_light_init.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.chunks.len()
     }
@@ -457,6 +770,71 @@ impl ChunkManager {
 mod tests {
     use super::*;
     use crate::level::generator::flat::{self, GRASS};
+    use crate::level::generator::realistic_terrain::structure::map_generator::VillageMapGenerator;
+    use crate::level::generator::realistic_terrain::structure::placement::{
+        StructurePlacement, VILLAGE_DISTANCE,
+    };
+    use crate::level::generator::realistic_terrain::structure::topology::PieceKind;
+
+    fn normalize_flower_kinds(chunk: &mut Chunk) {
+        // 参考实现的花种使用系统随机源；位置和其他方块仍必须逐格一致。
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 0..CHUNK_HEIGHT {
+                    if matches!(chunk.block(x, y, z), 37 | 38) {
+                        chunk.set_block(x, y, z, 38);
+                        chunk.set_meta(x, y, z, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 找一个确有非道路建筑跨区块的 RTG 村庄，返回目标区块和建筑 footprint 内的探针。
+    fn cross_chunk_village_fixture() -> (u32, (i32, i32), (i32, i32)) {
+        const SEED: u32 = 20261115;
+        let placement = StructurePlacement::new(SEED as i64, VILLAGE_DISTANCE);
+        let candidates = placement.candidates_in_window(-128, -128, 128, 128);
+        let mut villages = VillageMapGenerator::new(SEED as i64);
+        for (chunk_x, chunk_z) in candidates {
+            let Some(start) = villages.start_at(chunk_x, chunk_z) else {
+                continue;
+            };
+            for piece in &start.pieces {
+                if piece.kind == PieceKind::Path {
+                    continue;
+                }
+                let b = piece.bounding_box;
+                let first = (b.min_x >> 4, b.min_z >> 4);
+                let second = (b.max_x >> 4, b.max_z >> 4);
+                if first == second {
+                    continue;
+                }
+                let origin = (start.chunk_x, start.chunk_z);
+                let target = if first != origin { first } else { second };
+                let min_x = target.0 * 16;
+                let min_z = target.1 * 16;
+                let probe = (
+                    ((b.min_x + b.max_x) / 2).clamp(min_x, min_x + 15),
+                    ((b.min_z + b.max_z) / 2).clamp(min_z, min_z + 15),
+                );
+                return (SEED, target, probe);
+            }
+        }
+        panic!("测试种子没有找到跨区块村庄建筑");
+    }
+
+    fn realistic_manager(seed: u32) -> ChunkManager {
+        let mut manager = ChunkManager::new();
+        manager.set_generator(Generator::realistic(seed));
+        manager
+    }
+
+    fn normalized_chunk(manager: &mut ChunkManager, target: (i32, i32)) -> Bytes {
+        let chunk = manager.get(target.0, target.1);
+        normalize_flower_kinds(chunk);
+        chunk.serialize()
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -490,34 +868,39 @@ mod tests {
         assert_eq!(manager.block(0, 5, 0), 0);
     }
 
-    // 挖掉地表的方块 下一层必须立刻见到天光
+    // 挖掉地表的方块 高度图立刻刷新 光照修正排队交给异步引擎
     #[test]
-    fn breaking_block_updates_light_immediately() {
+    fn breaking_block_updates_height_and_queues_light() {
         let mut manager = ChunkManager::new();
         assert_eq!(manager.block(0, 4, 0), GRASS);
+        manager.mark_all_lit_for_test();
         assert_eq!(manager.get(0, 0).sky_light(0, 3, 0), 0);
 
         assert!(manager.set_block(0, 4, 0, 0));
 
+        // 高度图同步刷新 出生点与碰撞查询不等异步光照
         let chunk = manager.get(0, 0);
         assert_eq!(chunk.height(0, 0), 3);
-        assert_eq!(chunk.sky_light(0, 3, 0), 15);
-        assert_eq!(chunk.sky_light(0, 2, 0), 0);
+        // 光照保持旧值 直到 LightDone 回执
+        assert_eq!(chunk.sky_light(0, 3, 0), 0);
+        // 改动已排队
+        assert_eq!(manager.light_changes.get(&(0, 0)).map(Vec::len), Some(1));
     }
 
-    // 在空地上放方块 下方立刻变暗
+    // 在空地上放方块 高度图立刻变 光照修正排队交给异步引擎
     #[test]
-    fn placing_block_darkens_below() {
+    fn placing_block_queues_light_update() {
         let mut manager = ChunkManager::new();
-        assert_eq!(manager.get(0, 0).sky_light(0, 20, 0), 15);
+        // 先生成再标 lit set_block 只对已 lit 的区块记增量
+        let _ = manager.get(0, 0);
+        manager.mark_all_lit_for_test();
 
         assert!(manager.set_block(0, 10, 0, 1));
 
         let chunk = manager.get(0, 0);
         assert_eq!(chunk.height(0, 0), 10);
-        assert_eq!(chunk.sky_light(0, 10, 0), 15);
-        assert_eq!(chunk.sky_light(0, 9, 0), 0);
-        assert_eq!(chunk.sky_light(0, 11, 0), 15);
+        // 光照保持旧值 改动已排队
+        assert_eq!(manager.light_changes.get(&(0, 0)).map(Vec::len), Some(1));
     }
 
     #[test]
@@ -541,20 +924,34 @@ mod tests {
         assert_eq!(after[5], 3);
     }
 
-    // 装饰结束后要重算高度图与天空光照
+    // 装饰后先不下发 完整走一遍 Init 往返验证 vanilla 光照语义
     #[test]
     fn light_and_height_after_decoration() {
         let mut manager = ChunkManager::new();
         assert_eq!(manager.block(0, 4, 0), GRASS);
         let chunk = manager.get(0, 0);
         assert_eq!(chunk.height(0, 0), 4);
-        // 露出天空的部分全亮
+        // 装饰完成但光照没算
+        assert!(!chunk.lit);
+        assert_eq!(chunk.sky_light(0, 5, 0), 0);
+
+        // 提交 Init → 引擎算 → 回执写回（跳过 worker 直接调引擎）
+        let (tx, rx) = std::sync::mpsc::channel();
+        for job in manager.take_light_jobs(&tx) {
+            if let LightKind::Init(snap) = job.kind {
+                let receipt = crate::level::light::engine::Engine::init(snap).into_receipt();
+                manager.apply_light_receipt(receipt);
+            }
+        }
+        assert!(rx.try_recv().is_err(), "测试不走 worker 回执应为空");
+
+        // vanilla 语义：地表自身 0 上面的空气 15
+        let chunk = manager.get(0, 0);
+        assert!(chunk.lit);
         assert_eq!(chunk.sky_light(0, 5, 0), 15);
         assert_eq!(chunk.sky_light(0, CHUNK_HEIGHT - 1, 0), 15);
-        // 地表方块自身受光 它下面才是暗的
-        assert_eq!(chunk.sky_light(0, 4, 0), 15);
+        assert_eq!(chunk.sky_light(0, 4, 0), 0);
         assert_eq!(chunk.sky_light(0, 3, 0), 0);
-        assert_eq!(chunk.sky_light(0, 0, 0), 0);
     }
 
     // 改过的方块落盘后重新打开还在 没改的仍是平坦地形
@@ -564,6 +961,7 @@ mod tests {
         {
             let mut manager = ChunkManager::with_loader(ChunkLoader::open(&path).unwrap());
             assert!(manager.set_block(0, 5, 0, 7));
+            manager.mark_all_lit_for_test();
             assert_eq!(manager.flush().unwrap(), 1);
             // 再 flush 一次没有新改动
             assert_eq!(manager.flush().unwrap(), 0);
@@ -574,9 +972,141 @@ mod tests {
             assert_eq!(manager.block(0, 5, 0), 7);
             // 未修改过的区块仍然现生成
             assert_eq!(manager.block(0, 4, 0), GRASS);
-            assert!(manager.flush().unwrap() == 0);
+            assert_eq!(manager.flush().unwrap(), 0);
         }
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 装饰完成的区块必须标脏 否则 unload 时会被当无改动丢弃 下次重新生成
+    #[test]
+    fn populated_chunk_is_marked_dirty() {
+        let mut manager = ChunkManager::new();
+        let _ = manager.get(0, 0);
+        assert!(manager.dirty.contains(&(0, 0)));
+    }
+
+    // 邻块稍后的装饰不能把已下发、已挖掘的区块再改一遍。
+    #[test]
+    fn neighbour_population_does_not_modify_completed_chunk() {
+        let mut manager = ChunkManager::new();
+        manager.set_generator(Generator::terrain(1337));
+        let _ = manager.get(0, 0);
+        manager.break_block(0, 4, 0);
+        let before = manager.chunks.get(&(0, 0)).unwrap().serialize();
+
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    let _ = manager.get(dx, dz);
+                }
+            }
+        }
+
+        assert_eq!(manager.chunks.get(&(0, 0)).unwrap().serialize(), before);
+    }
+
+    // 同一个区块先加载还是后加载，装饰结果必须逐格一致：
+    // 旧实现读共享世界里邻居已经摆好的树，窗口平移会把同一棵树砍成两半。
+    #[test]
+    fn cross_chunk_decoration_is_load_order_independent() {
+        const SEED: u32 = 20241115;
+        let target = (1, 0);
+
+        let mut direct = realistic_manager(SEED);
+        let expected = normalized_chunk(&mut direct, target);
+
+        // 先把西/北侧的起源区块加载并装饰，再加载目标区块。
+        let mut reordered = realistic_manager(SEED);
+        for (chunk_x, chunk_z) in [(-1, -1), (-1, 0), (0, -1), (0, 0)] {
+            let _ = reordered.get(chunk_x, chunk_z);
+        }
+        assert_eq!(
+            normalized_chunk(&mut reordered, target),
+            expected,
+            "邻块先加载后，目标区块的跨界装饰变了，树会被砍半"
+        );
+    }
+
+    // region 边界只决定真实区块的属主，不能裁掉邻区贡献的跨界装饰。
+    #[test]
+    fn decoration_is_complete_at_region_boundary() {
+        let mut unbounded = ChunkManager::new();
+        unbounded.set_generator(Generator::realistic(20241115));
+        let expected = {
+            let chunk = unbounded.get(0, 0);
+            normalize_flower_kinds(chunk);
+            chunk.serialize()
+        };
+
+        let mut bounded = ChunkManager::new();
+        bounded.set_generator(Generator::realistic(20241115));
+        bounded.set_bounds(((0, 0), (0, 0)));
+        let actual = {
+            let chunk = bounded.get(0, 0);
+            normalize_flower_kinds(chunk);
+            chunk.serialize()
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rtg_village_is_order_independent_and_does_not_roll_back() {
+        let (seed, target, probe) = cross_chunk_village_fixture();
+        let neighbours = [(target.0 - 1, target.1), (target.0, target.1 + 1)];
+
+        // 目标区块先生成，作为 region 边界和另一种加载顺序的共同基准。
+        let mut direct = realistic_manager(seed);
+        let expected = normalized_chunk(&mut direct, target);
+
+        let mut bounded = realistic_manager(seed);
+        bounded.set_bounds((target, target));
+        assert_eq!(
+            normalized_chunk(&mut bounded, target),
+            expected,
+            "region 边界不能截断跨界村庄"
+        );
+
+        let mut reordered = realistic_manager(seed);
+        for &(chunk_x, chunk_z) in neighbours.iter().rev() {
+            let _ = reordered.get(chunk_x, chunk_z);
+        }
+        assert_eq!(
+            normalized_chunk(&mut reordered, target),
+            expected,
+            "邻块先加载不能改变村庄拓扑、放置高度或人口 RNG"
+        );
+
+        // 在建筑 footprint 内挖掉当前最高方块，后续邻块人口不得把它写回来。
+        let y = direct
+            .get(target.0, target.1)
+            .height((probe.0 & 15) as usize, (probe.1 & 15) as usize) as i32;
+        assert!(direct.break_block(probe.0, y, probe.1).is_some());
+        let before = direct.chunks.get(&target).unwrap().serialize();
+        for (chunk_x, chunk_z) in neighbours {
+            let _ = direct.get(chunk_x, chunk_z);
+        }
+        assert_eq!(direct.chunks.get(&target).unwrap().serialize(), before);
+    }
+
+    // 生成区块 unload 时应落盘 重新打开能读回 不再重新生成(树位置固定)
+    #[test]
+    fn generated_chunk_persists_after_unload() {
+        let path = temp_path("gen-unload-persist");
+        {
+            let mut manager = ChunkManager::with_loader(ChunkLoader::open(&path).unwrap());
+            let _ = manager.get(100, 100);
+            manager.mark_all_lit_for_test();
+            assert!(manager.tick_force(&HashSet::new()) >= 1);
+        }
+        {
+            let loader = ChunkLoader::open(&path).unwrap();
+            assert!(
+                loader.load(100, 100).unwrap().is_some(),
+                "生成的区块应已落盘"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -594,6 +1124,7 @@ mod tests {
         let mut manager = ChunkManager::new();
         manager.set_generator(Generator::flat());
         manager.payload(5, 5);
+        manager.mark_all_lit_for_test();
         let before = manager.len();
         assert!(before > 0);
 
@@ -614,6 +1145,7 @@ mod tests {
         let mut manager = ChunkManager::new();
         manager.set_generator(Generator::flat());
         manager.payload(5, 5);
+        manager.mark_all_lit_for_test();
         let before = manager.len();
 
         let mut in_use = HashSet::new();
@@ -635,7 +1167,49 @@ mod tests {
         assert_eq!(manager.len(), before);
     }
 
-    // 卸载前脏块要落盘 卸载后重新加载改动还在
+    // 装饰落点从起源区块 +8 开始，树干/树冠最远能伸到起源的 +2 区块。
+    // 目标区块必须把这些写入合进来，否则树会在 16 格边界上被切掉。
+    #[test]
+    fn decoration_writes_two_chunks_away_are_merged() {
+        const SEED: u32 = 20241115;
+        let mut manager = realistic_manager(SEED);
+
+        // 先装饰一片区域，缓存里才会出现 +2 溢出的写入。
+        for cx in 0..6 {
+            for cz in 0..6 {
+                let _ = manager.get(cx, cz);
+            }
+        }
+
+        let mut spilled = Vec::new();
+        for (&(origin_x, origin_z), decoration) in manager.decorations.iter() {
+            for write in decoration.writes.iter() {
+                if write.id == 0 || matches!(write.id, 37 | 38) {
+                    continue;
+                }
+                let dx = (write.x >> 4) - origin_x;
+                let dz = (write.z >> 4) - origin_z;
+                if dx == 2 || dz == 2 {
+                    spilled.push((write.x, write.y as usize, write.z, write.id));
+                }
+            }
+        }
+        spilled.sort_unstable();
+        assert!(
+            !spilled.is_empty(),
+            "测试种子没有找到落到 +2 区块的装饰写入"
+        );
+
+        for &(x, y, z, _) in spilled.iter().take(64) {
+            let chunk = manager.get(x >> 4, z >> 4);
+            assert_ne!(
+                chunk.block((x & 15) as usize, y, (z & 15) as usize),
+                0,
+                "起源区块跨两格写入的方块 ({x},{y},{z}) 没有合并进目标区块"
+            );
+        }
+    }
+
     #[test]
     fn dirty_chunk_is_saved_before_unload() {
         let path = temp_path("unload-dirty");
@@ -644,6 +1218,7 @@ mod tests {
             let mut manager = ChunkManager::with_loader(ChunkLoader::open(&path).unwrap());
             manager.set_generator(Generator::flat());
             assert!(manager.set_block(x, 5, z, 9));
+            manager.mark_all_lit_for_test();
             assert!(manager.len() > 0);
             assert!(manager.tick_force(&HashSet::new()) > 0);
             assert_eq!(manager.len(), 0);

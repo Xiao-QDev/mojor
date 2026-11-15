@@ -11,6 +11,7 @@ use crate::level::region_handler::PacketResult;
 use crate::level::chunk_io::ChunkIoPool;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::generator::Generator;
+use crate::level::light::LightService;
 use crate::level::region::RegionId;
 
 
@@ -33,6 +34,8 @@ pub struct Level {
     view_distance: i32,
     // 全局共享的区块 I/O 线程池 把同步读盘挪出 region 线程
     io: Arc<ChunkIoPool>,
+    // 全局共享的异步光照服务 所有分片往同一个 worker 提交任务
+    light: Arc<LightService>,
 }
 
 impl Level {
@@ -46,6 +49,7 @@ impl Level {
             idle_ticks: IDLE_SHUTDOWN_TICKS,
             view_distance: DEFAULT_VIEW_DISTANCE,
             io: ChunkIoPool::new(None, 1),
+            light: LightService::start(),
         }
     }
 
@@ -84,6 +88,7 @@ impl Level {
                 self.idle_ticks,
                 self.view_distance,
                 self.io.clone(),
+                self.light.clone(),
             );
             self.regions.insert(id, handle);
         }
@@ -127,6 +132,11 @@ impl Level {
     // 存档句柄 后台刷盘线程需要它
     pub fn loader(&self) -> Option<Arc<ChunkLoader>> {
         self.loader.clone()
+    }
+
+    // 世界数据目录 玩家数据等与 region/ 放在同一目录下
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.loader.as_ref().map(|loader| loader.dir())
     }
 
     // 把已经写进 page cache 的内容刷到磁盘
@@ -386,9 +396,21 @@ mod tests {
     #[test]
     fn payload_matches_edits() {
         let mut level = Level::new();
-        // 先触发生成让区块进缓存 payload 现在只读缓存不触发读盘
+        // 先触发生成让区块进缓存 payload 只回已照亮(lit)的区块
         assert_eq!(level.block(0, 4, 0), GRASS);
-        assert_eq!(level.payload(0, 0).expect("区块已生成")[5], 0);
+        // 光照是异步算的 轮询等 LightDone 回填后 payload 才可见
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if level
+                .payload(0, 0)
+                .map(|data| data[5])
+                .is_some_and(|value| value == 0)
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "光照没有按时回填");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         place_and_wait(&mut level, (0, 4, 0), (0, 5, 0), 3);
         assert_eq!(level.payload(0, 0).expect("区块已生成")[5], 3);
     }
