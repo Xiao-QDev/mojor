@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{Event, Subscriber, error, info};
+use tracing::{Event, Subscriber, info};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, format::Writer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
@@ -17,7 +17,7 @@ use mojor::level::ChunkLoader;
 use mojor::level::generator::Generator;
 use mojor::raknet::server::socket::RakNetServer;
 use mojor::tick;
-
+// 好想玩三角符文第六章啊QAQ
 // 内置默认 banner 用户可以在运行目录的 resources/ 里放自己的文本覆盖
 const DEFAULT_BANNER: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/resources/banner.txt"));
@@ -169,8 +169,16 @@ async fn main() -> Result<()> {
     );
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().event_format(BracketFormat))
+        .with(
+            fmt::layer()
+                .event_format(BracketFormat)
+                // 日志走控制台输出器: 有正在编辑的输入行时先擦掉再打印
+                .with_writer(mojor::console::ConsoleWriter),
+        )
         .init();
+
+    // 原始模式必须在任何退出路径恢复 否则 shell 会留在无回显状态
+    let _terminal = mojor::console::terminal_guard();
 
     // 加载配置过程中会输出 Loading mojor.toml / server.toml
     let config = Arc::new(Config::load());
@@ -182,7 +190,7 @@ async fn main() -> Result<()> {
         "CREATIVE"
     };
     info!("Default game type: {mode}");
-    info!("Start Minecraft server on : {}", config.bind);
+    info!("Start Minecraft:PE server on : {}", config.bind);
     info!(
         "This server is running Mojor version {} (MCPE: {}) (Plugin API {})",
         env!("CARGO_PKG_VERSION"),
@@ -192,7 +200,12 @@ async fn main() -> Result<()> {
     info!("Mojor is released under the AGPLv3.0 license");
     info!("Preparing to generate the level \"{}\"", config.world);
 
-    let socket = Arc::new(UdpSocket::bind(config.bind.as_str()).await?);
+    // 数字 IP 直连 静态 glibc 下避开 getaddrinfo 去 dlopen 系统的 libnss
+    // 非 IP 形式仍交给字符串解析 保留域名绑定
+    let socket = Arc::new(match config.bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => UdpSocket::bind(addr).await?,
+        Err(_) => UdpSocket::bind(config.bind.as_str()).await?,
+    });
     let server_id = std::env::var("MOJOR_SERVER_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -208,14 +221,16 @@ async fn main() -> Result<()> {
     let storage = ChunkLoader::open(&config.world)?;
     let generator = match config.generator.as_str() {
         "flat" => Generator::flat(),
-        _ => Generator::terrain(config.seed),
+        // 旧的 MCPE 噪声地形，保留用来对照/回退
+        "vanilla" | "terrain" => Generator::terrain(config.seed),
+        // "rtg" / "realistic"（默认）都指 RTG 移植版
+        _ => Generator::realistic(config.seed),
     };
+    info!("Terrain generator: {}", generator.name());
 
     let listener = RakNetServer::new(socket, &config, net_tx, server_id, cmd_rx);
-    let mut udp = tokio::spawn(async move {
-        if let Err(e) = listener.run().await {
-            error!(error = %e, "UDP 收包循环异常退出");
-        }
+    let udp = tokio::spawn(async move {
+        let _ = listener.run().await;
     });
 
     // 每 10 秒兜底 trim 一次 常规回收交给上面的 mallopt 阈值按需完成
@@ -238,12 +253,7 @@ async fn main() -> Result<()> {
     );
 
     tokio::select! {
-        res = tick::run(net_rx, cmd_tx, config.gamemode, storage, generator, config.seed, config.view_distance, config.mojor.effective_io_workers()) => { res?; }
-        res = &mut udp => {
-            if let Err(e) = res {
-                error!(error = %e, "UDP task 异常结束");
-            }
-        }
+        res = tick::run(net_rx, cmd_tx, config.gamemode, storage, generator, config.seed, config.view_distance, config.mojor.effective_io_workers(), config.world.clone(), config.max_players) => { res?; }
     }
 
     udp.abort();

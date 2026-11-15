@@ -37,6 +37,16 @@ impl ContainerSetContentPacket {
         }
     }
 
+    // 创造模式背包 客户端以此渲染创造物品栏 窗口 id 固定 0x79
+    // 不附带快捷栏映射(只有玩家主背包才带)
+    pub fn creative(items: Vec<ItemStack>) -> Self {
+        Self {
+            window_id: SPECIAL_CREATIVE,
+            slots: items.into_iter().map(Some).collect(),
+            hotbar: Vec::new(),
+        }
+    }
+
     // 0xb9 | windowid(u8) | count(u16) | 槽位(空槽为 u16 0)
     //      | 快捷栏数量(u16) | 快捷栏内容(i32 * n)
     pub fn encode(&self) -> Bytes {

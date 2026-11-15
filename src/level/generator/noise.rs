@@ -487,6 +487,328 @@ fn bilinear_lerp(
         + ((y - y1) / (y2 - y1)) * (dx1 * q01 + dx2 * q11)
 }
 
+// ============================================================
+// Vanilla NormalNoise：双 Perlin 八度叠加 对齐 Java NormalNoise
+// ============================================================
+
+// 对齐 Java java.util.Random（LCG 48位）
+#[derive(Clone)]
+pub struct VanillaRandom {
+    seed: u64,
+}
+
+impl VanillaRandom {
+    const MULTIPLIER: u64 = 25_214_903_917;
+    const INCREMENT: u64 = 11;
+    const MASK: u64 = (1 << 48) - 1;
+
+    pub fn new(seed: i64) -> Self {
+        Self { seed: (seed as u64 ^ Self::MULTIPLIER) & Self::MASK }
+    }
+
+    fn next(&mut self, bits: u32) -> i32 {
+        self.seed = self.seed.wrapping_mul(Self::MULTIPLIER).wrapping_add(Self::INCREMENT) & Self::MASK;
+        (self.seed >> (48 - bits)) as i32
+    }
+
+    pub fn next_long(&mut self) -> i64 {
+        let hi = self.next(32) as i64;
+        let lo = self.next(32) as i64;
+        (hi << 32).wrapping_add(lo)
+    }
+
+    pub fn next_double(&mut self) -> f64 {
+        let hi = self.next(26) as i64;
+        let lo = self.next(27) as i64;
+        ((hi << 27).wrapping_add(lo)) as f64 * (1.0 / (1i64 << 53) as f64)
+    }
+
+    // 对齐 LegacyRandomSource.fork
+    // 创建一个以 nextLong 为种子的子随机数
+    pub fn fork(&mut self) -> Self {
+        Self::new(self.next_long())
+    }
+}
+
+// 对齐 Vanilla PerlinNoise（GradientNoise）
+// 置换表由 VanillaRandom 初始化 offset 由 nextDouble() 给出
+// wrap：把输入折叠到 (-16777216, 16777216) 避免大坐标溢出
+#[derive(Clone)]
+pub struct VanillaPerlin {
+    perm: [u8; 256],
+    offset_x: f64,
+    offset_y: f64,
+    offset_z: f64,
+}
+
+// 对齐 GradientNoise.GRADIENT（16 个固定向量）
+// index = perm[...] & 15
+static VANILLA_GRAD: [(i8, i8, i8); 16] = [
+    ( 1,  1,  0), (-1,  1,  0), ( 1, -1,  0), (-1, -1,  0),
+    ( 1,  0,  1), (-1,  0,  1), ( 1,  0, -1), (-1,  0, -1),
+    ( 0,  1,  1), ( 0, -1,  1), ( 0,  1, -1), ( 0, -1, -1),
+    ( 1,  1,  0), ( 0, -1,  1), (-1,  1,  0), ( 0, -1, -1),
+];
+
+#[inline]
+fn vanilla_wrap(x: f64) -> f64 {
+    const HALF: f64 = 16_777_215.999_999_998; // nextDown(16777216.0)
+    if x >= -HALF && x < HALF {
+        x
+    } else {
+        x - (x / 33_554_432.0 + 0.5).floor() * 33_554_432.0
+    }
+}
+
+#[inline]
+fn vanilla_grad_dot(hash: usize, x: f64, y: f64, z: f64) -> f64 {
+    let (gx, gy, gz) = VANILLA_GRAD[hash & 15];
+    gx as f64 * x + gy as f64 * y + gz as f64 * z
+}
+
+impl VanillaPerlin {
+    pub fn new(rng: &mut VanillaRandom) -> Self {
+        let offset_x = rng.next_double() * 256.0;
+        let offset_y = rng.next_double() * 256.0;
+        let offset_z = rng.next_double() * 256.0;
+
+        // 对齐 Java Arrays.fill(0..256) + Fisher-Yates（nextInt(256-i) 而非 nextInt(256)）
+        let mut perm = [0u8; 256];
+        for (i, v) in perm.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        for i in 0..256usize {
+            let j = i + (rng.next(32) as usize % (256 - i));
+            perm.swap(i, j);
+        }
+
+        Self { perm, offset_x, offset_y, offset_z }
+    }
+
+    // 对齐 PerlinNoise.get(x, y, z)
+    // 先 wrap 再加 offset（Vanilla 顺序）
+    pub fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
+        let x = vanilla_wrap(x) + self.offset_x;
+        let y = vanilla_wrap(y) + self.offset_y;
+        let z = vanilla_wrap(z) + self.offset_z;
+
+        let ix = x.floor() as i32;
+        let iy = y.floor() as i32;
+        let iz = z.floor() as i32;
+
+        let xf = x - ix as f64;
+        let yf = y - iy as f64;
+        let zf = z - iz as f64;
+
+        let u = fade(xf);
+        let v = fade(yf);
+        let w = fade(zf);
+
+        let ix = (ix & 255) as usize;
+        let iy = (iy & 255) as usize;
+        let iz = (iz & 255) as usize;
+
+        let p = |i: usize| self.perm[i & 255] as usize;
+
+        let a = p(ix) + iy;
+        let b = p(ix + 1) + iy;
+        let aa = p(a) + iz;
+        let ab = p(a + 1) + iz;
+        let ba = p(b) + iz;
+        let bb = p(b + 1) + iz;
+
+        lerp3(
+            u, v, w,
+            vanilla_grad(p(aa),     xf,       yf,       zf),
+            vanilla_grad(p(ba),     xf - 1.0, yf,       zf),
+            vanilla_grad(p(ab),     xf,       yf - 1.0, zf),
+            vanilla_grad(p(bb),     xf - 1.0, yf - 1.0, zf),
+            vanilla_grad(p(aa + 1), xf,       yf,       zf - 1.0),
+            vanilla_grad(p(ba + 1), xf - 1.0, yf,       zf - 1.0),
+            vanilla_grad(p(ab + 1), xf,       yf - 1.0, zf - 1.0),
+            vanilla_grad(p(bb + 1), xf - 1.0, yf - 1.0, zf - 1.0),
+        )
+    }
+}
+
+fn fade(t: f64) -> f64 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+fn lerp3(u: f64, v: f64, w: f64,
+         c000: f64, c100: f64, c010: f64, c110: f64,
+         c001: f64, c101: f64, c011: f64, c111: f64) -> f64 {
+    let x0 = c000 + u * (c100 - c000);
+    let x1 = c010 + u * (c110 - c010);
+    let x2 = c001 + u * (c101 - c001);
+    let x3 = c011 + u * (c111 - c011);
+    let y0 = x0 + v * (x1 - x0);
+    let y1 = x2 + v * (x3 - x2);
+    y0 + w * (y1 - y0)
+}
+
+// 对齐 GradientNoise.gradDot —— 使用 VANILLA_GRAD 表（非 bit 运算版）
+fn vanilla_grad(hash: usize, x: f64, y: f64, z: f64) -> f64 {
+    vanilla_grad_dot(hash, x, y, z)
+}
+
+// 对齐 Vanilla NormalNoise
+// 双组 Perlin 八度：第二组频率 × INPUT_FACTOR
+#[derive(Clone)]
+pub struct VanillaNoise {
+    // 每个八度 (Perlin, frequency, amplitude)
+    first: Vec<(VanillaPerlin, f64, f64)>,
+    second: Vec<(VanillaPerlin, f64, f64)>,
+}
+
+// 第二组 Perlin 的频率偏移（NormalNoise.INPUT_FACTOR）
+const INPUT_FACTOR: f64 = 1.018_126_888_217_522_7;
+
+impl VanillaNoise {
+    // 对齐 NormalNoise.createParity（LEGACY 路径）
+    // base_octave：最低频率八度的指数（负数）
+    // amplitude_modifiers：每个八度的权重，0 表示跳过但仍消耗随机数
+    //
+    // 种子链（对齐 NormalNoise.create + PositionalRandomFactory）：
+    //   rng 是由 fromHashOf("minecraft:noise_name") 创建的 LegacyRandom
+    //   first 组：rng.forkPositional() → 对每个八度 fromHashOf("octave_N")
+    //   second 组：rng.forkPositional() → 对每个八度 fromHashOf("octave_N")
+    //
+    // 振幅（LEGACY + normalize=true）：
+    //   baseAmplitude = 1.0（已由 computeParityBaseAmplitude 折算，这里直接用 amp_mod）
+    //   每个八度 amplitude *= 0.5（lacunarity=2, persistence=0.5）
+    //   起始振幅 = 2^(-(n-1)) / (2^(-n) - 1) × baseAmplitude（normalize=true 调整）
+    //   归一化因子 = computeParityNormalizationFactor
+    pub fn new(
+        rng: &mut VanillaRandom,
+        base_octave: i32,
+        amplitude_modifiers: &[f64],
+    ) -> Self {
+        let n = amplitude_modifiers.len();
+
+        // --- 计算 LEGACY 归一化因子 ---
+        // computeParityNormalizationFactor：
+        //   找非零 amp 的 minOctave/maxOctave（在 modifiers 数组里的 index）
+        //   factor = baseAmplitude * 0.5 * (1/3) / parityExpectedDeviation(span)
+        //   parityExpectedDeviation(span) = 0.1 * (1 + 1/(span+1))
+        // 这里 baseAmplitude=1.0
+        let mut min_oct = n;
+        let mut max_oct = 0usize;
+        for (i, &a) in amplitude_modifiers.iter().enumerate() {
+            if a.abs() > 1e-9 {
+                if i < min_oct { min_oct = i; }
+                if i > max_oct { max_oct = i; }
+            }
+        }
+        let span = if min_oct <= max_oct { (max_oct - min_oct) as f64 } else { 0.0 };
+        let parity_dev = 0.1 * (1.0 + 1.0 / (span + 1.0));
+        let norm_factor = 0.5 / 3.0 / parity_dev; // = baseAmplitude * 0.5 * (1/3) / parityDev
+
+        // --- 计算每个八度的振幅（buildOctaves normalize=true）---
+        // normalize 时：startAmplitude = 2^(-(n-1)) / (2^(-n) - 1)
+        // = -1 / (1 - 2^n) ≈ 1/(2^(n-1)) 的等比数列归一化
+        // 实际上 buildOctaves 里 amplitude *= 0.5 每轮，起始值 start
+        // start = pow(0.5, -(n-1)) / (pow(0.5, -n) - 1)
+        //       = 2^(n-1) / (2^n - 1)
+        let start_amp = if n > 0 {
+            let pow_n = (1u64 << n) as f64; // 2^n
+            (pow_n / 2.0) / (pow_n - 1.0)  // 2^(n-1) / (2^n - 1)
+        } else {
+            1.0
+        };
+
+        // --- forkPositional 两次：创建两组的 positional factory ---
+        // forkPositional = new LegacyPositionalRandom(nextLong())
+        let first_positional_seed = rng.fork().next_long();
+        let second_positional_seed = rng.fork().next_long();
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+
+        let mut amp = start_amp;
+        for (i, &amp_mod) in amplitude_modifiers.iter().enumerate() {
+            let octave_index = base_octave + i as i32;
+            let freq = 2f64.powi(octave_index);
+            let final_amp = norm_factor * amp * amp_mod;
+
+            // fromHashOf("octave_N") = new LegacyRandom(hashCode("octave_N") ^ positional_seed)
+            // hashCode 截断为 32 位 int
+            let seed_name = format!("octave_{octave_index}");
+            let hash = java_string_hash_i32(&seed_name);
+
+            if amp_mod.abs() > 1e-9 {
+                let mut rng1 = VanillaRandom::new((hash as i64) ^ first_positional_seed);
+                first.push((VanillaPerlin::new(&mut rng1), freq, final_amp));
+                let mut rng2 = VanillaRandom::new((hash as i64) ^ second_positional_seed);
+                second.push((VanillaPerlin::new(&mut rng2), freq, final_amp));
+            }
+            // 权重为 0 时不消耗随机数（fromHashOf 是确定性的，不改变 rng 状态）
+
+            amp *= 0.5;
+        }
+
+        Self { first, second }
+    }
+
+    // 对齐 NormalNoise.getValue(x, y, z)
+    pub fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
+        let x2 = x * INPUT_FACTOR;
+        let y2 = y * INPUT_FACTOR;
+        let z2 = z * INPUT_FACTOR;
+
+        let v1: f64 = self.first.iter()
+            .map(|(p, freq, amp)| p.sample(x * freq, y * freq, z * freq) * amp)
+            .sum();
+        let v2: f64 = self.second.iter()
+            .map(|(p, freq, amp)| p.sample(x2 * freq, y2 * freq, z2 * freq) * amp)
+            .sum();
+
+        v1 + v2
+    }
+}
+
+// Java String.hashCode() 截断为 32 位 int
+// s[0]*31^(n-1) + ... + s[n-1]  全程 wrapping i32 运算
+fn java_string_hash_i32(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for c in s.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(c as i32);
+    }
+    h
+}
+
+// 对齐 LegacyPositionalRandom.fromHashOf：hash(name) ^ positional_seed
+// 供外部（make_*_noise）使用：用名称哈希初始化 rng
+fn from_hash_of(name: &str, positional_seed: i64) -> VanillaRandom {
+    let hash = java_string_hash_i32(name) as i64;
+    VanillaRandom::new(hash ^ positional_seed)
+}
+
+// 对齐 Noises.java 里三个噪声的构建
+// 种子链：VanillaRandom(world_seed).forkPositional().fromHashOf("minecraft:noise_name")
+// forkPositional = LegacyPositionalRandom(nextLong())
+// fromHashOf("name") = LegacyRandom(hashCode("name") ^ positional_seed)
+pub fn make_continents_noise(world_seed: i64) -> VanillaNoise {
+    let mut rng = VanillaRandom::new(world_seed);
+    let positional_seed = rng.fork().next_long();
+    let mut noise_rng = from_hash_of("minecraft:continentalness", positional_seed);
+    VanillaNoise::new(&mut noise_rng, -9, &[1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0])
+}
+
+pub fn make_erosion_noise(world_seed: i64) -> VanillaNoise {
+    let mut rng = VanillaRandom::new(world_seed);
+    let positional_seed = rng.fork().next_long();
+    let mut noise_rng = from_hash_of("minecraft:erosion", positional_seed);
+    VanillaNoise::new(&mut noise_rng, -9, &[1.0, 1.0, 0.0, 1.0, 1.0])
+}
+
+pub fn make_ridge_noise(world_seed: i64) -> VanillaNoise {
+    let mut rng = VanillaRandom::new(world_seed);
+    let positional_seed = rng.fork().next_long();
+    let mut noise_rng = from_hash_of("minecraft:ridge", positional_seed);
+    VanillaNoise::new(&mut noise_rng, -7, &[1.0, 2.0, 1.0, 0.0, 0.0, 0.0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +867,37 @@ mod tests {
                 assert!((array[x * stride + z] - direct).abs() < 1e-12);
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn vanilla_noise_range() {
+        let c = make_continents_noise(1);
+        let e = make_erosion_noise(1);
+        let r = make_ridge_noise(1);
+        let samples: Vec<f64> = (0..20).map(|i| {
+            let x = i as f64 * 100.0;
+            c.sample(x, 0.0, x * 1.3)
+        }).collect();
+        let cmin = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let cmax = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        println!("continents range: {cmin:.4}..{cmax:.4}");
+        let samples: Vec<f64> = (0..20).map(|i| {
+            let x = i as f64 * 100.0;
+            e.sample(x, 0.0, x * 1.3)
+        }).collect();
+        let emin = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let emax = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        println!("erosion range: {emin:.4}..{emax:.4}");
+        let samples: Vec<f64> = (0..20).map(|i| {
+            let x = i as f64 * 100.0;
+            r.sample(x, 0.0, x * 1.3)
+        }).collect();
+        let rmin = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let rmax = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        println!("ridge range: {rmin:.4}..{rmax:.4}");
+        // 至少要有一些非零值
+        assert!(cmax - cmin > 0.01, "continents 全零: {cmin}..{cmax}");
     }
 
     // 插值点落在相邻采样之间

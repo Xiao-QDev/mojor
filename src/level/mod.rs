@@ -13,6 +13,9 @@ pub mod region_handler;
 // 与 Nukkit 一致 Level 放在 level 包下 模块名与父模块同名
 #[allow(clippy::module_inception)]
 pub mod level;
+// 服务端世界时间 照搬 Nukkit Level 的 checkTime/sendTime/setTime 概念归到 level 包
+pub(crate) mod world_time;
 
 pub use chunk_loader::ChunkLoader;
 pub use level::Level;
+pub(crate) use world_time::WorldTime;

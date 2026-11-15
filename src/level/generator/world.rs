@@ -8,11 +8,37 @@ pub struct GenWorld<'a> {
     chunks: &'a mut HashMap<(i32, i32), Chunk>,
     // 本 region 的区块范围 越界的读写直接丢掉
     bounds: Option<((i32, i32), (i32, i32))>,
+    // 只读地形层：chunks 里没有的区块先克隆一份再写（区块级写时复制）。
+    // 每个待装饰区块都用一份干净的视图，装饰结果与调用顺序、邻居装饰无关。
+    base: Option<&'a HashMap<(i32, i32), Chunk>>,
 }
 
 impl<'a> GenWorld<'a> {
     pub fn new(chunks: &'a mut HashMap<(i32, i32), Chunk>) -> Self {
-        Self { chunks, bounds: None }
+        Self {
+            chunks,
+            bounds: None,
+            base: None,
+        }
+    }
+
+    /// 写时复制视图：读取先看本层写入、再看只读地形；写入时把整个区块
+    /// 从地形克隆过来。装饰一个区块前调用 [`Self::reset_overlay`] 丢掉
+    /// 上一次的写入，就能保证每次都从纯地形开始。
+    pub fn with_base(
+        chunks: &'a mut HashMap<(i32, i32), Chunk>,
+        base: &'a HashMap<(i32, i32), Chunk>,
+    ) -> Self {
+        Self {
+            chunks,
+            bounds: None,
+            base: Some(base),
+        }
+    }
+
+    /// 丢掉本视图所有写入，回到纯地形。
+    pub fn reset_overlay(&mut self) {
+        self.chunks.clear();
     }
 
     pub fn with_bounds(mut self, bounds: Option<((i32, i32), (i32, i32))>) -> Self {
@@ -29,29 +55,43 @@ impl<'a> GenWorld<'a> {
         }
     }
 
+    fn find_chunk(&self, chunk_x: i32, chunk_z: i32) -> Option<&Chunk> {
+        if !self.in_bounds(chunk_x, chunk_z) {
+            return None;
+        }
+        self.chunks
+            .get(&(chunk_x, chunk_z))
+            .or_else(|| self.base.and_then(|base| base.get(&(chunk_x, chunk_z))))
+    }
+
+    fn materialize(&mut self, chunk_x: i32, chunk_z: i32) -> Option<&mut Chunk> {
+        if !self.in_bounds(chunk_x, chunk_z) {
+            return None;
+        }
+        if !self.chunks.contains_key(&(chunk_x, chunk_z)) {
+            let source = self.base.and_then(|base| base.get(&(chunk_x, chunk_z)))?;
+            self.chunks.insert((chunk_x, chunk_z), source.clone());
+        }
+        self.chunks.get_mut(&(chunk_x, chunk_z))
+    }
+
     pub fn contains(&self, chunk_x: i32, chunk_z: i32) -> bool {
-        self.in_bounds(chunk_x, chunk_z) && self.chunks.contains_key(&(chunk_x, chunk_z))
+        self.find_chunk(chunk_x, chunk_z).is_some()
     }
 
     pub fn chunk(&self, chunk_x: i32, chunk_z: i32) -> Option<&Chunk> {
-        if !self.in_bounds(chunk_x, chunk_z) {
-            return None;
-        }
-        self.chunks.get(&(chunk_x, chunk_z))
+        self.find_chunk(chunk_x, chunk_z)
     }
 
     pub fn chunk_mut(&mut self, chunk_x: i32, chunk_z: i32) -> Option<&mut Chunk> {
-        if !self.in_bounds(chunk_x, chunk_z) {
-            return None;
-        }
-        self.chunks.get_mut(&(chunk_x, chunk_z))
+        self.materialize(chunk_x, chunk_z)
     }
 
     pub fn block(&self, x: i32, y: i32, z: i32) -> u8 {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 0;
         }
-        self.chunk(x >> 4, z >> 4)
+        self.find_chunk(x >> 4, z >> 4)
             .map(|chunk| chunk.block((x & 0xf) as usize, y as usize, (z & 0xf) as usize))
             .unwrap_or(0)
     }
@@ -61,7 +101,7 @@ impl<'a> GenWorld<'a> {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return;
         }
-        if let Some(chunk) = self.chunk_mut(x >> 4, z >> 4) {
+        if let Some(chunk) = self.materialize(x >> 4, z >> 4) {
             chunk.set_block((x & 0xf) as usize, y as usize, (z & 0xf) as usize, id);
         }
     }
@@ -70,7 +110,7 @@ impl<'a> GenWorld<'a> {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 0;
         }
-        self.chunk(x >> 4, z >> 4)
+        self.find_chunk(x >> 4, z >> 4)
             .map(|chunk| chunk.meta((x & 0xf) as usize, y as usize, (z & 0xf) as usize))
             .unwrap_or(0)
     }
@@ -79,7 +119,7 @@ impl<'a> GenWorld<'a> {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return;
         }
-        if let Some(chunk) = self.chunk_mut(x >> 4, z >> 4) {
+        if let Some(chunk) = self.materialize(x >> 4, z >> 4) {
             chunk.set_meta((x & 0xf) as usize, y as usize, (z & 0xf) as usize, data);
         }
     }
@@ -89,6 +129,41 @@ impl<'a> GenWorld<'a> {
         if data != 0 {
             self.set_meta(x, y, z, data);
         }
+    }
+
+    // RTG 内部统一用 state = id << 4 | meta 记法，population 阶段直接用它读写
+    pub fn block_state(&self, x: i32, y: i32, z: i32) -> i32 {
+        (self.block(x, y, z) as i32) << 4 | self.meta(x, y, z) as i32
+    }
+
+    pub fn set_block_state(&mut self, x: i32, y: i32, z: i32, state: i32) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        if self.block_state(x, y, z) == state {
+            return false;
+        }
+        let Some(chunk) = self.materialize(x >> 4, z >> 4) else {
+            return false;
+        };
+        let (lx, ly, lz) = ((x & 0xf) as usize, y as usize, (z & 0xf) as usize);
+        chunk.set_block(lx, ly, lz, (state >> 4) as u8);
+        chunk.set_meta(lx, ly, lz, (state & 0xf) as u8);
+        true
+    }
+
+    pub fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
+        self.block(x, y, z) == 0
+    }
+
+    // 对应 RTG 的 `isBlockLoaded`：只看区块在不在，不看 y
+    pub fn is_block_loaded(&self, x: i32, z: i32) -> bool {
+        self.contains(x >> 4, z >> 4)
+    }
+
+    // 生成期没有真实光照，按"露天"处理（与 RTG 在明亮地表的行为一致）
+    pub fn light(&self, _x: i32, _y: i32, _z: i32) -> u8 {
+        15
     }
 
     pub fn biome(&self, x: i32, z: i32) -> u8 {
@@ -139,5 +214,25 @@ mod tests {
         let mut world = GenWorld::new(&mut chunks);
         world.set_block(100, 10, 100, BEDROCK);
         assert_eq!(world.block(100, 10, 100), 0);
+    }
+
+    // 写时复制：没写过的区块读地形，写过之后读自己的副本，地形层不被污染。
+    #[test]
+    fn copy_on_write_view_starts_from_terrain() {
+        let mut terrain = HashMap::new();
+        let mut origin = Chunk::empty(0, 0);
+        origin.set_block(1, 10, 1, 2);
+        terrain.insert((0, 0), origin);
+
+        let mut working = HashMap::new();
+        let mut world = GenWorld::with_base(&mut working, &terrain);
+        assert_eq!(world.block(1, 10, 1), 2, "没写过时读到地形");
+        world.set_block(1, 11, 1, 17);
+        assert_eq!(world.block(1, 11, 1), 17, "写过之后读到自己的副本");
+        assert_eq!(terrain[&(0, 0)].block(1, 11, 1), 0, "地形层不能被污染");
+
+        world.reset_overlay();
+        assert_eq!(world.block(1, 11, 1), 0, "下一次装饰从纯地形开始");
+        assert_eq!(world.block(1, 10, 1), 2);
     }
 }

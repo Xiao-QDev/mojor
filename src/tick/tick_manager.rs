@@ -1,10 +1,10 @@
 use std::pin::pin;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
@@ -28,6 +28,8 @@ pub async fn run(
     seed: u32,
     view_distance: i32,
     io_workers: usize,
+    world_name: String,
+    max_players: u32,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_millis(TICK_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -38,8 +40,25 @@ pub async fn run(
 
     let mut tick_count: u64 = 0;
     let mut pending: Vec<NetEvent> = Vec::with_capacity(64);
-    let mut network =
-        NetworkState::with_loader(gamemode, storage, generator, seed, view_distance, io_workers);
+    let mut network = NetworkState::with_loader(
+        gamemode,
+        storage,
+        generator,
+        seed,
+        view_distance,
+        io_workers,
+        world_name,
+    );
+    network.set_max_players(max_players);
+
+    // 控制台命令 照搬 Nukkit CommandReader: 独立线程读 stdin 不阻塞 tokio
+    // TTY 下支持 Tab 自动补全与行编辑(见 crate::console)
+    let (console_tx, mut console_rx) = mpsc::channel::<String>(16);
+    std::thread::Builder::new()
+        .name("console".into())
+        .spawn(move || crate::console::run(console_tx))
+        .ok();
+
     // 刷盘放到后台 主循环只把改动写进 page cache 不会被磁盘阻塞
     let (sync_stop_tx, sync_stop_rx) = std_mpsc::channel::<()>();
     let sync_thread = network.sync_handle().and_then(|loader| {
@@ -50,9 +69,7 @@ pub async fn run(
                     match sync_stop_rx.recv_timeout(SYNC_INTERVAL) {
                         Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                            if let Err(e) = loader.sync() {
-                                warn!(error = %e, "后台刷盘失败");
-                            }
+                            let _ = loader.sync();
                         }
                     }
                 }
@@ -73,19 +90,27 @@ pub async fn run(
 
                 for evt in &pending {
                     match evt {
-                        NetEvent::SessionOpened { .. } => {}
-                        NetEvent::SessionClosed { addr, reason } => {
-                            info!(%addr, reason = %reason, "RakNet 会话关闭");
-                            for cmd in network.on_session_closed(addr) {
-                                if cmd_tx.try_send(cmd).is_err() {
-                                    warn!(%addr, "下行命令队列已满 丢弃玩家下线通知");
-                                }
+                        NetEvent::SessionOpened { id, addr, .. } => {
+                            network.on_session_opened(*id, addr);
+                        }
+                        NetEvent::SessionClosed { id, addr, reason } => {
+                            // 旧会话退役时新连接可能已经接管该端点 按 id 判断归属
+                            for cmd in network.on_session_closed(*id, addr, reason) {
+                                let _ = cmd_tx.try_send(cmd);
                             }
                         }
-                        NetEvent::GamePacket { addr, payload } => {
+                        NetEvent::GamePacket { id, addr, payload } => {
+                            // 旧会话的残留包丢弃 不能打进新会话
+                            if !network.session_matches(*id, addr) {
+                                continue;
+                            }
                             for cmd in network.handle_game_packet(*addr, payload) {
-                                if cmd_tx.try_send(cmd).is_err() {
-                                    warn!(%addr, "下行命令队列已满 丢弃回包");
+                                match cmd {
+                                    // 玩家聊天的服务端镜像 直接打到控制台 不发给 RakNet
+                                    SendCmd::Console(line) => info!("{line}"),
+                                    other => {
+                                        let _ = cmd_tx.try_send(other);
+                                    }
                                 }
                             }
                         }
@@ -94,9 +119,7 @@ pub async fn run(
 
                 // 网络状态机的周期工作 目前是分批下发区块
                 for cmd in network.tick().await {
-                    if cmd_tx.try_send(cmd).is_err() {
-                        warn!("下行命令队列已满 丢弃区块批次");
-                    }
+                    let _ = cmd_tx.try_send(cmd);
                 }
 
                 if tick_count.is_multiple_of(SAVE_INTERVAL_TICKS) {
@@ -104,28 +127,53 @@ pub async fn run(
                     network.flush_world_async();
                 }
             }
+            Some(line) = console_rx.recv() => {
+                let output = network.run_command(&line);
+                for message in &output.messages {
+                    info!("{message}");
+                }
+                for cmd in output.sync {
+                    let _ = cmd_tx.try_send(cmd);
+                }
+            }
             _ = &mut shutdown => {
-                info!("Stop!!!");
+                if !network.is_shutdown_requested() {
+                    const A: &[&str] = &[
+                        "Stop! Hah... please try not to use Ctrl+C to stop the server next time, okay?",
+                        "Could you please not use Ctrl+C? ...It's a bad habit.",
+                        "I really don't get what you're thinking. Just don't press it next time, okay?",
+                        "Hah... suit yourself.",
+                        "oh my god...",
+                        "Ctrl+C is a graceful shutdown, but I still wouldn't recommend it.",
+                        "NO!NO!NO!"
+                    ];
+                    let n = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as usize
+                        % A.len();
+                    info!("{}", A[n]);
+                }
                 break 'main;
             }
         }
+
+        // stop 命令从控制台或玩家触发 据此优雅停机
+        if network.is_shutdown_requested() {
+            break 'main;
+        }
     }
 
-    // 停机前把剩下的改动写进存档 先停后台线程再做最后一次刷盘
-    match network.flush_world() {
-        Ok(n) if n > 0 => info!(chunks = n, "停机前保存世界"),
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "停机前保存世界失败"),
-    }
+    // 停机前把在线玩家和剩下的区块改动都写进存档
+    // Ctrl+C 关服不会走 SessionClosed 必须在这里兜底存玩家
+    network.save_all_players();
+    let _ = network.flush_world();
     let _ = sync_stop_tx.send(());
     if let Some(handle) = sync_thread {
         let _ = handle.join();
     }
-    if let Err(e) = network.sync_world() {
-        warn!(error = %e, "停机前刷盘失败");
-    }
+    let _ = network.sync_world();
 
-    info!(tick = tick_count, "主循环结束");
     Ok(())
 }
 

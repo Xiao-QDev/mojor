@@ -3,30 +3,57 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{trace, warn};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::network::SendCmd;
-use crate::raknet::GAME_PACKET_PREFIX;
 use crate::raknet::protocol::packets::{
-    ID_UNCONNECTED_PING, ID_UNCONNECTED_PING_OPEN_CONNECTIONS, UnconnectedPing, UnconnectedPong,
+    ID_OPEN_CONNECTION_REQUEST_1, ID_UNCONNECTED_PING, ID_UNCONNECTED_PING_OPEN_CONNECTIONS,
+    UnconnectedPing, UnconnectedPong,
 };
 use crate::raknet::server::session::{Session, SessionEvent};
-use crate::utils::binary::hexdump;
 
 pub const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub const SESSION_TICK_MS: u64 = 50;
 
+// 事件都带会话 id 上层据此区分同端点上的新旧连接
 #[derive(Debug)]
 pub enum NetEvent {
-    SessionOpened { addr: SocketAddr, client_id: u64 },
-    SessionClosed { addr: SocketAddr, reason: String },
-    GamePacket { addr: SocketAddr, payload: Bytes },
+    SessionOpened {
+        id: u64,
+        addr: SocketAddr,
+        client_id: u64,
+    },
+    SessionClosed {
+        id: u64,
+        addr: SocketAddr,
+        reason: String,
+    },
+    GamePacket {
+        id: u64,
+        addr: SocketAddr,
+        payload: Bytes,
+    },
+}
+
+// 连接任务收到的消息
+enum ConnCmd {
+    Datagram(Bytes),
+    Downlink { bodies: Vec<Bytes> },
+    // 同端点新连接接管 旧会话立即退役
+    Shutdown,
+}
+
+struct ConnHandle {
+    id: u64,
+    tx: mpsc::Sender<ConnCmd>,
+    // 登录完成前不下发游戏包 旧会话在途的残包不会打到新连接
+    ready: bool,
 }
 
 pub struct RakNetServer {
@@ -35,7 +62,8 @@ pub struct RakNetServer {
     server_name: Arc<str>,
     net_tx: mpsc::Sender<NetEvent>,
     cmd_rx: mpsc::Receiver<SendCmd>,
-    sessions: HashMap<SocketAddr, Session>,
+    sessions: HashMap<SocketAddr, ConnHandle>,
+    next_id: u64,
 }
 
 impl RakNetServer {
@@ -54,15 +82,16 @@ impl RakNetServer {
             net_tx,
             cmd_rx,
             sessions: HashMap::new(),
+            next_id: 1,
         }
     }
 
+    // 只做收包路由与下行分发 协议状态全在各连接任务里
     pub async fn run(mut self) -> Result<()> {
         let socket = Arc::clone(&self.socket);
         let mut buf = vec![0u8; MAX_DATAGRAM];
-        let mut ticker = interval(Duration::from_millis(SESSION_TICK_MS));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut dropped: u64 = 0;
+        // 任务退出通知 由 manager 移除路由 不会误删已经接管的新会话
+        let (done_tx, mut done_rx) = mpsc::channel::<(u64, SocketAddr)>(64);
 
         loop {
             tokio::select! {
@@ -75,122 +104,216 @@ impl RakNetServer {
 
                     // 离线 ping 无会话 直接在收包循环回送
                     if matches!(packet[0], ID_UNCONNECTED_PING | ID_UNCONNECTED_PING_OPEN_CONNECTIONS) {
-                        match UnconnectedPing::decode(packet) {
-                            Ok(ping) => {
-                                let pong = UnconnectedPong::reply_to(ping, self.server_id, self.server_name.as_ref());
-                                match pong.encode() {
-                                    Ok(data) => {
-                                        if let Err(e) = socket.send_to(&data, peer).await {
-                                            warn!(%peer, error = %e, "pong 发送失败");
-                                        }
-                                    }
-                                    Err(e) => warn!(%peer, error = %e, "pong 编码失败"),
-                                }
+                        if let Ok(ping) = UnconnectedPing::decode(packet) {
+                            let pong = UnconnectedPong::reply_to(ping, self.server_id, self.server_name.as_ref());
+                            if let Ok(data) = pong.encode() {
+                                let _ = socket.send_to(&data, peer).await;
                             }
-                            Err(e) => warn!(%peer, error = %e, "ping 解码失败\n{}", hexdump(packet)),
                         }
                         continue;
                     }
 
-                    let mut out = Vec::new();
-                    let mut events = Vec::new();
-                    {
-                        let session = self
-                            .sessions
-                            .entry(peer)
-                            .or_insert_with(|| Session::new(peer, self.server_id));
-                        if let Err(e) = session.handle_datagram(packet, &mut out, &mut events) {
-                            warn!(%peer, error = %e, "处理数据包失败\n{}", hexdump(packet));
+                    // 握手首包一律开新会话 同端点旧会话立刻退役
+                    // 新任务马上接管 旧任务在后台收尾 它的 Closed 带旧 id 不会影响新玩家
+                    if packet[0] == ID_OPEN_CONNECTION_REQUEST_1 {
+                        if let Some(old) = self.sessions.remove(&peer) {
+                            let _ = old.tx.try_send(ConnCmd::Shutdown);
                         }
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let (tx, rx) = mpsc::channel(256);
+                        self.sessions.insert(peer, ConnHandle { id, tx, ready: false });
+                        spawn_connection(
+                            id,
+                            peer,
+                            self.server_id,
+                            Arc::clone(&socket),
+                            self.net_tx.clone(),
+                            done_tx.clone(),
+                            rx,
+                            Bytes::copy_from_slice(packet),
+                        );
+                        continue;
                     }
 
-                    for data in out {
-                        if let Err(e) = socket.send_to(&data, peer).await {
-                            trace!(%peer, error = %e, "发送失败");
+                    if let Some(handle) = self.sessions.get(&peer) {
+                        let tx = handle.tx.clone();
+                        // 上行也不能丢 ACK 丢了会触发大量重传 下行翻倍后雪崩
+                        // 缓冲满时阻塞一下 由连接任务的消费速度自然背压
+                        if let Err(mpsc::error::TrySendError::Full(cmd)) =
+                            tx.try_send(ConnCmd::Datagram(Bytes::copy_from_slice(packet)))
+                        {
+                            let _ = tx.send(cmd).await;
                         }
                     }
-                    self.forward(events, &mut dropped);
                 }
-                command = self.cmd_rx.recv() => {
-                    match command {
-                        Some(SendCmd::GamePackets { addr, bodies }) => {
-                            if let Some(session) = self.sessions.get_mut(&addr) {
-                                for body in bodies {
-                                    // 0x8e 前缀在这里拼 只做一次拷贝
-                                    let mut payload = BytesMut::with_capacity(1 + body.len());
-                                    payload.put_u8(GAME_PACKET_PREFIX);
-                                    payload.put_slice(&body);
-                                    let mut out = Vec::new();
-                                    if let Err(e) = session.send_game(payload.freeze(), &mut out) {
-                                        warn!(%addr, error = %e, "下行编码失败");
-                                    }
-                                    for data in out {
-                                        if let Err(e) = socket.send_to(&data, addr).await {
-                                            trace!(%addr, error = %e, "发送失败");
-                                        }
-                                    }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    match cmd {
+                        SendCmd::Console(_) => {}
+                        // 登录完成 之后的下行才允许发到这条连接
+                        SendCmd::SessionReady { addr } => {
+                            match self.sessions.get_mut(&addr) {
+                                Some(handle) => {
+                                    handle.ready = true;
+                                    info!("[{addr}] session {} ready for downlink", handle.id);
+                                }
+                                None => warn!("[{addr}] session ready but no route"),
+                            }
+                        }
+                        SendCmd::GamePackets { addr, bodies } => {
+                            if let Some(handle) = self.sessions.get(&addr).filter(|h| h.ready) {
+                                let tx = handle.tx.clone();
+                                // 下行绝不能丢 区块包丢了客户端会一直卡在加载界面
+                                // 缓冲满时阻塞等待 由连接任务的发送速度自然背压
+                                if let Err(mpsc::error::TrySendError::Full(cmd)) =
+                                    tx.try_send(ConnCmd::Downlink { bodies })
+                                {
+                                    let _ = tx.send(cmd).await;
                                 }
                             }
                         }
-                        None => break,
                     }
                 }
-                _ = ticker.tick() => {
-                    let now = Instant::now();
-                    let mut outgoing: Vec<(SocketAddr, Bytes)> = Vec::new();
-                    let mut events = Vec::new();
-                    let mut closed = Vec::new();
-
-                    for (addr, session) in &mut self.sessions {
-                        let mut out = Vec::new();
-                        let mut session_events = Vec::new();
-                        session.tick(now, &mut out, &mut session_events);
-
-                        for data in out {
-                            outgoing.push((*addr, data));
-                        }
-                        if session_events
-                            .iter()
-                            .any(|e| matches!(e, SessionEvent::Closed { .. }))
-                        {
-                            closed.push(*addr);
-                        }
-                        events.extend(session_events);
-                    }
-
-                    for (addr, data) in outgoing {
-                        if let Err(e) = socket.send_to(&data, addr).await {
-                            trace!(%addr, error = %e, "发送失败");
-                        }
-                    }
-                    for addr in closed {
+                Some((id, addr)) = done_rx.recv() => {
+                    // 只有路由还是这个 id 才移除 新连接接管后旧任务退出不会误删
+                    if self.sessions.get(&addr).is_some_and(|handle| handle.id == id) {
                         self.sessions.remove(&addr);
                     }
-                    self.forward(events, &mut dropped);
                 }
+                else => break,
             }
         }
         Ok(())
     }
+}
 
-    fn forward(&self, events: Vec<SessionEvent>, dropped: &mut u64) {
-        for event in events {
-            let net_event = match event {
-                SessionEvent::Opened { addr, client_id } => {
-                    NetEvent::SessionOpened { addr, client_id }
+// 每条连接一个任务 握手 重传 超时判定都独立跑
+// 旧会话退役和新会话建立互不阻塞 退出时保证 Closed 事件只发一次
+#[allow(clippy::too_many_arguments)]
+fn spawn_connection(
+    id: u64,
+    addr: SocketAddr,
+    server_id: u64,
+    socket: Arc<UdpSocket>,
+    net_tx: mpsc::Sender<NetEvent>,
+    done_tx: mpsc::Sender<(u64, SocketAddr)>,
+    mut rx: mpsc::Receiver<ConnCmd>,
+    first: Bytes,
+) {
+    tokio::spawn(async move {
+        let mut session = Session::new(id, addr, server_id);
+        let mut ticker = interval(Duration::from_millis(SESSION_TICK_MS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut pending = Some(first);
+        let mut finished = false;
+        let mut sent_closed = false;
+        let mut reason = String::from("closed");
+        // 收发统计 用来判断客户端是否真的收到并确认了数据
+        let mut sent_datagrams: u64 = 0;
+        let mut recv_datagrams: u64 = 0;
+        let mut ticks: u64 = 0;
+
+        while !finished {
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+
+            match pending.take() {
+                Some(packet) => {
+                    let _ = session.handle_datagram(&packet, &mut out, &mut events);
                 }
-                SessionEvent::Closed { addr, reason } => NetEvent::SessionClosed { addr, reason },
-                SessionEvent::Game { addr, payload } => NetEvent::GamePacket { addr, payload },
-            };
-
-            if self.net_tx.try_send(net_event).is_err() {
-                *dropped += 1;
-                if (*dropped).is_multiple_of(100) {
-                    warn!(dropped = *dropped, "网络事件队列已满 丢弃事件");
+                None => {
+                    // 队列里已排队的命令一次性取空 批量处理后再统一发送
+                    // 一次只处理一条会让区块下发的突发流量堆积并丢包
+                    let mut cmds = Vec::new();
+                    tokio::select! {
+                        cmd = rx.recv() => match cmd {
+                            Some(cmd) => {
+                                cmds.push(cmd);
+                                while let Ok(cmd) = rx.try_recv() {
+                                    cmds.push(cmd);
+                                }
+                            }
+                            None => {
+                                reason = "replaced".into();
+                                finished = true;
+                            }
+                        },
+                        _ = ticker.tick() => {
+                            ticks += 1;
+                            session.tick(Instant::now(), &mut out, &mut events);
+                            // 每 2 秒汇报一次 未确认数不降说明客户端没收到或者没回 ACK
+                            if ticks.is_multiple_of(40) && sent_datagrams > 0 {
+                                info!(
+                                    "[{addr}] down {sent_datagrams} datagrams / up {recv_datagrams}, unacked {}, next seq {}",
+                                    session.recovery_len(),
+                                    session.send_seq()
+                                );
+                            }
+                        }
+                    }
+                    for cmd in cmds {
+                        match cmd {
+                            ConnCmd::Datagram(packet) => {
+                                recv_datagrams += 1;
+                                let _ = session.handle_datagram(&packet, &mut out, &mut events);
+                            }
+                            ConnCmd::Downlink { bodies } => {
+                                for body in bodies {
+                                    let _ = session.send_game(body, &mut out);
+                                }
+                            }
+                            ConnCmd::Shutdown => {
+                                reason = "replaced".into();
+                                finished = true;
+                            }
+                        }
+                    }
                 }
             }
+
+            for data in out {
+                sent_datagrams += 1;
+                let _ = socket.send_to(&data, addr).await;
+            }
+
+            for event in events {
+                let (net, closed) = match event {
+                    SessionEvent::Opened { id, addr, client_id } => (
+                        NetEvent::SessionOpened { id, addr, client_id },
+                        false,
+                    ),
+                    SessionEvent::Closed { id, addr, reason } => (
+                        NetEvent::SessionClosed { id, addr, reason },
+                        true,
+                    ),
+                    SessionEvent::Game { id, addr, payload } => (
+                        NetEvent::GamePacket { id, addr, payload },
+                        false,
+                    ),
+                };
+                if closed {
+                    finished = true;
+                    sent_closed = true;
+                }
+                if net_tx.send(net).await.is_err() {
+                    finished = true;
+                }
+            }
+
+            // 客户端主动断开(0x15)时 Closed 事件已经产生 这里兜住其余路径
+            if session.is_closed() {
+                finished = true;
+            }
         }
-    }
+
+        info!("[{addr}] session {id} task exit: {reason}");
+        if !sent_closed {
+            let _ = net_tx
+                .send(NetEvent::SessionClosed { id, addr, reason })
+                .await;
+        }
+        let _ = done_tx.send((id, addr)).await;
+    });
 }
 
 #[cfg(test)]
@@ -272,6 +395,42 @@ mod tests {
         assert_eq!(&buf[1..17], MAGIC.as_slice());
         assert_eq!(len, 1 + 16 + 8 + 1 + 2);
         assert_eq!(u16::from_be_bytes([buf[len - 2], buf[len - 1]]), 1464);
+        handle.abort();
+    }
+
+    // 同一端口重复握手 客户端退出后立刻重连也必须有回应 不能等会话超时
+    #[tokio::test]
+    async fn reconnect_from_same_port_gets_reply_again() {
+        let (addr, mut rx, handle) = start().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut request = vec![ID_OPEN_CONNECTION_REQUEST_1];
+        request.extend_from_slice(&MAGIC);
+        request.push(6);
+        request.resize(1492, 0);
+
+        for _ in 0..2 {
+            client.send_to(&request, addr).await.unwrap();
+            let mut buf = [0u8; 2048];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .expect("同端点重连必须立刻回 Reply1")
+                .unwrap();
+            assert_eq!(buf[0], ID_OPEN_CONNECTION_REPLY_1);
+            assert!(len > 0);
+        }
+
+        // 旧会话退役 上层必须收到带旧 id 的关闭事件 用于区分新旧连接
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("应收到旧会话的关闭事件")
+            .expect("事件通道未关闭");
+        match event {
+            NetEvent::SessionClosed { id, .. } => {
+                assert_eq!(id, 1, "旧会话 id 应为 1");
+            }
+            other => panic!("期望 SessionClosed 实际 {other:?}"),
+        }
         handle.abort();
     }
 

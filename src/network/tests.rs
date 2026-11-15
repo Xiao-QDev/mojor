@@ -22,6 +22,7 @@ use crate::network::protocol::animate::ACTION_SWING_ARM;
 use crate::level::generator::terrain::SEA_LEVEL;
 use crate::level::actor::REGION_TICK;
 use crate::utils::binary::BinaryWriter;
+use uuid::Uuid;
 
 fn addr() -> SocketAddr {
     "127.0.0.1:50000".parse().unwrap()
@@ -33,6 +34,11 @@ fn peer(port: u16) -> SocketAddr {
 
 fn login_packet() -> Vec<u8> {
     login_packet_for("Xiao_QDev", [0; 16])
+}
+
+// 与 login_packet_for 写进登录包的 uuid 一致 读存档时按同一个值找
+fn login_uuid(byte: u8) -> Uuid {
+    Uuid::from_bytes([byte; 16])
 }
 
 fn login_packet_for(username: &str, uuid: [u8; 16]) -> Vec<u8> {
@@ -196,6 +202,7 @@ async fn edited_block_survives_reload() {
             0,
             DEFAULT_VIEW_DISTANCE,
             1,
+            "world".to_string(),
         );
         let alice = peer(50003);
         state.handle_game_packet(alice, &login_packet_for("alice", [0x33; 16]));
@@ -205,7 +212,8 @@ async fn edited_block_survives_reload() {
         // 挖掘在分片线程里完成 等结果回来再落盘
         drain_by_peer(&mut state).await;
         assert_eq!(state.block_at(0, 4, 0), 0);
-        assert_eq!(state.flush_world().unwrap(), 1);
+        // 视野内新生成的区块也会一并落盘(避免重生成丢改动) 所以只要求至少写了被挖的区块
+        assert!(state.flush_world().unwrap() >= 1);
     }
 
     {
@@ -216,6 +224,7 @@ async fn edited_block_survives_reload() {
             0,
             DEFAULT_VIEW_DISTANCE,
             1,
+            "world".to_string(),
         );
         assert_eq!(state.block_at(0, 4, 0), 0);
         assert_eq!(state.block_at(0, 3, 0), crate::level::generator::flat::DIRT);
@@ -427,18 +436,31 @@ async fn empty_hand_and_distant_blocks_are_rejected() {
 fn bodies(cmd: &SendCmd) -> &[Bytes] {
     match cmd {
         SendCmd::GamePackets { bodies, .. } => bodies,
+        SendCmd::SessionReady { .. } | SendCmd::Console(_) => &[],
     }
+}
+
+// 登录会先发 SessionReady 再发回包 取第一条游戏包序列
+fn game_bodies(commands: &[SendCmd]) -> &[Bytes] {
+    commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            SendCmd::GamePackets { bodies, .. } => Some(bodies.as_slice()),
+            _ => None,
+        })
+        .expect("应有下行游戏包")
 }
 
 #[tokio::test]
 async fn login_returns_initial_sequence() {
     let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
     let commands = state.handle_game_packet(addr(), &login_packet());
-    assert_eq!(commands.len(), 1);
+    // SessionReady + 登录回包
+    assert_eq!(commands.len(), 2);
 
-    let packets = bodies(&commands[0]);
-    // 8 个登录包 + 半径更新
-    assert_eq!(packets.len(), 9);
+    let packets = game_bodies(&commands);
+    // 8 个登录包 半径更新照 Nukkit 等客户端请求再回 不在登录批次里
+    assert_eq!(packets.len(), 8);
     assert_eq!(packets[0][0], PLAY_STATUS);
     assert_eq!(packets[1][0], START_GAME);
     assert_eq!(packets[2][0], SET_TIME);
@@ -447,8 +469,6 @@ async fn login_returns_initial_sequence() {
     assert_eq!(packets[5][0], SET_DIFFICULTY);
     assert_eq!(packets[6][0], SET_PLAYER_GAMETYPE);
     assert_eq!(packets[7][0], ADVENTURE_SETTINGS);
-    assert_eq!(packets[8][0], CHUNK_RADIUS_UPDATE);
-    assert_eq!(&packets[8][1..5], &DEFAULT_VIEW_DISTANCE.to_be_bytes());
 
     // 默认生存：StartGame 的 gamemode 字段为 0 且不给飞行权限
     assert_eq!(i32::from_be_bytes(packets[1][10..14].try_into().unwrap()), 0);
@@ -461,7 +481,7 @@ async fn login_returns_initial_sequence() {
 async fn creative_mode_allows_flight() {
     let mut state = NetworkState::new(GAMEMODE_CREATIVE);
     let commands = state.handle_game_packet(addr(), &login_packet());
-    let packets = bodies(&commands[0]);
+    let packets = game_bodies(&commands);
 
     assert_eq!(i32::from_be_bytes(packets[1][10..14].try_into().unwrap()), 1);
     assert_eq!(&packets[6][1..5], &1i32.to_be_bytes());
@@ -472,13 +492,15 @@ async fn creative_mode_allows_flight() {
 #[tokio::test]
 async fn repeated_login_is_ignored() {
     let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
-    assert_eq!(state.handle_game_packet(addr(), &login_packet()).len(), 1);
+    // SessionReady + 登录回包
+    assert_eq!(state.handle_game_packet(addr(), &login_packet()).len(), 2);
     assert!(state.handle_game_packet(addr(), &login_packet()).is_empty());
 }
 
 // 区块由 region 线程按自己的周期推进 连续这么多轮空 tick 才认为真的没活了
-const IDLE_POLLS: usize = 8;
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// 光照异步化后首批区块要等 worker 回执（1-2 个 region tick） 空闲窗口放宽到 600ms
+const IDLE_POLLS: usize = 30;
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 // 反复 tick 直到 region 线程连续几轮没有产出 期间的下行全部收下
 async fn pump(state: &mut NetworkState) -> Vec<SendCmd> {
@@ -540,7 +562,7 @@ async fn everything_is_released_after_all_players_leave() {
     drain_by_peer(&mut state).await;
     assert!(state.level.region_count() > 0);
 
-    state.on_session_closed(&addr());
+    state.on_session_closed(0, &addr(), "Disconnected");
     // region 线程异步 按真实时间推进 轮询等到彻底清空 而不是数固定 tick
     // 避免 CPU 争抢时固定窗口不够导致偶发失败
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -589,7 +611,7 @@ async fn owner_region_referenced_by_remote_player_is_kept() {
     drain_by_peer(&mut state).await;
 
     // 出生点 (0,0) 的视野跨到负坐标 这些分片本地没有玩家
-    let neighbour = crate::level::region::RegionId { x: -1, z: 0 };
+    let neighbour = RegionId { x: -1, z: 0 };
     assert!(state.level.has_region(neighbour));
     advance_ticks(&mut state, 5).await;
     assert!(
@@ -640,6 +662,7 @@ async fn idle_region_saves_dirty_chunks_before_stopping() {
             0,
             DEFAULT_VIEW_DISTANCE,
             1,
+            "world".to_string(),
         );
         state.set_idle_ticks_for_test(1);
         assert_eq!(
@@ -662,6 +685,7 @@ async fn idle_region_saves_dirty_chunks_before_stopping() {
             0,
             DEFAULT_VIEW_DISTANCE,
             1,
+            "world".to_string(),
         );
         assert_eq!(state.block_at(600, 5, 0), 1, "撤销前没保存脏块");
     }
@@ -691,28 +715,34 @@ async fn region_with_players_is_not_stopped() {
 async fn view_distance_controls_radius_and_queue() {
     let mut state = NetworkState::with_world(
         GAMEMODE_SURVIVAL,
-        crate::level::Level::new(),
+        Level::new(),
         0,
         3,
+        "world".to_string(),
     );
     let alice = peer(50021);
     let commands = state.handle_game_packet(alice, &login_packet());
 
-    // 登录回包里带的半径就是配置值
-    let mut radius_seen = false;
-    for cmd in &commands {
-        for packet in bodies(cmd) {
-            if packet[0] == CHUNK_RADIUS_UPDATE {
-                assert_eq!(&packet[1..5], &3i32.to_be_bytes());
-                radius_seen = true;
-            }
-        }
-    }
-    assert!(radius_seen, "登录应下发半径");
+    // 登录批次里不再带半径更新 由客户端请求后按配置回
+    assert!(
+        !commands
+            .iter()
+            .flat_map(bodies)
+            .any(|packet| packet[0] == CHUNK_RADIUS_UPDATE),
+        "登录批次不该带半径更新"
+    );
 
     let (chunks, _) = drain(&mut state).await;
     // 半径 3 时下发圈还是完整 7x7 49 块 buffer 要更大视距才切角
     assert_eq!(chunks.len(), 49);
+
+    let commands = state.handle_game_packet(alice, &request_radius(3));
+    let packets = bodies(&commands[0]);
+    let reply = packets
+        .iter()
+        .find(|packet| packet[0] == CHUNK_RADIUS_UPDATE)
+        .expect("请求后应回半径");
+    assert_eq!(&reply[1..5], &3i32.to_be_bytes());
 }
 
 // 客户端要求更大的视距时按服务端配置截断
@@ -720,9 +750,10 @@ async fn view_distance_controls_radius_and_queue() {
 async fn client_radius_is_capped_by_config() {
     let mut state = NetworkState::with_world(
         GAMEMODE_SURVIVAL,
-        crate::level::Level::new(),
+        Level::new(),
         0,
         2,
+        "world".to_string(),
     );
     let alice = peer(50022);
     state.handle_game_packet(alice, &login_packet());
@@ -746,15 +777,15 @@ async fn login_queues_chunks_and_spawn_over_ticks() {
     let (chunks, tail) = drain(&mut state).await;
     // 半径 2 时 buffer 内缩后角上仍含 下发圈是完整 5x5
     assert_eq!(chunks.len(), 25);
-    // 出生前先同步背包 之后紧跟自己的玩家列表项
+    // 列表项必须最先到 之后才是背包 重生与出生状态 照搬 Nukkit doFirstSpawn
     assert_eq!(
         tail,
         vec![
+            PLAYER_LIST,
             CONTAINER_SET_CONTENT,
             CONTAINER_SET_CONTENT,
             RESPAWN,
-            PLAY_STATUS,
-            PLAYER_LIST
+            PLAY_STATUS
         ]
     );
 
@@ -785,7 +816,7 @@ async fn chunks_across_region_border_have_terrain() {
         .iter()
         .find(|packet| chunk_coord(packet) == (-2, -2))
         .expect("缺少边界区块");
-    // 头部 14 字节之后是方块数组 索引 4 即区块内 (0, 4, 0)
+    // 包 14 字节头之后是方块数组 索引 4 即区块内 (0, 4, 0)
     assert_eq!(border[14 + 4], crate::level::generator::flat::GRASS);
 }
 
@@ -814,11 +845,11 @@ async fn moving_streams_new_chunks_only() {
     assert_eq!(
         tail,
         vec![
+            PLAYER_LIST,
             CONTAINER_SET_CONTENT,
             CONTAINER_SET_CONTENT,
             RESPAWN,
-            PLAY_STATUS,
-            PLAYER_LIST
+            PLAY_STATUS
         ]
     );
 
@@ -839,7 +870,9 @@ async fn moving_streams_new_chunks_only() {
 async fn drain_by_peer(state: &mut NetworkState) -> HashMap<SocketAddr, Vec<u8>> {
     let mut out: HashMap<SocketAddr, Vec<u8>> = HashMap::new();
     for cmd in &pump(state).await {
-        let SendCmd::GamePackets { addr, bodies } = cmd;
+        let SendCmd::GamePackets { addr, bodies } = cmd else {
+            continue;
+        };
         let entry = out.entry(*addr).or_default();
         for body in bodies {
             entry.push(body[0]);
@@ -867,9 +900,12 @@ async fn players_see_each_other() {
 
     state.handle_game_packet(alice, &login_packet_for("alice", [0x11; 16]));
     let first = drain_by_peer(&mut state).await;
-    // 场上只有自己 只应有自己的列表项 没有实体
-    assert_eq!(first[&alice].last(), Some(&PLAYER_LIST));
-    assert!(!first[&alice].contains(&ADD_PLAYER));
+    // 场上只有自己 只应有自己的列表项 没有实体 且列表项必须排在出生包之前
+    let packets = &first[&alice];
+    let list_pos = packets.iter().rposition(|p| *p == PLAYER_LIST).unwrap();
+    let spawn_pos = packets.iter().rposition(|p| *p == PLAY_STATUS).unwrap();
+    assert!(list_pos < spawn_pos, "玩家列表要早于 PLAYER_SPAWN");
+    assert!(!packets.contains(&ADD_PLAYER));
 
     state.handle_game_packet(bob, &login_packet_for("bob", [0x22; 16]));
     let second = drain_by_peer(&mut state).await;
@@ -896,7 +932,7 @@ async fn join_and_leave_are_announced() {
     assert_eq!(text.kind, TYPE_RAW);
     assert_eq!(text.message, "bob joined the game");
 
-    let left = state.on_session_closed(&bob);
+    let left = state.on_session_closed(0, &bob, "Disconnected");
     let bodies = bodies_of(&left, alice);
     let notice = bodies
         .iter()
@@ -918,7 +954,9 @@ async fn entity_ids_start_from_one() {
 
     let mut seen = Vec::new();
     for cmd in &pump(&mut state).await {
-        let SendCmd::GamePackets { addr, bodies } = cmd;
+        let SendCmd::GamePackets { addr, bodies } = cmd else {
+            continue;
+        };
         if *addr != bob {
             continue;
         }
@@ -971,7 +1009,7 @@ async fn disconnect_notifies_others() {
     state.handle_game_packet(bob, &login_packet_for("bob", [0x22; 16]));
     drain_by_peer(&mut state).await;
 
-    let commands = state.on_session_closed(&bob);
+    let commands = state.on_session_closed(0, &bob, "Disconnected");
     assert_eq!(commands.len(), 1);
     let packets = bodies(&commands[0]);
     assert_eq!(packets[0][0], REMOVE_PLAYER);
@@ -1024,6 +1062,15 @@ fn swing_packet(eid: i64) -> Vec<u8> {
     w.freeze().to_vec()
 }
 
+// 控制台命令不带斜杠也能执行 结果与发送者解耦
+#[tokio::test]
+async fn console_style_command_without_slash() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let output = state.run_command("time set night");
+    assert_eq!(output.messages, vec!["Set the time to 14000".to_string()]);
+    assert_eq!(state.world_time.time(), 14000);
+}
+
 // 斜杠命令在 global 层消费 不会走进聊天广播
 #[tokio::test]
 async fn slash_command_is_not_broadcast_as_chat() {
@@ -1036,6 +1083,127 @@ async fn slash_command_is_not_broadcast_as_chat() {
     let text = TextPacket::decode(&bodies[0][..]).unwrap();
     assert_eq!(text.kind, TYPE_RAW);
     assert!(text.message.starts_with("Time is "), "{}", text.message);
+}
+
+// /say 控制台发起时以 Server 身份广播给全体在线玩家
+#[tokio::test]
+async fn console_say_broadcasts_to_every_player() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let output = state.run_command("say hello world");
+    assert_eq!(output.messages, vec!["[Server] hello world".to_string()]);
+    for player in [alice, bob] {
+        let texts: Vec<_> = bodies_of(&output.sync, player)
+            .into_iter()
+            .filter(|body| body[0] == TEXT)
+            .collect();
+        assert_eq!(texts.len(), 1, "每个在线玩家各收一条广播");
+        assert_eq!(
+            TextPacket::decode(&texts[0][..]).unwrap().message,
+            "[Server] hello world"
+        );
+    }
+}
+
+// 玩家 /say 用服务端记录的用户名 客户端自带的 source 不可信
+#[tokio::test]
+async fn player_say_uses_username_without_duplicate_reply() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let commands = state.handle_game_packet(alice, &chat_packet("/say hi there"));
+    for player in [alice, bob] {
+        let texts: Vec<_> = bodies_of(&commands, player)
+            .into_iter()
+            .filter(|body| body[0] == TEXT)
+            .collect();
+        assert_eq!(texts.len(), 1, "广播只发一条 不能再补一条 messages 回复");
+        assert_eq!(
+            TextPacket::decode(&texts[0][..]).unwrap().message,
+            "[alice] hi there"
+        );
+    }
+
+    let commands = state.handle_game_packet(alice, &chat_packet("/say"));
+    let texts: Vec<_> = bodies_of(&commands, alice)
+        .into_iter()
+        .filter(|body| body[0] == TEXT)
+        .collect();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        TextPacket::decode(&texts[0][..]).unwrap().message,
+        command::say::SAY_USAGE
+    );
+}
+
+// 玩家 /tell 只把私聊定向发给目标 发起者收到回执 全服其他人看不到
+#[tokio::test]
+async fn tell_sends_private_message_to_target_only() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let commands = state.handle_game_packet(alice, &chat_packet("/tell bob hi"));
+    // bob 收到私聊 内容不是公聊格式
+    let bob_texts: Vec<_> = bodies_of(&commands, bob)
+        .into_iter()
+        .filter(|body| body[0] == TEXT)
+        .collect();
+    assert_eq!(bob_texts.len(), 1);
+    assert_eq!(
+        TextPacket::decode(&bob_texts[0][..]).unwrap().message,
+        "alice whispers to you: hi"
+    );
+    // alice 收到回执
+    let alice_texts: Vec<_> = bodies_of(&commands, alice)
+        .into_iter()
+        .filter(|body| body[0] == TEXT)
+        .collect();
+    assert_eq!(alice_texts.len(), 1);
+    assert_eq!(
+        TextPacket::decode(&alice_texts[0][..]).unwrap().message,
+        "You whisper to bob: hi"
+    );
+}
+
+// 目标不在线 /tell 只回一句提示给发起者 不广播
+#[tokio::test]
+async fn tell_to_offline_player_replies_not_online() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let commands = state.handle_game_packet(alice, &chat_packet("/tell ghost hi"));
+    let alice_texts: Vec<_> = bodies_of(&commands, alice)
+        .into_iter()
+        .filter(|body| body[0] == TEXT)
+        .collect();
+    assert_eq!(alice_texts.len(), 1);
+    assert!(
+        TextPacket::decode(&alice_texts[0][..])
+            .unwrap()
+            .message
+            .contains("not online")
+    );
+    // 其他在线玩家(以及不存在的 ghost)都不应收到任何包
+    assert!(bodies_of(&commands, bob).is_empty());
+}
+
+// 玩家聊天经 on_text 广播给其他玩家 同时在服务端控制台镜像一份 "<name> msg"
+#[tokio::test]
+async fn player_chat_is_broadcast_and_logged_to_server() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let commands = state.handle_game_packet(alice, &chat_packet("hello world"));
+    // bob 收到聊天的 TEXT 包
+    let bob_texts: Vec<_> = bodies_of(&commands, bob)
+        .into_iter()
+        .filter(|body| body[0] == TEXT)
+        .collect();
+    assert_eq!(bob_texts.len(), 1);
+    assert_eq!(
+        TextPacket::decode(&bob_texts[0][..]).unwrap().message,
+        "hello world"
+    );
+    // 服务端控制台镜像 "<alice> hello world"
+    let logs: Vec<String> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            SendCmd::Console(line) => Some(line.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(logs, vec!["<alice> hello world".to_string()]);
 }
 
 // /time set 改世界时间并立刻向全体同步 SetTime
@@ -1161,6 +1329,7 @@ async fn spawn_point_lands_on_land() {
         1337,
         DEFAULT_VIEW_DISTANCE,
         1,
+        "world".to_string(),
     );
 
     let (block, position) = state.spawn_point();
@@ -1186,4 +1355,261 @@ async fn probe_spawn_point_timing() {
     let t = std::time::Instant::now();
     let (block, _) = state.spawn_point();
     println!("spawn_point: {:?} -> {block:?}", t.elapsed());
+}
+
+// 创造模式进入游戏时 服务端下发的创造背包(window 0x79) 让客户端渲染创造物品栏
+#[test]
+fn creative_spawn_sends_creative_inventory() {
+    use crate::network::protocol::container_set_content::SPECIAL_CREATIVE;
+    let pkts = spawn_sequence((0.0, 4.0, 0.0), GAMEMODE_CREATIVE);
+    assert!(
+        pkts.iter()
+            .any(|b| b[0] == CONTAINER_SET_CONTENT && b[1] == SPECIAL_CREATIVE)
+    );
+}
+
+// 生存模式不发创造背包 只发普通背包与盔甲
+#[test]
+fn survival_spawn_omits_creative_inventory() {
+    use crate::network::protocol::container_set_content::SPECIAL_CREATIVE;
+    let pkts = spawn_sequence((0.0, 4.0, 0.0), 0);
+    assert!(
+        !pkts.iter()
+            .any(|b| b[0] == CONTAINER_SET_CONTENT && b[1] == SPECIAL_CREATIVE)
+    );
+}
+
+// 玩家下线按用户名存档 重新登录应恢复位置而不是回到出生点
+#[tokio::test]
+async fn player_data_persists_across_sessions() {
+    use crate::entity::PlayerData;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mojor-player-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // 第一段：登录 -> 走到指定位置 -> 断线存档
+    {
+        let mut state = NetworkState::with_loader(
+            GAMEMODE_SURVIVAL,
+            ChunkLoader::open(&dir).unwrap(),
+            Generator::flat(),
+            0,
+            DEFAULT_VIEW_DISTANCE,
+            1,
+            "world".to_string(),
+        );
+        let alice = peer(50004);
+        state.handle_game_packet(alice, &login_packet_for("alice", [0x44; 16]));
+        drain_by_peer(&mut state).await;
+        // 进入即存 登录后立刻应出现 players/alice.dat
+        assert!(
+            PlayerData::load(&dir, login_uuid(0x44), "alice").is_some(),
+            "登录即应写出玩家存档"
+        );
+        // move_player 传的是眼睛坐标 存档里记脚下坐标
+        state.handle_game_packet(alice, &move_player(12.5, 30.0 + 1.62, -4.5));
+        drain_by_peer(&mut state).await;
+        state.on_session_closed(0, &alice, "disconnect");
+    }
+
+    let data = PlayerData::load(&dir, login_uuid(0x44), "alice").expect("下线应写出玩家存档");
+    assert!((data.position.0 - 12.5).abs() < 0.01);
+    assert!((data.position.1 - 30.0).abs() < 0.01);
+    assert!((data.position.2 + 4.5).abs() < 0.01);
+
+    // 第二段：重新登录 位置应从存档恢复 再断线存档仍保持一致
+    {
+        let mut state = NetworkState::with_loader(
+            GAMEMODE_SURVIVAL,
+            ChunkLoader::open(&dir).unwrap(),
+            Generator::flat(),
+            0,
+            DEFAULT_VIEW_DISTANCE,
+            1,
+            "world".to_string(),
+        );
+        let alice = peer(50005);
+        state.handle_game_packet(alice, &login_packet_for("alice", [0x44; 16]));
+        drain_by_peer(&mut state).await;
+        state.on_session_closed(0, &alice, "disconnect");
+    }
+    let back = PlayerData::load(&dir, login_uuid(0x44), "alice").unwrap();
+    assert!((back.position.0 - 12.5).abs() < 0.01);
+    assert!((back.position.1 - 30.0).abs() < 0.01);
+    assert!((back.position.2 + 4.5).abs() < 0.01);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 停机兜底 没有 SessionClosed(Ctrl+C 关服) 也要把在线玩家写盘
+#[tokio::test]
+async fn shutdown_saves_online_players() {
+    use crate::entity::PlayerData;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mojor-shutdown-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let mut state = NetworkState::with_loader(
+        GAMEMODE_SURVIVAL,
+        ChunkLoader::open(&dir).unwrap(),
+        Generator::flat(),
+        0,
+        DEFAULT_VIEW_DISTANCE,
+        1,
+        "world".to_string(),
+    );
+    let alice = peer(50006);
+    state.handle_game_packet(alice, &login_packet_for("alice", [0x55; 16]));
+    drain_by_peer(&mut state).await;
+
+    // 模拟直接 Ctrl+C 关服 不经过 on_session_closed
+    state.save_all_players();
+
+    let data = PlayerData::load(&dir, login_uuid(0x55), "alice").expect("停机兜底应写出在线玩家存档");
+    assert!(data.position.1 > 0.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 同端点立刻重连 新会话顶替旧会话后 旧会话迟到的关闭不能踢掉新玩家
+#[tokio::test]
+async fn stale_session_close_does_not_kick_reconnected_player() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let alice = addr();
+
+    state.on_session_opened(1, &alice);
+    state.handle_game_packet(alice, &login_packet());
+    assert!(state.players.contains_key(&alice));
+
+    // 客户端重连 同一端点换新会话
+    state.on_session_opened(2, &alice);
+    // 旧会话退役的关闭事件迟到 必须忽略
+    let out = state.on_session_closed(1, &alice, "replaced");
+    assert!(out.is_empty());
+    assert!(
+        state.players.contains_key(&alice),
+        "旧会话收尾不能清掉新会话的玩家"
+    );
+
+    // 当前会话自己断开才清理
+    let _ = state.on_session_closed(2, &alice, "Disconnected");
+    assert!(!state.players.contains_key(&alice));
+}
+
+// 旧会话残留的游戏包按 id 丢弃 不能打进新会话
+#[test]
+fn stale_session_packets_are_filtered_by_id() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let alice = addr();
+    state.on_session_opened(7, &alice);
+    assert!(state.session_matches(7, &alice));
+    assert!(!state.session_matches(6, &alice));
+}
+
+// 换端点立刻重连 旧端点超时收尾不能覆盖新会话的存档
+#[tokio::test]
+async fn stale_session_does_not_overwrite_reconnected_save() {
+    use crate::entity::PlayerData;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mojor-reconnect-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let mut state = NetworkState::with_loader(
+        GAMEMODE_SURVIVAL,
+        ChunkLoader::open(&dir).unwrap(),
+        Generator::flat(),
+        0,
+        DEFAULT_VIEW_DISTANCE,
+        1,
+        "world".to_string(),
+    );
+
+    // 旧连接 id=1 走到远处
+    let old = peer(50007);
+    state.on_session_opened(1, &old);
+    state.handle_game_packet(old, &login_packet_for("alice", [0x77; 16]));
+    drain_by_peer(&mut state).await;
+    state.handle_game_packet(old, &move_player(40.5, 30.0 + 1.62, 40.5));
+    drain_by_peer(&mut state).await;
+
+    // 客户端换端点重连 id=2 登录时进入即存
+    let new = peer(50008);
+    state.on_session_opened(2, &new);
+    state.handle_game_packet(new, &login_packet_for("alice", [0x77; 16]));
+    drain_by_peer(&mut state).await;
+
+    // 旧端点 10 秒后超时收尾 同名 alice 已在线 不能再写盘
+    state.on_session_closed(1, &old, "timeout");
+
+    let data = PlayerData::load(&dir, login_uuid(0x77), "alice").expect("新会话存档应保留");
+    assert!(
+        (data.position.0 - 40.5).abs() > 0.01,
+        "旧会话的迟到存档不能覆盖新会话"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 同名的另一台设备带来的是另一个 uuid 只能拿到自己那份存档
+#[tokio::test]
+async fn same_name_different_uuid_gets_own_save() {
+    use crate::entity::PlayerData;
+
+    let dir = std::env::temp_dir().join(format!(
+        "mojor-uuid-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let mut state = NetworkState::with_loader(
+        GAMEMODE_SURVIVAL,
+        ChunkLoader::open(&dir).unwrap(),
+        Generator::flat(),
+        0,
+        DEFAULT_VIEW_DISTANCE,
+        1,
+        "world".to_string(),
+    );
+
+    // 设备 A 用 alice 这个名字走到远处并下线
+    let device_a = peer(50009);
+    state.handle_game_packet(device_a, &login_packet_for("alice", [0xa1; 16]));
+    drain_by_peer(&mut state).await;
+    state.handle_game_packet(device_a, &move_player(40.5, 30.0 + 1.62, 40.5));
+    drain_by_peer(&mut state).await;
+    state.on_session_closed(0, &device_a, "disconnect");
+
+    // 设备 B 也叫 alice 但 uuid 不同 读不到 A 的存档
+    let device_b = peer(50010);
+    state.handle_game_packet(device_b, &login_packet_for("alice", [0xb2; 16]));
+    drain_by_peer(&mut state).await;
+
+    let mine = PlayerData::load(&dir, login_uuid(0xb2), "alice").expect("登录即存");
+    assert!(
+        (mine.position.0 - 40.5).abs() > 0.01,
+        "同名换 uuid 不能读到别人的坐标"
+    );
+    let theirs = PlayerData::load(&dir, login_uuid(0xa1), "alice").expect("原存档还在");
+    assert!((theirs.position.0 - 40.5).abs() < 0.01);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

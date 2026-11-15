@@ -18,7 +18,7 @@ use crate::network::protocol::start_game::StartGamePacket;
 use crate::network::protocol::update_attributes::UpdateAttributesPacket;
 
 use super::GAMEMODE_CREATIVE;
-use super::world_time::WorldTime;
+use crate::level::WorldTime;
 
 pub(crate) fn protocol_accepted(login: &LoginPacket) -> bool {
     login.protocol1 == CURRENT_PROTOCOL || login.protocol2 == CURRENT_PROTOCOL
@@ -109,30 +109,33 @@ pub(crate) fn adventure_settings(gamemode: u8) -> AdventureSettingsPacket {
     }
 }
 
-pub(crate) fn spawn_sequence(position: (f32, f32, f32)) -> Vec<Bytes> {
-    vec![
+pub(crate) fn spawn_sequence(position: (f32, f32, f32), gamemode: u8) -> Vec<Bytes> {
+    let mut packets = vec![
         // 背包与盔甲槽 生存模式下客户端以此为准
         ContainerSetContentPacket::empty_inventory().encode(),
         ContainerSetContentPacket::empty_armor().encode(),
+    ];
+    // 创造模式额外下发创造背包(window 0x79) 客户端以此渲染创造物品栏
+    // 照搬 Nukkit Player.sendCreativeInventory
+    if gamemode & GAMEMODE_CREATIVE != 0 {
+        packets.push(
+            ContainerSetContentPacket::creative(crate::item::creative::creative_inventory())
+                .encode(),
+        );
+    }
+    packets.push(
         RespawnPacket {
             x: position.0,
             y: position.1,
             z: position.2,
         }
         .encode(),
+    );
+    packets.push(
         PlayStatusPacket {
             status: PLAYER_SPAWN,
         }
         .encode(),
-    ]
-}
-
-// 解析失败时打印包头 便于对照客户端实际协议布局
-pub(crate) fn hex_head(bytes: &[u8], limit: usize) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(limit * 3);
-    for b in bytes.iter().take(limit) {
-        let _ = write!(out, "{b:02x} ");
-    }
-    out.trim_end().to_string()
+    );
+    packets
 }

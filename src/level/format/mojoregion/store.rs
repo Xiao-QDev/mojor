@@ -34,6 +34,11 @@ impl RegionStore {
         })
     }
 
+    // 世界数据目录 region/ 与 players/ 等都在它下面
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn path_of(&self, region_x: i32, region_z: i32) -> PathBuf {
         self.dir
             .join("region")

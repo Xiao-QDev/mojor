@@ -1,16 +1,15 @@
 use std::net::SocketAddr;
 
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::entity::RegionPlayer;
+use crate::entity::{PlayerData, RegionPlayer, assign_uuid};
 use crate::level::actor::RegionEvent;
 use crate::level::region::RegionId;
-use crate::network::protocol::chunk_radius::ChunkRadiusUpdatePacket;
 use crate::network::protocol::item::ItemStack;
 use crate::network::protocol::login::LoginPacket;
 
 use super::broadcast::reply;
-use super::login::{hex_head, login_sequence, protocol_accepted};
+use super::login::{login_sequence, protocol_accepted};
 use super::{GAMEMODE_CREATIVE, NetworkState, SendCmd};
 
 impl NetworkState {
@@ -21,9 +20,7 @@ impl NetworkState {
 
         let login = match LoginPacket::decode(&packet[1..]) {
             Ok(login) => login,
-            Err(e) => {
-                let head = hex_head(&packet[1..], 72);
-                warn!(%addr, error = %e, len = packet.len(), head = %head, "登录包解析失败");
+            Err(_) => {
                 return;
             }
         };
@@ -33,7 +30,7 @@ impl NetworkState {
 
         let accepted = protocol_accepted(&login);
         let (spawn_block, spawn_position) = self.spawn_point();
-        let mut bodies = login_sequence(
+        let bodies = login_sequence(
             &login,
             self.gamemode,
             self.seed,
@@ -42,44 +39,68 @@ impl NetworkState {
             &self.world_time,
         );
         let view_distance = self.view_distance();
-        if accepted {
-            // 与 Nukkit 一致 区块由服务端主动推送 不等客户端请求
-            bodies.push(
-                ChunkRadiusUpdatePacket {
-                    radius: view_distance,
-                }
-                .encode(),
-            );
-        }
+
+        // 玩家身份由服务端分配 存档按 uuid 落到 playerdata/<uuid>.dat 与 Java 版一致
+        // 同名的另一台设备带来的是另一个 uuid 只能拿到自己那份 读不到别人的背包
+        let uuid = assign_uuid(login.client_uuid, &login.username);
+        // 有档就恢复位置朝向背包 没有就停在出生点
+        let saved = self
+            .level
+            .data_dir()
+            .and_then(|dir| PlayerData::load(dir, uuid, &login.username));
 
         let state = self.players.entry(addr).or_default();
         state.logged_in = true;
         state.eid = eid;
-        state.uuid = login.client_uuid;
+        state.uuid = uuid;
         state.username = login.username;
         state.skin = login.skin;
         state.position = spawn_position;
+        if let Some(data) = saved {
+            data.apply_to(state);
+        }
         // 区块队列由 region 线程自己推进 这里只把视图交过去
         state.spawn_pending = accepted;
+        let player_position = state.position;
+        let snapshot = state.clone();
+        // 登录日志带上分配到的 uuid 同一台设备重登应看到同一个值
+        // 存档目录 playerdata/<uuid>.dat 就是按这个值找的
+        info!(
+            "[{addr}] {} login uuid {uuid} batch pids {:02x?}",
+            state.username,
+            bodies
+                .iter()
+                .filter_map(|body| body.first().copied())
+                .collect::<Vec<_>>()
+        );
+        // 登录完成 放开这条连接的下行 旧会话在途的残包在此之前已被丢弃
+        out.push(SendCmd::SessionReady { addr });
         out.push(reply(addr, bodies));
 
-        let snapshot = state.clone();
         if accepted {
             self.player_index.insert(
                 addr,
                 RegionId::of_block(
-                    spawn_position.0.floor() as i32,
-                    spawn_position.2.floor() as i32,
+                    player_position.0.floor() as i32,
+                    player_position.2.floor() as i32,
                 ),
             );
             // 手电筒点亮 出生区块当距离场的源 照搬 DistanceManager.addPlayer
             let chunk = (
-                spawn_position.0.floor() as i32 >> 4,
-                spawn_position.2.floor() as i32 >> 4,
+                player_position.0.floor() as i32 >> 4,
+                player_position.2.floor() as i32 >> 4,
             );
             self.chunk_tracker.add_player(addr, chunk);
             self.level
                 .join(addr, RegionPlayer::new(snapshot, view_distance));
+            // 进入即存一次 登录时就写出 playerdata/<uuid>.dat
+            // 与下线存档 停机兜底(save_all_players) 三者独立互不依赖
+            if let Some(dir) = self.level.data_dir() {
+                let data = PlayerData::from_state(state);
+                if let Err(e) = data.save(dir, state.uuid) {
+                    warn!("保存玩家数据失败 {}: {e}", state.username);
+                }
+            }
         }
     }
 

@@ -162,8 +162,7 @@ fn on_move_player(
     }
     let mv = match MovePlayerPacket::decode(&packet[1..]) {
         Ok(mv) => mv,
-        Err(e) => {
-            warn!(%addr, error = %e, "移动包解析失败");
+        Err(_) => {
             return;
         }
     };
@@ -254,13 +253,11 @@ fn on_remove_block(
     }
     let dig = match RemoveBlockPacket::decode(&packet[1..]) {
         Ok(dig) => dig,
-        Err(e) => {
-            warn!(%addr, error = %e, "挖方块包解析失败");
+        Err(_) => {
             return;
         }
     };
     if !within_reach(player.state.position, dig.x, dig.y, dig.z) {
-        warn!(%addr, x = dig.x, y = dig.y, z = dig.z, "挖方块距离过远 已忽略");
         return;
     }
 
@@ -291,8 +288,7 @@ fn on_use_item(
 
     let use_item = match UseItemPacket::decode(&packet[1..]) {
         Ok(item) => item,
-        Err(e) => {
-            warn!(%addr, error = %e, "使用物品包解析失败");
+        Err(_) => {
             return;
         }
     };
@@ -358,7 +354,7 @@ fn on_text(
     directory: &Arc<PlayerDirectory>,
     addr: SocketAddr,
     packet: &[u8],
-    view_distance: i32,
+    _view_distance: i32,
     commands: &mut Vec<SendCmd>,
 ) {
     let Some(player) = players.get(&addr) else {
@@ -369,8 +365,7 @@ fn on_text(
     }
     let text = match TextPacket::decode(&packet[1..]) {
         Ok(text) => text,
-        Err(e) => {
-            warn!(%addr, error = %e, "聊天包解析失败");
+        Err(_) => {
             return;
         }
     };
@@ -383,8 +378,15 @@ fn on_text(
             continue;
         }
         let body = TextPacket::chat(&player.state.username, line).encode();
-        let center = player.state.position;
-        commands.extend(broadcast(directory, center, view_distance, &[body], None));
+        // 聊天发给全体已进入服务器的玩家 不限于视野 照搬 Nukkit 的全局广播
+        for (peer, _) in directory.spawned() {
+            commands.push(SendCmd::GamePackets {
+                addr: peer,
+                bodies: vec![body.clone()],
+            });
+        }
+        // 玩家聊天同步一份到服务端控制台 照搬 Mojang 的 "<name> message" 日志格式
+        commands.push(SendCmd::Console(format!("<{}> {}", player.state.username, line)));
     }
 }
 
@@ -399,8 +401,7 @@ fn on_player_action(
 ) {
     let action = match PlayerActionPacket::decode(&packet[1..]) {
         Ok(action) => action,
-        Err(e) => {
-            warn!(%addr, error = %e, "玩家动作包解析失败");
+        Err(_) => {
             return;
         }
     };
@@ -456,8 +457,7 @@ fn on_animate(
 ) {
     let animate = match AnimatePacket::decode(&packet[1..]) {
         Ok(animate) => animate,
-        Err(e) => {
-            warn!(%addr, error = %e, "动画包解析失败");
+        Err(_) => {
             return;
         }
     };
@@ -490,7 +490,7 @@ fn on_request_radius(
                 vec![ChunkRadiusUpdatePacket { radius }.encode()],
             ));
         }
-        Err(e) => warn!(%addr, error = %e, "区块半径请求解析失败"),
+        Err(_) => {},
     }
 }
 

@@ -17,6 +17,11 @@ impl ChunkLoader {
         Ok(Self { store })
     }
 
+    // 世界数据目录 玩家存档等与 region/ 同级
+    pub fn dir(&self) -> &Path {
+        self.store.dir()
+    }
+
     pub fn load(&self, x: i32, z: i32) -> Result<Option<Vec<u8>>> {
         self.store.load(x, z)
     }

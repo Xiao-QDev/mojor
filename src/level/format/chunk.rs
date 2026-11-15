@@ -9,6 +9,7 @@ pub const NIBBLE_COUNT: usize = BLOCK_COUNT / 2;
 pub const HEIGHTMAP_COUNT: usize = CHUNK_WIDTH * CHUNK_WIDTH;
 
 // 0.14 的区块是 16x16x128 一整块 索引为 (x << 11) | (z << 7) | y
+#[derive(Clone)]
 pub struct Chunk {
     pub x: i32,
     pub z: i32,
@@ -21,6 +22,9 @@ pub struct Chunk {
     // 生成与装饰状态 对齐 FullChunk 的 isGenerated/isPopulated 不参与序列化
     pub generated: bool,
     pub populated: bool,
+    // 光照已算完 算完才允许下发与落盘（异步光照的下发门槛）
+    // 从存档解码出来的区块默认 true 信任存档里的光照
+    pub lit: bool,
 }
 
 impl Chunk {
@@ -37,6 +41,7 @@ impl Chunk {
             biome_colors: vec![0x4c9b6c; HEIGHTMAP_COUNT].into_boxed_slice(),
             generated: false,
             populated: false,
+            lit: false,
         }
     }
 
@@ -163,6 +168,29 @@ impl Chunk {
         }
     }
 
+    // 高度图重算一列 最高非空气方块没变就是 0
+    // 改方块时同步更新 碰撞与出生点查询不能等异步光照
+    pub fn refresh_height(&mut self, x: usize, z: usize) {
+        let mut top = 0u8;
+        for y in (0..CHUNK_HEIGHT).rev() {
+            if self.blocks[(x << 11) | (z << 7) | y] != 0 {
+                top = y as u8;
+                break;
+            }
+        }
+        self.height_map[(z << 4) | x] = top;
+    }
+
+    // 全量刷一遍高度图 生成器写方块不走 set_block 的同步路径
+    // 装饰完成后调用 出生点与碰撞查询直接读它 不能等异步光照
+    pub fn refresh_heights(&mut self) {
+        for x in 0..CHUNK_WIDTH {
+            for z in 0..CHUNK_WIDTH {
+                self.refresh_height(x, z);
+            }
+        }
+    }
+
     // 存档编码按 (z << 4) | x 顺序整块搬 与内部布局一致
     pub fn height_map(&self) -> &[u8] {
         &self.height_map
@@ -201,7 +229,7 @@ impl Chunk {
         self.set_biome_color(x, z, color);
     }
 
-    // 从存档字节还原区块 长度不对说明数据损坏
+    // 从 serialize 的网络布局还原区块 长度不对说明数据损坏
     pub fn deserialize(x: i32, z: i32, data: &[u8]) -> Option<Self> {
         let expected =
             BLOCK_COUNT + NIBBLE_COUNT * 3 + HEIGHTMAP_COUNT + HEIGHTMAP_COUNT * 4 + 4;
@@ -242,9 +270,10 @@ impl Chunk {
             block_light,
             height_map,
             biome_colors: biome_colors.into_boxed_slice(),
-            // 存档里的区块已经生成并装饰过
+            // 网络负载里没有状态位 能下发的区块都已经生成并装饰过
             generated: true,
             populated: true,
+            lit: false,
         })
     }
 
@@ -254,7 +283,10 @@ impl Chunk {
         self.serialize()
     }
 
-    // 与 Nukkit 0.14 LevelDB 的发送顺序一致
+    // 与 Nukkit 0.14 LevelDB.requestChunkTask 拼给客户端的负载逐字节一致
+    // blocks | meta | skyLight | blockLight | heightMap(256) | biomeColors(1024) | extraData 数量(i32=0) | tiles(空)
+    // 注意这里没有 x/z 头 也没有状态位 坐标在 FullChunkDataPacket 里单独发
+    // 多写任何一个字节都会让后面的群系色整体串位 草会变成紫色
     pub fn serialize(&self) -> Bytes {
         let capacity =
             BLOCK_COUNT + NIBBLE_COUNT * 3 + HEIGHTMAP_COUNT + HEIGHTMAP_COUNT * 4 + 4;
@@ -267,7 +299,7 @@ impl Chunk {
         for color in self.biome_colors.iter() {
             w.put_i32(*color);
         }
-        // 方块额外数据数量 0
+        // 方块额外数据数量 0 后面紧跟 tiles 空数据
         w.put_lint(0);
         Bytes::from(w.freeze())
     }
@@ -291,8 +323,10 @@ mod tests {
         let mut chunk = Chunk::empty(0, 0);
         chunk.set_block(0, 0, 0, 7);
         chunk.set_height(0, 0, 4);
+        chunk.set_biome(0, 0, 1, 0x92bc59);
         let data = chunk.serialize();
 
+        // 与 Nukkit requestChunkTask 相同 没有坐标头 末尾是 i32 额外数据数量 0
         assert_eq!(
             data.len(),
             BLOCK_COUNT + NIBBLE_COUNT * 3 + HEIGHTMAP_COUNT + HEIGHTMAP_COUNT * 4 + 4
@@ -300,7 +334,23 @@ mod tests {
         assert_eq!(data[0], 7);
         assert_eq!(data[BLOCK_COUNT], 0);
         assert_eq!(data[BLOCK_COUNT + NIBBLE_COUNT * 3], 4);
+        // 群系色紧跟高度图 高 8 位是群系 id 低 24 位是颜色
+        let offset = BLOCK_COUNT + NIBBLE_COUNT * 3 + HEIGHTMAP_COUNT;
+        assert_eq!(&data[offset..offset + 4], &0x0192bc59i32.to_be_bytes());
         assert_eq!(&data[data.len() - 4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn deserialize_roundtrips_serialized_chunk() {
+        let mut chunk = Chunk::empty(3, -4);
+        chunk.set_block(1, 2, 3, 5);
+        chunk.set_height(1, 3, 9);
+        chunk.set_biome(1, 3, 2, 0xbfb755);
+
+        let restored = Chunk::deserialize(3, -4, &chunk.serialize()).unwrap();
+        assert_eq!(restored.block(1, 2, 3), 5);
+        assert_eq!(restored.height(1, 3), 9);
+        assert_eq!(restored.biome_id(1, 3), 2);
     }
 
     #[test]
