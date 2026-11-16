@@ -634,7 +634,7 @@ impl NetworkState {
         let mut out = vec![reply(addr, bodies)];
         self.level.send_drops(addr);
 
-        let joined = TextPacket::raw(&format!("§e{} joined the game", me.username)).encode();
+        // 同一份广播发给其他玩家 不再重复构造
         for (peer, _, _, visible) in &others {
             let mut bodies = vec![PlayerListPacket::add(vec![my_entry.clone()]).encode()];
             if *visible {

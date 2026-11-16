@@ -1,5 +1,6 @@
 pub mod protocol;
 pub mod server;
+pub mod udp_compat;
 
 pub const PROTOCOL: u8 = 6;
 

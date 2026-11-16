@@ -20,6 +20,9 @@ use crate::raknet::server::session::{Session, SessionEvent};
 
 pub const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub const SESSION_TICK_MS: u64 = 50;
+/// 同时存在的会话上限。UDP 无连接，任何源地址都能凭空建一个会话，
+/// 不设上限的话伪造源地址的洪泛包可以瞬间把内存和线程打爆。
+pub const MAX_SESSIONS: usize = 1024;
 
 // 事件都带会话 id 上层据此区分同端点上的新旧连接
 #[derive(Debug)]
@@ -96,12 +99,18 @@ impl RakNetServer {
         loop {
             tokio::select! {
                 received = socket.recv_from(&mut buf) => {
-                    // 对端端口关掉时内核会用 ICMP port unreachable 回敬一次
-                    // Windows 表现在 WSAECONNRESET(10054) Linux 是 ECONNREFUSED
-                    // 这类错误必须忽略 否则一条断线就能把整个监听循环带走
+                    // Windows 上 ICMP port unreachable 会让 recv_from 返回
+                    // WSAECONNRESET(10054)，Linux/macOS 上对应 ECONNREFUSED。
+                    // 这类错误只影响本次收包，socket 依然可用，绝不能退出循环
+                    // ——否则客户端在服务器列表里刷新一次就能把服务端打挂。
                     let (len, peer) = match received {
                         Ok(value) => value,
-                        Err(error) if is_transient(&error) => continue,
+                        Err(error)
+                            if crate::raknet::udp_compat::is_transient_udp_error(&error) =>
+                        {
+                            tracing::trace!(error = %error, "UDP 收到 ICMP 不可达，忽略本次收包");
+                            continue;
+                        }
                         Err(error) => return Err(error.into()),
                     };
                     let packet = &buf[..len];
@@ -123,6 +132,17 @@ impl RakNetServer {
                     // 握手首包一律开新会话 同端点旧会话立刻退役
                     // 新任务马上接管 旧任务在后台收尾 它的 Closed 带旧 id 不会影响新玩家
                     if packet[0] == ID_OPEN_CONNECTION_REQUEST_1 {
+                        // 会话数上限：UDP 无连接，伪造源地址的洪泛包能凭空建会话，
+                        // 不设上限的话内存和线程都会被瞬间打爆。
+                        // 已有会话的端点重连不受影响（下面会先 remove 再 insert）。
+                        if !self.sessions.contains_key(&peer) && self.sessions.len() >= MAX_SESSIONS {
+                            tracing::trace!(
+                                %peer,
+                                limit = MAX_SESSIONS,
+                                "会话数已达上限，丢弃新连接"
+                            );
+                            continue;
+                        }
                         if let Some(old) = self.sessions.remove(&peer) {
                             let _ = old.tx.try_send(ConnCmd::Shutdown);
                         }
@@ -305,20 +325,6 @@ fn spawn_connection(
     });
 }
 
-// 内核把 ICMP port unreachable 映射成的错误 属于正常网络抖动
-// 客户端退出后它那一侧的端口关闭 我们下次 send/recv 就会收到一条
-fn is_transient(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-    )
-    // Windows 的 10054 已被映射成 ConnectionReset 这里只是兜底
-        || error.raw_os_error() == Some(10054)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,20 +333,6 @@ mod tests {
         ID_OPEN_CONNECTION_REPLY_1, ID_OPEN_CONNECTION_REQUEST_1, ID_UNCONNECTED_PONG,
     };
     use std::time::Duration;
-
-    // 断线时内核回的 ICMP 不可达不能带走监听循环
-    #[test]
-    fn transient_errors_are_ignored() {
-        use std::io::{Error, ErrorKind};
-        assert!(is_transient(&Error::from(ErrorKind::ConnectionReset)));
-        assert!(is_transient(&Error::from(ErrorKind::ConnectionRefused)));
-        assert!(is_transient(&Error::from(ErrorKind::Interrupted)));
-        // Windows 原始码兜底
-        assert!(is_transient(&Error::from_raw_os_error(10054)));
-        // 真错误不能被吞掉
-        assert!(!is_transient(&Error::from(ErrorKind::PermissionDenied)));
-        assert!(!is_transient(&Error::from(ErrorKind::BrokenPipe)));
-    }
 
     fn ping_packet(pid: u8, ping_id: u64) -> Vec<u8> {
         let mut p = vec![pid];

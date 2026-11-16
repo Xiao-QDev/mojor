@@ -23,6 +23,10 @@ use crate::raknet::protocol::packets::{
 pub const WINDOW_SIZE: u32 = 2048;
 pub const MAX_SPLIT_SIZE: u32 = 128;
 pub const MAX_SPLIT_COUNT: usize = 4;
+/// 未确认发送帧的最大积压量。客户端长期不回 ACK 时防止内存无界增长。
+pub const MAX_RECOVERY: usize = 4096;
+/// 单个 session 内正在进行的重组任务超时时间，超时后丢弃，避免半成品长期占用内存
+pub const SPLIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -81,6 +85,7 @@ struct SentFrame {
 struct SplitAssembler {
     count: u32,
     parts: Vec<Option<Bytes>>,
+    started_at: Instant,
 }
 
 impl SplitAssembler {
@@ -88,6 +93,7 @@ impl SplitAssembler {
         Self {
             count,
             parts: vec![None; count as usize],
+            started_at: Instant::now(),
         }
     }
 
@@ -242,6 +248,11 @@ impl Session {
         // 只保留仍在窗口内的接收记录
         self.received = self.received.split_off(&self.window_start);
 
+        // 清理超时未完成的分片重组，避免半成品长期占用内存
+        if let Some(deadline) = now.checked_sub(SPLIT_TIMEOUT) {
+            self.splits.retain(|_, a| a.started_at >= deadline);
+        }
+
         if let Some(deadline) = now.checked_sub(RETRY_TIMEOUT) {
             let stale: Vec<u32> = self
                 .recovery
@@ -352,7 +363,7 @@ impl Session {
         let frame = DataFrame::decode(buf)?;
 
         if frame.seq < self.window_start
-            || frame.seq > self.window_end
+            || frame.seq >= self.window_end
             || self.received.contains(&frame.seq)
         {
             return Ok(());
@@ -363,7 +374,7 @@ impl Session {
         self.received.insert(frame.seq);
 
         let diff = frame.seq as i64 - self.last_seq;
-        if diff != 1 {
+        if diff > 1 {
             let start = (self.last_seq + 1).max(0) as u32;
             for seq in (start..frame.seq).take(512) {
                 if !self.received.contains(&seq) {
@@ -373,9 +384,16 @@ impl Session {
         }
         if diff >= 1 {
             self.last_seq = frame.seq as i64;
-            self.window_start = self.window_start.saturating_add(diff as u32);
-            self.window_end = self.window_end.saturating_add(diff as u32);
         }
+
+        // 窗口起点只能推进到「连续已收到的最大序号 + 1」。
+        // 不能因为收到一个跳跃的 seq 就整体前移，否则中间那些被 NACK
+        // 请求重传的包回来时会被判定为「已过窗口」直接丢弃，
+        // 客户端会永远卡在等待重传的状态（丢包网络下必现）。
+        while self.received.contains(&self.window_start) {
+            self.window_start = self.window_start.saturating_add(1);
+        }
+        self.window_end = self.window_start.saturating_add(WINDOW_SIZE);
 
         for packet in frame.packets {
             self.on_encapsulated(packet, out, events)?;
@@ -450,11 +468,16 @@ impl Session {
             return Ok(());
         }
 
-        if !self.splits.contains_key(&split.id)
-            && self.splits.len() >= MAX_SPLIT_COUNT
-            && let Some(oldest) = self.splits.keys().next().copied()
-        {
-            self.splits.remove(&oldest);
+        if !self.splits.contains_key(&split.id) && self.splits.len() >= MAX_SPLIT_COUNT {
+            // 淘汰最久未完成的重组任务（真正按时间，不是 HashMap 的任意一个）
+            if let Some(oldest) = self
+                .splits
+                .iter()
+                .min_by_key(|(_, a)| a.started_at)
+                .map(|(id, _)| *id)
+            {
+                self.splits.remove(&oldest);
+            }
         }
 
         let entry = self
@@ -603,13 +626,23 @@ impl Session {
         let seq = self.next_send_seq();
         let frame = DataFrame::new(seq, packets);
         let data = frame.encode();
-        self.recovery.insert(
-            seq,
-            SentFrame {
-                frame,
-                sent_at: Instant::now(),
-            },
-        );
+
+        // 客户端长期不回 ACK 时 recovery 会无界增长，超过上限就丢掉最旧的。
+        // 那些包本来也已经重传过，丢掉只是让客户端多等一次超时。
+        while self.recovery.len() >= MAX_RECOVERY {
+            if let Some(oldest) = self.recovery.keys().next().copied() {
+                self.recovery.remove(&oldest);
+                tracing::warn!(
+                    seq = oldest,
+                    limit = MAX_RECOVERY,
+                    "未确认帧积压超过上限，丢弃最旧的一帧"
+                );
+            } else {
+                break;
+            }
+        }
+
+        self.recovery.insert(seq, SentFrame { frame, sent_at: Instant::now() });
         out.push(data);
     }
 

@@ -175,6 +175,9 @@ async fn main() -> Result<()> {
         Ok(addr) => UdpSocket::bind(addr).await?,
         Err(_) => UdpSocket::bind(config.bind.as_str()).await?,
     });
+    // Windows 上关掉 SIO_UDP_CONNRESET 否则客户端在列表刷新一次就可能把监听打挂
+    // 其它平台是空操作 编译后零开销
+    mojor::raknet::udp_compat::fix_udp_socket(&*socket)?;
     let server_id = std::env::var("MOJOR_SERVER_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

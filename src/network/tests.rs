@@ -1015,11 +1015,12 @@ async fn login_queues_chunks_and_spawn_over_ticks() {
     let (chunks, tail) = drain(&mut state).await;
     // 半径 2 时 buffer 内缩后角上仍含 下发圈是完整 5x5
     assert_eq!(chunks.len(), 25);
-    // 列表项必须最先到 之后才是背包 重生与出生状态 照搬 Nukkit doFirstSpawn
+    // 列表项必须最先到 紧跟进服广播(自己也收到) 之后才是背包 重生与出生状态
     assert_eq!(
         tail,
         vec![
             PLAYER_LIST,
+            TEXT,
             CONTAINER_SET_CONTENT,
             CONTAINER_SET_CONTENT,
             RESPAWN,
@@ -1084,6 +1085,7 @@ async fn moving_streams_new_chunks_only() {
         tail,
         vec![
             PLAYER_LIST,
+            TEXT,
             CONTAINER_SET_CONTENT,
             CONTAINER_SET_CONTENT,
             RESPAWN,
@@ -1171,7 +1173,7 @@ async fn join_and_leave_are_announced() {
         .expect("加入时要通知其他玩家");
     let text = TextPacket::decode(notice).unwrap();
     assert_eq!(text.kind, TYPE_RAW);
-    assert_eq!(text.message, "bob joined the game");
+    assert_eq!(text.message, "§ebob joined the game");
 
     let left = state.on_session_closed(0, &bob, "Disconnected");
     let bodies = bodies_of(&left, alice);
@@ -1179,7 +1181,10 @@ async fn join_and_leave_are_announced() {
         .iter()
         .find(|body| body[0] == TEXT)
         .expect("离开时要通知其他玩家");
-    assert_eq!(TextPacket::decode(notice).unwrap().message, "bob left the game");
+    assert_eq!(
+        TextPacket::decode(notice).unwrap().message,
+        "§ebob left the game"
+    );
 }
 
 // 实体 id 从 1 开始 0 留给客户端自己的实体

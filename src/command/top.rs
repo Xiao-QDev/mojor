@@ -238,13 +238,16 @@ mod tests {
     }
 
     #[test]
-    fn cores_over_cap_show_remainder() {
+    fn all_cores_are_listed() {
+        // 20 核全部列出来 每行 4 个 不截断
         let mut sample = sample(10.0, 1, 100);
         sample.core_count = 20;
         let lines = TopCommand::Top.execute(&sample, None);
         let core_lines: Vec<&String> = lines.iter().filter(|l| l.contains("§7core")).collect();
-        assert_eq!(core_lines.len(), MAX_CORES / 4);
-        assert!(core_lines.last().unwrap().contains("…+4"), "{core_lines:?}");
+        assert_eq!(core_lines.len(), 5, "{core_lines:?}");
+        assert!(core_lines[0].contains("core0") && core_lines[0].contains("core3"));
+        assert!(core_lines[4].contains("core19"), "{core_lines:?}");
+        assert!(!core_lines[4].contains("…+"));
     }
 
     #[test]
