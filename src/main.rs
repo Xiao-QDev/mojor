@@ -199,7 +199,10 @@ async fn main() -> Result<()> {
 
     let listener = RakNetServer::new(socket, &config, net_tx, server_id, cmd_rx);
     let udp = tokio::spawn(async move {
-        let _ = listener.run().await;
+        // 监听循环退出后端口就没人收了 必须留痕 否则表现为"突然连不进去"
+        if let Err(error) = listener.run().await {
+            tracing::error!("UDP listener stopped: {error}");
+        }
     });
 
     // 每 10 秒兜底 trim 一次 常规回收交给上面的 mallopt 阈值按需完成
