@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::format::chunk::{CHUNK_HEIGHT, Chunk};
 use crate::level::format::mojoregion::blob;
+use crate::level::generator::blocks::is_breakable;
 use crate::level::generator::Generator;
 use crate::level::generator::world::GenWorld;
 use crate::level::actor::RegionMsg;
@@ -61,8 +62,12 @@ pub struct ChunkManager {
     decoration_order: VecDeque<(i32, i32)>,
     // 等光照引擎全量计算的新区块 生成后 lit=false 算完回执才 lit=true
     pending_light_init: HashSet<(i32, i32)>,
+    // Init 已经提交给 worker、还没回执的区块。回执只对这些区块开 lit：
+    // 快照是 3x3 的，邻居区块在回执里只有边界几格是新算的，拿它当全量
+    // 会把整块未照亮的地皮下发给客户端
+    light_init_in_flight: HashSet<(i32, i32)>,
     // 玩家改动批量收集 攒到 tick 交给光照引擎做增量修正
-    // 只记已 lit 区块的改动 未 lit 区块的改动会被 Init 全量覆盖
+    // 已 lit 的记；Init 在途的也记，快照抓早了，回执回来后要再补一次 Update
     light_changes: HashMap<(i32, i32), Vec<BlockChange>>,
 }
 
@@ -377,8 +382,20 @@ impl ChunkManager {
 
     // 区块已经在内存缓存里（已生成或已加载）才返回 true
     // 异步加载改造后 下发路径靠它判断要不要先把区块交给 IO 池
+    // 已加载区块数 健康报告用
+    pub fn loaded_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
     pub fn is_cached(&self, chunk_x: i32, chunk_z: i32) -> bool {
         self.chunks.contains_key(&(chunk_x, chunk_z))
+    }
+
+    // 装饰阶段会顺手把邻居铺成"只有地形"的半成品 它们占着缓存但没有光照任务
+    // 下发路径撞上这种区块要补一次完整流程 否则它会一直 card 在等光照
+    pub fn prepare_for_light(&mut self, chunk_x: i32, chunk_z: i32) {
+        self.ensure_generated(chunk_x, chunk_z);
+        self.ensure_populated(chunk_x, chunk_z);
     }
 
     // IO 池把区块 load+decode 回来之后塞进缓存
@@ -426,8 +443,22 @@ impl ChunkManager {
             .block((x & 0xf) as usize, y as usize, (z & 0xf) as usize)
     }
 
+    // 读方块元数据 越界回 0
+    pub fn meta(&mut self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return 0;
+        }
+        self.get(x >> 4, z >> 4)
+            .meta((x & 0xf) as usize, y as usize, (z & 0xf) as usize)
+    }
+
     // 写方块 返回值表示是否真的发生了变化
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, id: u8) -> bool {
+        self.set_block_meta(x, y, z, id, 0)
+    }
+
+    // 写方块带元数据 玩家放置走这条 羊毛色 木头种类 楼梯朝向 都在 meta 里
+    pub fn set_block_meta(&mut self, x: i32, y: i32, z: i32, id: u8, meta: u8) -> bool {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return false;
         }
@@ -442,16 +473,21 @@ impl ChunkManager {
         let old = {
             let chunk = self.get(chunk_x, chunk_z);
             let old = chunk.block(lx, ly, lz);
-            if old == id {
+            if old == id && chunk.meta(lx, ly, lz) == meta {
                 return false;
             }
             chunk.set_block(lx, ly, lz, id);
+            chunk.set_meta(lx, ly, lz, meta);
             // 高度图同步刷新 碰撞与出生点查询不能等异步光照
             chunk.refresh_height(lx, lz);
             old
         };
-        // 已 lit 的区块记增量修正交给光照引擎 未 lit 的改动会被 Init 全量覆盖
-        if self.chunks.get(&(chunk_x, chunk_z)).is_some_and(|chunk| chunk.lit) {
+        // 已 lit 的区块记增量修正交给光照引擎
+        // Init 已经在途的也要记：快照在提交时抓好了 这次改动不在里面
+        // 等 Init 回执写回之后必须再补一轮 Update 否则光照是旧的
+        if self.chunks.get(&(chunk_x, chunk_z)).is_some_and(|chunk| chunk.lit)
+            || self.light_init_in_flight.contains(&(chunk_x, chunk_z))
+        {
             self.light_changes
                 .entry((chunk_x, chunk_z))
                 .or_default()
@@ -582,15 +618,21 @@ impl ChunkManager {
         let id = {
             let chunk = self.get(key.0, key.1);
             let id = chunk.block(lx, y as usize, lz);
-            if id == 0 {
+            // 空气没什么可挖 基岩挖不动
+            if id == 0 || !is_breakable(id) {
                 return None;
             }
             chunk.set_block(lx, y as usize, lz, 0);
+            // 元数据一起清 剩下的 meta 会串到以后放上去的方块
+            chunk.set_meta(lx, y as usize, lz, 0);
             chunk.refresh_height(lx, lz);
             id
         };
-        // 已 lit 的区块记增量修正交给光照引擎
-        if self.chunks.get(&key).is_some_and(|chunk| chunk.lit) {
+        // 已 lit 或 Init 在途的区块记增量修正交给光照引擎
+        // 在途的那份快照抓在改动之前 回执回来后要再补一次
+        if self.chunks.get(&key).is_some_and(|chunk| chunk.lit)
+            || self.light_init_in_flight.contains(&key)
+        {
             self.light_changes.entry(key).or_default().push(BlockChange {
                 x,
                 y,
@@ -698,7 +740,7 @@ impl ChunkManager {
 
     // 取走待处理的光照任务提交给异步引擎
     // 快照抓取必须在 region 线程做（ChunkManager 是 region 私有的） 整体 move 给 worker
-    pub fn take_light_jobs(&mut self, reply: &Sender<RegionMsg>) -> Vec<LightJob> {
+    pub(crate) fn take_light_jobs(&mut self, reply: &Sender<RegionMsg>) -> Vec<LightJob> {
         let mut jobs = Vec::new();
         let inits: Vec<(i32, i32)> = self.pending_light_init.drain().collect();
         for key in inits {
@@ -707,6 +749,7 @@ impl ChunkManager {
                 continue;
             }
             let snap = Snapshot::grab(self, key.0, key.1);
+            self.light_init_in_flight.insert(key);
             jobs.push(LightJob {
                 kind: LightKind::Init(snap),
                 reply: reply.clone(),
@@ -715,6 +758,12 @@ impl ChunkManager {
         let updates: Vec<((i32, i32), Vec<BlockChange>)> = self.light_changes.drain().collect();
         for (key, changes) in updates {
             if !self.chunks.contains_key(&key) {
+                continue;
+            }
+            // Init 还在途时快照里的光照还是旧的 现在排增量会拿错底
+            // 先放回去 等回执写回之后的下一轮再走
+            if self.light_init_in_flight.contains(&key) {
+                self.light_changes.insert(key, changes);
                 continue;
             }
             let snap = Snapshot::grab(self, key.0, key.1);
@@ -727,18 +776,34 @@ impl ChunkManager {
     }
 
     // 光照回执写回 只合入还在内存里的区块 已卸载的直接丢弃
-    // 拿到光照才算完整区块 打开下发门槛并标脏落盘
+    // 只有任务的目标区块能开 lit：回执会捎带邻居区块的边界修正，
+    // 那几格光不能当整块算完，否则未照亮的地皮会直接下发给客户端
     pub fn apply_light_receipt(&mut self, receipt: LightReceipt) {
+        let owner = receipt.owner;
+        // Init 回执在光照没有变化时不含目标区块（不变脏就不打包）
+        // 但任务本身已经完成 门槛照样要开 不然这个区块永远不下发
+        let init_done = self.light_init_in_flight.remove(&owner);
         for data in receipt.chunks {
             let key = (data.x, data.z);
             if let Some(chunk) = self.chunks.get_mut(&key) {
                 let (_, _, sky, light) = chunk.parts_mut();
                 sky.copy_from_slice(&data.sky_light);
                 light.copy_from_slice(&data.block_light);
-                chunk.lit = true;
+                if init_done && key == owner {
+                    chunk.lit = true;
+                }
                 self.dirty.insert(key);
             }
         }
+    }
+
+    // 还有光照没落地：待提交的、在途的、或者改了还没送出去的
+    // 空闲判定必须带上它，否则分片会在回执到达前被撤掉，
+    // 未 lit 的区块被 flush 跳过，玩家的编辑就留在内存里一起没了
+    pub fn has_pending_light(&self) -> bool {
+        !self.pending_light_init.is_empty()
+            || !self.light_changes.is_empty()
+            || !self.light_init_in_flight.is_empty()
     }
 
     // 下发门槛 光照回填之前区块不下发
@@ -755,6 +820,7 @@ impl ChunkManager {
             chunk.lit = true;
         }
         self.pending_light_init.clear();
+        self.light_init_in_flight.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -903,6 +969,27 @@ mod tests {
         assert_eq!(manager.light_changes.get(&(0, 0)).map(Vec::len), Some(1));
     }
 
+    // 基岩挖不动 返回 None 表示什么都没发生
+    #[test]
+    fn bedrock_cannot_be_broken() {
+        let mut manager = ChunkManager::new();
+        assert!(manager.set_block(0, 1, 0, crate::level::generator::blocks::BEDROCK));
+        assert_eq!(manager.break_block(0, 1, 0), None);
+        assert_eq!(manager.block(0, 1, 0), crate::level::generator::blocks::BEDROCK);
+    }
+
+    // 挖掉带 meta 的方块 元数据要跟着清零
+    #[test]
+    fn breaking_block_clears_meta() {
+        let mut manager = ChunkManager::new();
+        let _ = manager.get(0, 0);
+        manager.set_block_meta(0, 5, 0, 17, 1);
+        assert_eq!(manager.meta(0, 5, 0), 1);
+        assert_eq!(manager.break_block(0, 5, 0), Some(17));
+        assert_eq!(manager.block(0, 5, 0), 0);
+        assert_eq!(manager.meta(0, 5, 0), 0);
+    }
+
     #[test]
     fn set_block_reports_change() {
         let mut manager = ChunkManager::new();
@@ -952,6 +1039,84 @@ mod tests {
         assert_eq!(chunk.sky_light(0, CHUNK_HEIGHT - 1, 0), 15);
         assert_eq!(chunk.sky_light(0, 4, 0), 0);
         assert_eq!(chunk.sky_light(0, 3, 0), 0);
+    }
+
+    // 在途光照要算进"有活干" 否则分片会在回执到达前被撤掉
+    #[test]
+    fn pending_light_keeps_the_manager_busy() {
+        let mut manager = ChunkManager::new();
+        assert_eq!(manager.block(0, 4, 0), GRASS);
+        // 刚生成 待提交
+        assert!(manager.has_pending_light());
+
+        // 提交之后进在途 仍然不能算空闲
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let jobs = manager.take_light_jobs(&tx);
+        assert_eq!(jobs.len(), 1);
+        assert!(manager.has_pending_light());
+
+        // 回执写回才真正空闲
+        for job in jobs {
+            if let LightKind::Init(snap) = job.kind {
+                let receipt = crate::level::light::engine::Engine::init(snap).into_receipt();
+                manager.apply_light_receipt(receipt);
+            }
+        }
+        assert!(!manager.has_pending_light());
+    }
+
+    // 回执捎带的邻居区块只改了边界几格 不能当它自己算完了
+    #[test]
+    fn receipt_does_not_open_the_gate_for_a_neighbour() {
+        let mut manager = ChunkManager::new();
+        assert_eq!(manager.block(0, 4, 0), GRASS);
+        assert!(!manager.is_lit(0, 0));
+
+        // 目标是别家区块 只是把 (0,0) 的边界光带回来了
+        let receipt = LightReceipt {
+            owner: (1, 0),
+            chunks: vec![crate::level::light::snapshot::ChunkLight {
+                x: 0,
+                z: 0,
+                sky_light: vec![0; crate::level::format::chunk::NIBBLE_COUNT],
+                block_light: vec![0; crate::level::format::chunk::NIBBLE_COUNT],
+            }],
+        };
+        manager.apply_light_receipt(receipt);
+        assert!(!manager.is_lit(0, 0), "没有自己的 Init 不能开下发门槛");
+    }
+
+    // Init 在途时改方块 快照里没有这次改动 必须再排一轮增量
+    #[test]
+    fn edit_while_init_in_flight_is_queued_for_update() {
+        let mut manager = ChunkManager::new();
+        assert_eq!(manager.block(0, 4, 0), GRASS);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let jobs = manager.take_light_jobs(&tx);
+        assert_eq!(jobs.len(), 1);
+
+        assert!(manager.set_block(0, 10, 0, 1));
+        assert_eq!(
+            manager.light_changes.get(&(0, 0)).map(Vec::len),
+            Some(1),
+            "在途期间的改动漏排了"
+        );
+        // 底光还没写回 现在排增量会拿旧快照算 必须先在队列里等着
+        let more = manager.take_light_jobs(&tx);
+        assert!(more.is_empty(), "在途期间不该排增量任务");
+        assert!(manager.light_changes.contains_key(&(0, 0)));
+
+        // 回执写回之后就能正常排了
+        for job in jobs {
+            if let LightKind::Init(snap) = job.kind {
+                manager.apply_light_receipt(
+                    crate::level::light::engine::Engine::init(snap).into_receipt(),
+                );
+            }
+        }
+        let after = manager.take_light_jobs(&tx);
+        assert_eq!(after.len(), 1);
+        assert!(matches!(after[0].kind, LightKind::Update { .. }));
     }
 
     // 改过的方块落盘后重新打开还在 没改的仍是平坦地形

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -155,7 +155,6 @@ impl RakNetServer {
                             match self.sessions.get_mut(&addr) {
                                 Some(handle) => {
                                     handle.ready = true;
-                                    info!("[{addr}] session {} ready for downlink", handle.id);
                                 }
                                 None => warn!("[{addr}] session ready but no route"),
                             }
@@ -208,10 +207,6 @@ fn spawn_connection(
         let mut finished = false;
         let mut sent_closed = false;
         let mut reason = String::from("closed");
-        // 收发统计 用来判断客户端是否真的收到并确认了数据
-        let mut sent_datagrams: u64 = 0;
-        let mut recv_datagrams: u64 = 0;
-        let mut ticks: u64 = 0;
 
         while !finished {
             let mut out = Vec::new();
@@ -239,22 +234,12 @@ fn spawn_connection(
                             }
                         },
                         _ = ticker.tick() => {
-                            ticks += 1;
                             session.tick(Instant::now(), &mut out, &mut events);
-                            // 每 2 秒汇报一次 未确认数不降说明客户端没收到或者没回 ACK
-                            if ticks.is_multiple_of(40) && sent_datagrams > 0 {
-                                info!(
-                                    "[{addr}] down {sent_datagrams} datagrams / up {recv_datagrams}, unacked {}, next seq {}",
-                                    session.recovery_len(),
-                                    session.send_seq()
-                                );
-                            }
                         }
                     }
                     for cmd in cmds {
                         match cmd {
                             ConnCmd::Datagram(packet) => {
-                                recv_datagrams += 1;
                                 let _ = session.handle_datagram(&packet, &mut out, &mut events);
                             }
                             ConnCmd::Downlink { bodies } => {
@@ -272,7 +257,6 @@ fn spawn_connection(
             }
 
             for data in out {
-                sent_datagrams += 1;
                 let _ = socket.send_to(&data, addr).await;
             }
 
@@ -305,8 +289,6 @@ fn spawn_connection(
                 finished = true;
             }
         }
-
-        info!("[{addr}] session {id} task exit: {reason}");
         if !sent_closed {
             let _ = net_tx
                 .send(NetEvent::SessionClosed { id, addr, reason })

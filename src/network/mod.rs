@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tracing::{info, warn};
@@ -20,6 +21,8 @@ use crate::network::protocol::player_list::{PlayerListEntry, PlayerListPacket};
 use crate::network::protocol::remove_player::RemovePlayerPacket;
 use crate::network::protocol::text::{TYPE_CHAT, TextPacket};
 use crate::raknet::GAME_PACKET_PREFIX;
+use crate::tick::metrics::{RegionHealth, TickMeter, TickStats};
+use crate::tick::os::{OsMeter, OsSample};
 
 pub mod batch;
 pub mod protocol;
@@ -92,6 +95,16 @@ pub struct NetworkState {
     shutdown_requested: bool,
     // 世界名称 来自 server.toml 的 world 用于玩家上下线日志
     world_name: String,
+    // 容器(工作台/熔炉/箱子)内容与烧制进度 按方块坐标存 关窗不丢
+    containers: crate::item::containers::ContainerRegistry,
+    // 熔炉进度条同步节流 每 10 tick 一次
+    furnace_sync_ticks: u32,
+    // TPS/MSPT 采样 主循环每拍写 /tps 只读
+    metrics: TickMeter,
+    // 各分片每秒上报的健康快照 /tps 汇总展示
+    region_health: HashMap<RegionId, RegionHealth>,
+    // 系统与进程性能采样 /top 只读
+    os: OsMeter,
 }
 
 impl NetworkState {
@@ -149,7 +162,27 @@ impl NetworkState {
             world_time: WorldTime::default(),
             shutdown_requested: false,
             world_name,
+            containers: crate::item::containers::ContainerRegistry::default(),
+            furnace_sync_ticks: 0,
+            metrics: TickMeter::new(),
+            region_health: HashMap::new(),
+            os: OsMeter::new(),
         }
+    }
+
+    // /top 读的快照 拷贝 cost 很小
+    pub(crate) fn os_sample(&self) -> OsSample {
+        self.os.sample()
+    }
+
+    // 主循环每拍调用 gap 是上一拍开始到这一拍开始的间隔 mspt 是这一拍干活耗时
+    pub(crate) fn record_tick(&mut self, gap: Duration, mspt: Duration) {
+        self.metrics.record(gap, mspt);
+    }
+
+    // 当前窗口的采样统计 一拍都还没跑完时是 None
+    pub(crate) fn tick_stats(&self) -> Option<TickStats> {
+        self.metrics.stats()
     }
 
     pub fn view_distance(&self) -> i32 {
@@ -257,6 +290,9 @@ impl NetworkState {
         let Some(state) = self.players.remove(addr) else {
             return Vec::new();
         };
+        // 下线必须解除容器关联 否则同一端口的会话重连后
+        // 还会收到指向已关闭窗口的 ContainerSetSlot 客户端会崩
+        self.containers.close(*addr);
         // 同一 uuid 的玩家已经用新端点重新上线 旧端点超时收尾时不能再写盘或广播
         // 否则会覆盖新会话刚写的存档 还会发出错误的 left the game
         // 同名但 uuid 不同是另一台设备上的另一个人 两份存档各写各的 不能当重连吞掉
@@ -305,7 +341,7 @@ impl NetworkState {
             return Vec::new();
         }
         // 进过世界才记 "left the game" 与游戏内广播对应
-        info!("{} left the game", state.username);
+        info!("§6{} left the game", state.username);
 
         // 实体移除只给看得见他的人 列表项与离开提示全服都发
         let entity_gone = RemovePlayerPacket {
@@ -316,7 +352,7 @@ impl NetworkState {
         let radius = (self.view_distance * 16) as f32;
         let center = state.position;
         let list_gone = PlayerListPacket::remove(vec![*state.uuid.as_bytes()]).encode();
-        let notice = TextPacket::raw(&format!("{} left the game", state.username)).encode();
+        let notice = TextPacket::raw(&format!("§e{} left the game", state.username)).encode();
         self.players
             .iter()
             .filter(|(_, peer)| peer.spawned)
@@ -433,6 +469,85 @@ impl NetworkState {
             }
         }
 
+        // 熔炉每 tick 烧制 槽位变化立即同步 进度条定期推给正在看这个容器的人
+        out.extend(self.tick_containers());
+
+        out
+    }
+
+    // 照搬 Nukkit BlockEntityFurnace.onUpdate 每 tick 推进燃料与烧制
+    // 只给打开该容器的玩家发进度 燃烧方块切换广播给视野内所有人
+    fn tick_containers(&mut self) -> Vec<SendCmd> {
+        use crate::item::containers::{KIND_FURNACE, SlotChange, slot_packet};
+        use crate::network::protocol::container::ContainerSetSlotPacket;
+
+        let mut out = Vec::new();
+        let mut lit_changes: Vec<(i32, i32, i32, bool)> = Vec::new();
+        self.furnace_sync_ticks = self.furnace_sync_ticks.wrapping_add(1);
+        let sync_progress = self.furnace_sync_ticks.is_multiple_of(10);
+        let manager = crate::item::inventory::CraftingManager::new();
+        let addrs: Vec<SocketAddr> = self.containers.opened.keys().copied().collect();
+
+        let positions: Vec<(i32, i32, i32)> = self
+            .containers
+            .blocks
+            .iter()
+            .filter(|(_, s)| s.kind == KIND_FURNACE)
+            .map(|(p, _)| *p)
+            .collect();
+
+        for pos in positions {
+            let Some(state) = self.containers.blocks.get_mut(&pos) else {
+                continue;
+            };
+            let changes = state.tick(&manager);
+            let window_id = state.window_id;
+            let viewers: Vec<SocketAddr> = addrs
+                .iter()
+                .copied()
+                .filter(|a| self.containers.pos_of(*a) == Some(pos))
+                .collect();
+
+            // 槽位变化(吃燃料/出产物/原料减少)立刻推给观察者
+            for change in changes {
+                let (slot, item) = match change {
+                    SlotChange::Smelting(i) => (0, Some(i)),
+                    SlotChange::Fuel(i) => (1, Some(i)),
+                    SlotChange::Result(i) => (2, Some(i)),
+                    SlotChange::Lit(lit) => {
+                        lit_changes.push((pos.0, pos.1, pos.2, lit));
+                        continue;
+                    }
+                };
+                let clean = item.filter(|i| i.id > 0 && i.count > 0);
+                let packet: ContainerSetSlotPacket = slot_packet(window_id, slot, clean);
+                for addr in &viewers {
+                    out.push(reply(*addr, vec![packet.encode()]));
+                }
+            }
+
+            // 熔炉进度条 ContainerSetData 暂不下发 0.14 客户端收到会闪退
+            if sync_progress {
+                // 保留节流计数 之后换别的方式同步烧制进度时直接用
+            }
+        }
+
+        // 点燃/熄火: 服务端世界也要切成 61/62 否则客户端重载区块会变回去
+        for (x, y, z, lit) in lit_changes {
+            self.level.set_furnace_lit(x, y, z, lit);
+            let meta = self
+                .containers
+                .blocks
+                .get(&(x, y, z))
+                .map(|s| s.meta)
+                .unwrap_or(0);
+            let id = if lit {
+                crate::level::generator::blocks::BURNING_FURNACE
+            } else {
+                crate::level::generator::blocks::FURNACE
+            };
+            out.extend(self.broadcast_block(x, y, z, id, meta));
+        }
         out
     }
 
@@ -474,14 +589,6 @@ impl NetworkState {
         // 顺序反了会因为找不到条目而一直停在加载界面
         out.extend(self.on_player_spawned(addr));
         let spawn = spawn_sequence(position, self.gamemode);
-        // 临时诊断 出生批次的包类型序列
-        info!(
-            "[{addr}] spawn batch pids {:02x?}",
-            spawn
-                .iter()
-                .filter_map(|body| body.first().copied())
-                .collect::<Vec<_>>()
-        );
         out.push(reply(addr, spawn));
     }
 
@@ -491,9 +598,11 @@ impl NetworkState {
         let Some(me) = self.players.get(&addr) else {
             return Vec::new();
         };
-        info!(
-            "{}[{}] logged in with entity id {} at ([{}]{:.1}, {:.1}, {:.1})",
-            me.username, addr, me.eid, self.world_name, me.position.0, me.position.1, me.position.2
+        info!("UUID of player {} is {}",
+            me.username, me.uuid
+        );
+        info!("{}[/{}] logged in with entity id {} at ([{}]{:.1}, {:.1}, {:.1})",
+        me.username, addr, me.eid, self.world_name, me.position.0, me.position.1, me.position.2
         );
         let my_entry = me.list_entry();
         let my_add = me.add_packet();
@@ -513,6 +622,7 @@ impl NetworkState {
             })
             .collect();
 
+        let joined = TextPacket::raw(&format!("§e{} joined the game", me.username)).encode();
         let mut bodies = vec![PlayerListPacket::add(vec![my_entry.clone()]).encode()];
         for (_, entry, add, visible) in &others {
             bodies.push(PlayerListPacket::add(vec![entry.clone()]).encode());
@@ -520,12 +630,11 @@ impl NetworkState {
                 bodies.push(add.clone());
             }
         }
+        bodies.push(joined.clone());
         let mut out = vec![reply(addr, bodies)];
-
-        // 世界里已经存在的掉落物由各分片各自补发给新出生玩家
         self.level.send_drops(addr);
 
-        let joined = TextPacket::raw(&format!("{} joined the game", me.username)).encode();
+        let joined = TextPacket::raw(&format!("§e{} joined the game", me.username)).encode();
         for (peer, _, _, visible) in &others {
             let mut bodies = vec![PlayerListPacket::add(vec![my_entry.clone()]).encode()];
             if *visible {
@@ -562,16 +671,6 @@ impl NetworkState {
     fn dispatch(&mut self, addr: SocketAddr, packet: &[u8], out: &mut Vec<SendCmd>) {
         if packet.len() < 2 || packet[0] != GAME_PACKET_PREFIX {
             return;
-        }
-
-        // 临时诊断 打印客户端上行的游戏包类型 移动包除外避免刷屏
-        if packet[1] != MOVE_PLAYER {
-            info!(
-                "[{addr}] up pid 0x{:02x} len {} spawned {:?}",
-                packet[1],
-                packet.len(),
-                self.players.get(&addr).map(|s| s.spawned)
-            );
         }
 
         // 登录由 global region 引导 移动要维护归属表 其余包全部投给属主分片消费
@@ -704,7 +803,35 @@ impl NetworkState {
                 messages.extend(output.messages);
                 sync.extend(output.sync);
             }
-            Command::Version(op) => messages.push(op.message().to_string()),
+            Command::Teleport(cmd) => {
+                let outcome = cmd.resolve(sender, &self.players);
+                messages.extend(outcome.messages);
+                for mv in outcome.moves {
+                    // 镜像先跟上 同一个 tick 后面的包处理看到的就是新位置
+                    if let Some(state) = self.players.get_mut(&mv.addr) {
+                        state.position = mv.position;
+                        state.yaw = mv.yaw;
+                        state.pitch = mv.pitch;
+                    }
+                    // 落点视野跨到的分片要先建出来 Transfer 才有接收方
+                    self.level.ensure_view(mv.position, self.view_distance);
+                    if let Some(&id) = self.player_index.get(&mv.addr) {
+                        self.level.teleport(mv.addr, id, mv.position, mv.yaw, mv.pitch);
+                    }
+                }
+            }
+            Command::Tps(_) => {
+                let online = self.players.values().filter(|state| state.spawned).count();
+                let regions: Vec<RegionHealth> = self.region_health.values().copied().collect();
+                let report =
+                    command::CommandTps::Tps.execute(self.tick_stats(), &regions, online, &self.world_name);
+                messages.extend(report);
+            }
+            Command::Top(_) => {
+                let sample = self.os_sample();
+                messages.extend(command::TopCommand::Top.execute(&sample, self.tick_stats()));
+            }
+            Command::Version(op) => messages.extend(op.lines().map(str::to_string)),
             Command::Stop(_) => {
                 self.shutdown_requested = true;
                 messages.push(command::stop::CommandStop::Stop.message().to_string());

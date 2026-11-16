@@ -302,6 +302,18 @@ impl Level {
         self.region(id).sync_player(addr, state);
     }
 
+    // 服务端主动传送 交给玩家当前归属的分片落地
+    pub(crate) fn teleport(
+        &mut self,
+        addr: std::net::SocketAddr,
+        id: RegionId,
+        position: (f32, f32, f32),
+        yaw: f32,
+        pitch: f32,
+    ) {
+        self.region(id).teleport(addr, position, yaw, pitch);
+    }
+
     // 掉落物交给方块属主分片生成
     pub(crate) fn add_drop(
         &mut self,
@@ -313,6 +325,12 @@ impl Level {
     ) {
         self.region(RegionId::of_block(x, z))
             .add_drop(eid, item, block);
+    }
+
+    // 熔炉点燃/熄火 让方块属主分片真正改世界 id(61/62)
+    pub(crate) fn set_furnace_lit(&mut self, x: i32, y: i32, z: i32, lit: bool) {
+        let id = RegionId::of_block(x, z);
+        self.region(id).set_furnace_lit(x, y, z, lit);
     }
 
     // 玩家出生 让所有分片把已有的掉落物补发给他

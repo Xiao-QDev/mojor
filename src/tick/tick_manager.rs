@@ -1,5 +1,6 @@
 use std::pin::pin;
 use std::sync::mpsc as std_mpsc;
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -39,6 +40,8 @@ pub async fn run(
     let mut shutdown = pin!(shutdown);
 
     let mut tick_count: u64 = 0;
+    // 每拍开始的时间戳 gap 与 MSPT 都从这里算 统计口径见 tick::metrics
+    let mut last_tick = Instant::now();
     let mut pending: Vec<NetEvent> = Vec::with_capacity(64);
     let mut network = NetworkState::with_loader(
         gamemode,
@@ -80,6 +83,9 @@ pub async fn run(
     'main: loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // 实际间隔比标称多出来的部分是上一拍拖的时间
+                let gap = last_tick.elapsed();
+                last_tick = Instant::now();
                 tick_count += 1;
 
                 // 网络事件只在 tick 边界批量取出 保证状态变更顺序确定
@@ -126,6 +132,11 @@ pub async fn run(
                     // 异步投递 不阻塞主循环 region 自己分批编码写盘
                     network.flush_world_async();
                 }
+
+                // 系统性能采样在 tick::os 的独立线程里跑 主循环不参与
+
+                // 本拍耗时就是 MSPT 到这里本拍的活干完了 后面等的是下一拍的空闲
+                network.record_tick(gap, last_tick.elapsed());
             }
             Some(line) = console_rx.recv() => {
                 let output = network.run_command(&line);

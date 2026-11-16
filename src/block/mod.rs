@@ -10,6 +10,9 @@ pub use block_def::Block;
 
 pub mod BlockIds;
 
+// 手持物品 -> 放置的方块 对照表
+pub mod placement;
+
 pub mod AcaciaDoor;
 pub mod AcaciaWoodStairs;
 pub mod ActivatorRail;

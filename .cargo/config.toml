@@ -8,7 +8,10 @@ target = "x86_64-unknown-linux-gnu"
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
 
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-# cargo build --release --target x86_64-pc-windows-gnu
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "link-arg=/ignore:4099",
+]
+# cargo xwin build --release --target x86_64-pc-windows-msvc

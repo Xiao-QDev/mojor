@@ -5,6 +5,6 @@ pub struct WoodenButton;
 pub const INSTANCE: WoodenButton = WoodenButton;
 
 impl Block for WoodenButton {
-    fn id(&self) -> u8 { 72 }
+    fn id(&self) -> u8 { 143 }
     fn name(&self) -> &'static str { "WoodenButton" }
 }

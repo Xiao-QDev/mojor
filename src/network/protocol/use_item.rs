@@ -9,6 +9,10 @@ pub struct UseItemPacket {
     pub y: i32,
     pub z: i32,
     pub face: u8,
+    // 命中点 相对被点方块的坐标 0..1 台阶与楼梯判上下半格要用 fy
+    pub fx: f32,
+    pub fy: f32,
+    pub fz: f32,
     pub slot: i32,
     pub item_id: i16,
     pub item_count: u8,
@@ -29,7 +33,11 @@ impl UseItemPacket {
         let y = r.get_i32()?;
         let z = r.get_i32()?;
         let face = r.get_u8()?;
-        for _ in 0..6 {
+        let fx = r.get_f32()?;
+        let fy = r.get_f32()?;
+        let fz = r.get_f32()?;
+        // 后面三个是玩家自己的坐标 放置用不到
+        for _ in 0..3 {
             r.get_f32()?;
         }
         let slot = r.get_i32()?;
@@ -51,6 +59,9 @@ impl UseItemPacket {
             y,
             z,
             face,
+            fx,
+            fy,
+            fz,
             slot,
             item_id,
             item_count,
@@ -123,6 +134,9 @@ mod tests {
             y: 5,
             z: -1,
             face: 0,
+            fx: 0.5,
+            fy: 0.5,
+            fz: 0.5,
             slot: 0,
             item_id: 1,
             item_count: 1,

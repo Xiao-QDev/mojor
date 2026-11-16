@@ -16,6 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustyline = { version = "19.0.0", default-features = false, features = ["with-file-history"] }
 uuid = { version = "1.29.2", features = ["v3"] }
 md-5 = "0.10"
+sysinfo = "0.40.3"
 
 # 单候选时 Tab 不再退回原始输入 补丁在 vendor/rustyline/src/lib.rs 的 complete_line
 [patch.crates-io]

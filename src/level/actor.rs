@@ -17,9 +17,12 @@ use crate::entity::{ItemDrop, PlayerDirectory, RegionPlayer, within_view_distanc
 use crate::entity::{ITEM_LIFETIME, ITEM_PICKUP_DELAY};
 use crate::network::protocol::item::ItemStack;
 use crate::network::protocol::item_entity::TakeItemEntityPacket;
+use crate::network::protocol::move_entity::{MoveEntityEntry, MoveEntityPacket};
+use crate::network::protocol::move_player::{EYE_HEIGHT, MovePlayerPacket};
 use crate::network::protocol::remove_entity::RemoveEntityPacket;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::chunk_io::ChunkIoPool;
+use crate::block::placement::Placement;
 use crate::level::chunk_manager::ChunkManager;
 use crate::level::format::chunk::Chunk;
 use crate::level::light::{LightReceipt, LightService};
@@ -30,12 +33,20 @@ use crate::network::protocol::full_chunk_data::{FullChunkDataPacket, ORDER_COLUM
 
 // 每个 region 自己的 tick 周期 与主循环一致
 pub const REGION_TICK: Duration = Duration::from_millis(50);
+// 同一个玩家两次挖掘之间的最小间隔 2 tick = 100ms
+// 生存里最快的合法挖掘(带工具瞬挖)也就这么快 再快的先排队
+pub const MIN_DIG_TICKS: u64 = 2;
+// 排队上限 超过说明流量远超任何合法速度 才回退成拒绝(客户端会看到回弹)
+const MAX_DIG_QUEUE: usize = 4;
 // 每个玩家每 tick 最多下发多少个区块 与网络层保持一致
 const CHUNKS_PER_TICK: usize = 4;
 // 连续这么多 tick 不可达就上报空闲 40 tick 也就是 2 秒
 pub const IDLE_SHUTDOWN_TICKS: u64 = 40;
 // 每 tick 最多编码写出多少脏块 16 块约 1.3MB 分摊进 50ms 不会被察觉
 const MAX_FLUSH_PER_TICK: usize = 16;
+// 停机 drain 的兜底上限：光照 worker 被 CPU 饿住时回执可能很慢，
+// 但分片不能在没落盘的情况下直接退线程，宁可多等也别丢编辑
+const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // region 注册表 让 region 线程之间互相找得到
 // 只存消息通道 拿到就能投递 不用拿到整个句柄
@@ -70,22 +81,60 @@ impl RegionRegistry {
 
 // region 做完世界改动后交给 global region 的事件
 pub enum RegionEvent {
-    // 挖掉一格 id 为 None 表示那里本来是空气
+    // 挖一格的回执 id/meta 是这一格原本的样子(成功时就是被挖掉的那个方块)
     BlockBroken {
         addr: SocketAddr,
         x: i32,
         y: i32,
         z: i32,
-        id: Option<u8>,
+        id: u8,
+        // 挖掉前的 meta 碎屑粒子靠它选贴图
+        meta: u8,
+        // false 表示没挖动(基岩/本来就是空气) 要让客户端把这一格补回去
+        ok: bool,
+        // 门挖一半时连带的另一半 (x,y,z,id,meta)
+        paired: Option<(i32, i32, i32, u8, u8)>,
     },
-    // 放置一格 ok 为 false 表示目标格被占 没有真的放下去
+    // 放置结果 门/床 一次两格 ok 为 false 表示目标格被占 没有真的放下去
     BlockPlaced {
+        addr: SocketAddr,
+        // 第一格(被点面相邻格)的绝对坐标 其余格按 cells 里的偏移推
+        origin: (i32, i32, i32),
+        cells: Placement,
+        // 手持物品 id 失败时要按物品退回去 不是方块 id
+        item: i16,
+        ok: bool,
+    },
+    // 点门开关的结果 翻转的是下半格 meta 的 0x04
+    // 只有真的翻了门才会发这条 非门/没配对下半一律静默
+    DoorToggled {
         addr: SocketAddr,
         x: i32,
         y: i32,
         z: i32,
         id: u8,
-        ok: bool,
+        meta: u8,
+    },
+    // 客户端拖动某个容器窗口的槽位 由 global 的容器注册表存档
+    ContainerSlot {
+        addr: SocketAddr,
+        window_id: u8,
+        slot: usize,
+        item: Option<crate::network::protocol::item::ItemStack>,
+    },
+    // 关窗 清掉玩家与容器的关联
+    ContainerClosed { addr: SocketAddr },
+    // 点了工作台/熔炉/箱子 让 global 下发 ContainerOpen 打开界面
+    ContainerOpen {
+        addr: SocketAddr,
+        window_id: u8,
+        kind: u8,
+        slots: u16,
+        x: i32,
+        y: i32,
+        z: i32,
+        // 熔炉朝向 点亮/熄火广播方块时要保留
+        meta: u8,
     },
     // 掉落物被拾取 global region 据此加背包并刷新界面
     Pickup {
@@ -107,6 +156,10 @@ pub enum RegionEvent {
         region: RegionId,
         state: Box<crate::entity::PlayerState>,
     },
+    // 分片每秒上报一次自身耗时与规模 global region 只读镜像供 /tps 展示
+    Health {
+        health: crate::tick::metrics::RegionHealth,
+    },
 }
 
 // region 线程产出的下行数据 由 global region 取走展开
@@ -127,6 +180,14 @@ pub struct RegionOutbound {
 #[warn(private_interfaces)]
 pub(crate) enum RegionMsg {
     GetBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        reply: Sender<u8>,
+    },
+    // 测试读方块元数据(羊毛色 楼梯朝向)
+    #[cfg(test)]
+    GetBlockMeta {
         x: i32,
         y: i32,
         z: i32,
@@ -199,6 +260,13 @@ pub(crate) enum RegionMsg {
         player: Box<RegionPlayer>,
         view_distance: i32,
     },
+    // global region 发起的传送 权威坐标与区块队列都在属主分片里改
+    Teleport {
+        addr: SocketAddr,
+        position: (f32, f32, f32),
+        yaw: f32,
+        pitch: f32,
+    },
     // 玩家包交给本分片消费 global region 只等一份下行与玩家状态快照
     HandlePacket {
         addr: SocketAddr,
@@ -214,14 +282,38 @@ pub(crate) enum RegionMsg {
         y: i32,
         z: i32,
     },
-    // 网络层请求放一格 放完回一条 BlockPlaced 事件
+    // 熔炉点燃/熄火 分片把方块 id 在 61/62 之间切 客户端重载区块也一致
+    SetFurnaceLit {
+        x: i32,
+        y: i32,
+        z: i32,
+        lit: bool,
+    },
+    // 网络层请求开关门 分片翻转下半格 meta 的 0x04 回一条 DoorToggled
+    ToggleDoorFor {
+        addr: SocketAddr,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    // 网络层请求打开被点方块的容器 UI 分片读方块判定窗口类型
+    OpenContainerFor {
+        addr: SocketAddr,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    // 网络层请求放置 放完回一条 BlockPlaced 事件
     PlaceBlockFor {
         addr: SocketAddr,
         // 被点击的方块 要存在才允许放置
         click: (i32, i32, i32),
-        // 点击面的相邻格 目标位置
+        // 点击面的相邻格 第一格的绝对位置
         target: (i32, i32, i32),
-        id: u8,
+        // 对照表算好的结果 相对 target 的偏移
+        cells: Placement,
+        // 手持物品 id 放置失败要原样退回
+        item: i16,
     },
     // 方块被挖掉 属主分片就地生成掉落物
     AddDrop {
@@ -389,6 +481,10 @@ impl RegionHandle {
         let _ = self.tx.send(RegionMsg::AddDrop { eid, item, block });
     }
 
+    pub(crate) fn set_furnace_lit(&self, x: i32, y: i32, z: i32, lit: bool) {
+        let _ = self.tx.send(RegionMsg::SetFurnaceLit { x, y, z, lit });
+    }
+
     // 新玩家出生 把本分片已有的掉落物补发给他
     pub(crate) fn send_drops(&self, addr: SocketAddr) {
         let _ = self.tx.send(RegionMsg::SendDrops { addr });
@@ -406,6 +502,11 @@ impl RegionHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn toggle_door_for(&self, addr: SocketAddr, x: i32, y: i32, z: i32) {
+        let _ = self.tx.send(RegionMsg::ToggleDoorFor { addr, x, y, z });
+    }
+
+    #[cfg(test)]
     pub(crate) fn place_block_for(
         &self,
         addr: SocketAddr,
@@ -413,15 +514,53 @@ impl RegionHandle {
         target: (i32, i32, i32),
         id: u8,
     ) {
-        let _ = self
-            .tx
-            .send(RegionMsg::PlaceBlockFor { addr, click, target, id });
+        let _ = self.tx.send(RegionMsg::PlaceBlockFor {
+            addr,
+            click,
+            target,
+            cells: Placement::single(id, 0),
+            item: id as i16,
+        });
+    }
+
+    // 门/床 这种一次两格的放置 测试直接投递对照表算好的结果
+    #[cfg(test)]
+    pub(crate) fn place_cells_for(
+        &self,
+        addr: SocketAddr,
+        click: (i32, i32, i32),
+        target: (i32, i32, i32),
+        cells: Placement,
+    ) {
+        let _ = self.tx.send(RegionMsg::PlaceBlockFor {
+            addr,
+            click,
+            target,
+            cells,
+            item: cells.first.id as i16,
+        });
     }
 
     pub(crate) fn sync_player(&self, addr: SocketAddr, state: crate::entity::PlayerState) {
         let _ = self.tx.send(RegionMsg::SyncPlayer {
             addr,
             state: Box::new(state),
+        });
+    }
+
+    // 服务端主动传送 位置权威在分片 这里只投递 不等回执
+    pub(crate) fn teleport(
+        &self,
+        addr: SocketAddr,
+        position: (f32, f32, f32),
+        yaw: f32,
+        pitch: f32,
+    ) {
+        let _ = self.tx.send(RegionMsg::Teleport {
+            addr,
+            position,
+            yaw,
+            pitch,
         });
     }
 
@@ -475,6 +614,17 @@ impl RegionHandle {
     pub fn block(&self, x: i32, y: i32, z: i32) -> u8 {
         let (reply, rx) = mpsc::channel();
         if self.tx.send(RegionMsg::GetBlock { x, y, z, reply }).is_err() {
+            return 0;
+        }
+        rx.recv().unwrap_or(0)
+    }
+
+    // 测试读元数据
+    #[cfg(test)]
+    pub(crate) fn meta(&self, x: i32, y: i32, z: i32) -> u8 {
+        let (reply, rx) = mpsc::channel();
+        let msg = RegionMsg::GetBlockMeta { x, y, z, reply };
+        if self.tx.send(msg).is_err() {
             return 0;
         }
         rx.recv().unwrap_or(0)
@@ -598,6 +748,9 @@ fn run(
     let mut ticks: u64 = 0;
     // 连续空闲的 tick 数
     let mut idle_for: u64 = 0;
+    // 已提交给光照引擎、还没收到回执的任务数
+    // 等价于"这段时间里内存里可能有还没照亮也没落盘的改动"
+    let mut light_in_flight: usize = 0;
     // 收到异步落盘请求后 后续 tick 分批把脏块写完
     let mut flush_pending = false;
     // 最近一轮 GC 标记出来的可达区块 由 global region 统一算
@@ -606,6 +759,12 @@ fn run(
     // 掉落物实体归本分片 物理与拾取判定都在本线程里做
     let mut drops: Vec<ItemDrop> = Vec::new();
     let mut next_tick = Instant::now() + REGION_TICK;
+    // 分片健康上报窗口 20 拍(1 秒)一次
+    const HEALTH_TICKS: u64 = 20;
+    let mut health_mspt_sum = 0.0_f64;
+    let mut health_max_mspt = 0.0_f32;
+    let mut health_ticks = 0_u64;
+    let mut health_start = Instant::now();
 
     loop {
         loop {
@@ -626,21 +785,31 @@ fn run(
                         view_distance,
                         &mut io,
                         &mut flush_pending,
+                        &mut light_in_flight,
                     ) {
+                        stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                         return;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // 通道没了收不到回执，能写的先写下去
+                    let _ = manager.flush();
+                    return;
+                }
             }
         }
 
         let now = Instant::now();
         if now >= next_tick {
             ticks += 1;
+            // 本拍开工时间 MSPT 统计到这个 tick 分支末尾
+            let tick_start = Instant::now();
             manager.tick(&gc_chunks);
             // 攒下的光照任务交给异步引擎 快照已在 region 线程抓好
-            for job in manager.take_light_jobs(&tx) {
+            let jobs = manager.take_light_jobs(&tx);
+            light_in_flight += jobs.len();
+            for job in jobs {
                 light.submit(job);
             }
             // 异步落盘请求到了就每 tick 分批写一点 平滑掉大批量改动的抖动
@@ -654,6 +823,8 @@ fn run(
                 }
             }
             tick_players(&mut manager, &mut players, &outbound, &registry, id, &mut io, &tx);
+            // 上一拍排队没来得及挖的 按节流节奏补上
+            drain_digs(&mut manager, &mut players, &outbound, ticks);
             tick_drops(
                 &mut manager,
                 &mut drops,
@@ -665,7 +836,14 @@ fn run(
 
             // 没玩家也没实体就累计空闲 到点上报一次让 global region 撤线程
             // 线程自己不停 生命周期统一由 Level 管 免得留下悬空句柄
-            if gc_chunks.is_empty() && players.is_empty() && drops.is_empty() {
+            // 光照有在途/待提交的也不算空闲：这时候退线程，未 lit 的区块
+            // 会被 flush 跳过，玩家的编辑就跟着内存一起没了
+            if gc_chunks.is_empty()
+                && players.is_empty()
+                && drops.is_empty()
+                && light_in_flight == 0
+                && !manager.has_pending_light()
+            {
                 idle_for += 1;
                 if idle_for >= idle_ticks {
                     idle_for = 0;
@@ -683,6 +861,40 @@ fn run(
                 }
             } else {
                 idle_for = 0;
+            }
+
+            // 秒级窗口统计 攒够 20 拍推给 global region 供 /tps 展示
+            let tick_mspt = tick_start.elapsed().as_secs_f64() * 1000.0;
+            health_mspt_sum += tick_mspt;
+            health_max_mspt = health_max_mspt.max(tick_mspt as f32);
+            health_ticks += 1;
+            if health_ticks >= HEALTH_TICKS {
+                let elapsed = health_start.elapsed().as_secs_f32().max(f32::MIN_POSITIVE);
+                let health = crate::tick::metrics::RegionHealth {
+                    region: (id.x, id.z),
+                    mspt: (health_mspt_sum / health_ticks as f64) as f32,
+                    max_mspt: health_max_mspt,
+                    // 实际完成拍数除以真实时长 掉拍时低于标称 20
+                    tps: (health_ticks as f32 / elapsed).min(crate::tick::metrics::TARGET_TPS as f32),
+                    chunks: manager.loaded_chunks(),
+                    players: players.len(),
+                    entities: drops.len(),
+                };
+                push_outbound(
+                    &outbound,
+                    RegionOutbound {
+                        to: None,
+                        skip: None,
+                        around: None,
+                        bodies: Vec::new(),
+                        events: vec![RegionEvent::Health { health }],
+                        chunks_complete: false,
+                    },
+                );
+                health_mspt_sum = 0.0;
+                health_max_mspt = 0.0;
+                health_ticks = 0;
+                health_start = Instant::now();
             }
             next_tick += REGION_TICK;
             // 落后太多跳帧 不追赶 免得一帧里补跑十几个 tick
@@ -709,14 +921,61 @@ fn run(
                         view_distance,
                         &mut io,
                         &mut flush_pending,
+                        &mut light_in_flight,
                     ) {
+                    stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                     return;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = manager.flush();
+                return;
+            }
         }
     }
+}
+
+// 停机 drain：把还在飞的光照回执收完再落盘
+// 没 lit 的区块 flush 会跳过，直接退线程等于把这段改动丢在内存里
+// 只处理回执 其它消息一律丢弃：分片已经在退出了 调用方都按超时兜底
+fn stop_drain(
+    manager: &mut ChunkManager,
+    light: &LightService,
+    tx: &Sender<RegionMsg>,
+    rx: &Receiver<RegionMsg>,
+    light_in_flight: &mut usize,
+) {
+    // 停机消息之前刚生成、还没来得及提交的任务也补上
+    let jobs = manager.take_light_jobs(tx);
+    *light_in_flight += jobs.len();
+    for job in jobs {
+        light.submit(job);
+    }
+
+    let deadline = Instant::now() + STOP_DRAIN_TIMEOUT;
+    while *light_in_flight > 0 {
+        let now = Instant::now();
+        if now >= deadline {
+            warn!(
+                in_flight = *light_in_flight,
+                "停机时光照没等到回执 已过期的区块这次不落盘"
+            );
+            break;
+        }
+        match rx.recv_timeout((deadline - now).min(REGION_TICK)) {
+            Ok(RegionMsg::LightDone { receipt }) => {
+                manager.apply_light_receipt(receipt);
+                *light_in_flight = light_in_flight.saturating_sub(1);
+            }
+            // 停机路径不再处理业务消息 让投递方按通道断开兜底
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // 光照回填之后 lit 才为真 这一步决定编辑到底进不进存档
+    let _ = manager.flush();
 }
 
 // 本 region 内玩家的区块下发 生成与序列化都在 region 线程里做
@@ -837,6 +1096,9 @@ fn tick_players(
                         view.awaiting_light.remove(&pos);
                         owned.push(pos);
                     } else {
+                        // 缓存里可能只是装饰顺手铺的邻居 只有地形没有光照任务
+                        // 补一次完整流程 不然这里会永远等不到 LightDone
+                        manager.prepare_for_light(pos.0, pos.1);
                         view.awaiting_light.insert(pos);
                         view.pending_chunks.push_back(pos);
                     }
@@ -1055,6 +1317,133 @@ fn view_radius_blocks(view_distance: i32) -> f32 {
     (view_distance * 16) as f32
 }
 
+// 这一格能不能被放置覆盖 与 Nukkit 的 block.canBeReplaced() 同义
+// 草 雪 花 这类可覆盖方块允许直接顶掉 另有属主校验 双格的门床不能跨分片
+// 门铰链位 照 Nukkit BlockDoor::place
+// 铰链侧已经有同种门 或 正面是墙而铰链侧是空的 都要带 0x01
+fn door_hinged(manager: &mut ChunkManager, x: i32, y: i32, z: i32, direction: u8, id: u8) -> bool {
+    let (hinge, facing) = crate::block::placement::door_faces(direction);
+    let (hx, hz) = crate::block::placement::face_offset(hinge);
+    let (fx, fz) = crate::block::placement::face_offset(facing);
+    let next = manager.block(x + hx, y, z + hz);
+    let next2 = manager.block(x + fx, y, z + fz);
+    next == id
+        || (!crate::level::generator::blocks::is_transparent(next2)
+        && crate::level::generator::blocks::is_transparent(next))
+}
+
+// 挖掘请求的受理结果
+enum DigAdmit {
+    // 到点了 立刻挖
+    Now,
+    // 太快 排进队列等下一个允许的 tick
+    Queued,
+    // 队列也满了 判定异常流量 回补一格
+    Reject,
+}
+
+// 真正挖一格 连带拆门并推回执给 global
+fn dig_block(
+    manager: &mut ChunkManager,
+    outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
+    addr: SocketAddr,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    // id/meta 要在挖之前读 挖掉之后就是空气了
+    let id = manager.block(x, y, z);
+    let meta = manager.meta(x, y, z);
+    let broken = manager.break_block(x, y, z);
+    // 门是两格 拆一半另一半也要拆 不然会留下悬空门
+    let paired = if broken.is_some() && crate::level::generator::blocks::is_door(id) {
+        paired_door(manager, x, y, z, id, meta)
+    } else {
+        None
+    };
+    push_block_broken(outbound, addr, x, y, z, id, meta, broken.is_some(), paired);
+}
+
+fn push_block_broken(
+    outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
+    addr: SocketAddr,
+    x: i32,
+    y: i32,
+    z: i32,
+    id: u8,
+    meta: u8,
+    ok: bool,
+    paired: Option<(i32, i32, i32, u8, u8)>,
+) {
+    let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
+    buffer.push(RegionOutbound {
+        to: None,
+        skip: None,
+        around: None,
+        bodies: Vec::new(),
+        events: vec![RegionEvent::BlockBroken {
+            addr,
+            x,
+            y,
+            z,
+            id,
+            meta,
+            ok,
+            paired,
+        }],
+        chunks_complete: false,
+    });
+}
+
+// 每 tick 把排队的挖掘按 MIN_DIG_TICKS 的节奏补上
+// 一次最多补一格 保持和"当场受理"完全一样的速度上限
+fn drain_digs(
+    manager: &mut ChunkManager,
+    players: &mut HashMap<SocketAddr, RegionPlayer>,
+    outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
+    ticks: u64,
+) {
+    for (addr, player) in players.iter_mut() {
+        while ticks >= player.next_dig_tick {
+            let Some((x, y, z)) = player.dig_queue.pop_front() else {
+                break;
+            };
+            player.next_dig_tick = ticks + MIN_DIG_TICKS;
+            dig_block(manager, outbound, *addr, x, y, z);
+        }
+    }
+}
+
+// 拆门连带另一半 Nukkit BlockDoor::onBreak
+// 上半(meta 带 0x08)拆下面 下半拆上面 返回另一半的原样给网络层广播
+fn paired_door(
+    manager: &mut ChunkManager,
+    x: i32,
+    y: i32,
+    z: i32,
+    id: u8,
+    meta: u8,
+) -> Option<(i32, i32, i32, u8, u8)> {
+    let other_y = if meta & 0x08 != 0 { y - 1 } else { y + 1 };
+    if manager.block(x, other_y, z) != id {
+        return None;
+    }
+    let other_meta = manager.meta(x, other_y, z);
+    manager.break_block(x, other_y, z);
+    Some((x, other_y, z, id, other_meta))
+}
+
+fn placeable(manager: &mut ChunkManager, x: i32, y: i32, z: i32) -> bool {
+    if !(0..crate::level::format::chunk::CHUNK_HEIGHT as i32).contains(&y) {
+        return false;
+    }
+    if !manager.owns(x >> 4, z >> 4) {
+        return false;
+    }
+    let id = manager.block(x, y, z);
+    id == 0 || crate::level::generator::blocks::is_overridable(id)
+}
+
 fn push_outbound(buffer: &Arc<Mutex<Vec<RegionOutbound>>>, item: RegionOutbound) {
     let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
     buffer.push(item);
@@ -1076,10 +1465,15 @@ fn dispatch(
     view_distance: i32,
     io: &mut IoState,
     flush_pending: &mut bool,
+    light_in_flight: &mut usize,
 ) -> bool {
     match msg {
         RegionMsg::GetBlock { x, y, z, reply } => {
             let _ = reply.send(manager.block(x, y, z));
+        }
+        #[cfg(test)]
+        RegionMsg::GetBlockMeta { x, y, z, reply } => {
+            let _ = reply.send(manager.meta(x, y, z));
         }
         RegionMsg::Payload {
             chunk_x,
@@ -1237,31 +1631,157 @@ fn dispatch(
                 player.view.pending_foreign = player.view.pending_foreign.saturating_sub(count);
             }
         }
-        // 网络层请求挖方块 挖完把结果作为事件交回去
-        RegionMsg::BreakBlockFor { addr, x, y, z } => {
-            let id = manager.break_block(x, y, z);
+        // 网络层请求开关门 Nukkit BlockDoor::toggle
+        // 点上半就翻下半 meta 的 0x04 点下半翻自己 没配对下半就当没开成
+        RegionMsg::ToggleDoorFor { addr, x, y, z } => {
+            let id = manager.block(x, y, z);
+            // 不是门 或没配对下半 静默返回 手持物品点普通方块不该有任何副作用
+            if !crate::level::generator::blocks::is_door(id) {
+                return true;
+            }
+            let meta = manager.meta(x, y, z);
+            let (lower_y, lower_meta) = if meta & 0x08 != 0 {
+                (y - 1, manager.meta(x, y - 1, z))
+            } else {
+                (y, meta)
+            };
+            if manager.block(x, lower_y, z) != id {
+                return true;
+            }
+            let next = lower_meta ^ 0x04;
+            manager.set_block_meta(x, lower_y, z, id, next);
             let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
             buffer.push(RegionOutbound {
                 to: None,
                 skip: None,
                 around: None,
                 bodies: Vec::new(),
-                events: vec![RegionEvent::BlockBroken { addr, x, y, z, id }],
+                events: vec![RegionEvent::DoorToggled {
+                    addr,
+                    x,
+                    y: lower_y,
+                    z,
+                    id,
+                    meta: next,
+                }],
                 chunks_complete: false,
             });
         }
-        // 网络层请求放方块 点击的方块要在 目标格要空
+        // 熔炉点燃/熄火 保留朝向 meta 广播由 global 那边的 SlotChange::Lit 负责
+        RegionMsg::SetFurnaceLit { x, y, z, lit } => {
+            let current = manager.block(x, y, z);
+            if current != crate::level::generator::blocks::FURNACE
+                && current != crate::level::generator::blocks::BURNING_FURNACE
+            {
+                return true;
+            }
+            let id = if lit {
+                crate::level::generator::blocks::BURNING_FURNACE
+            } else {
+                crate::level::generator::blocks::FURNACE
+            };
+            if current != id {
+                let meta = manager.meta(x, y, z);
+                manager.set_block_meta(x, y, z, id, meta);
+            }
+        }
+        // 点了容器方块 判定窗口类型并回事件 非容器静默
+        RegionMsg::OpenContainerFor { addr, x, y, z } => {
+            let id = manager.block(x, y, z) as i16;
+            let (kind, slots) = match id {
+                // Nukkit InventoryType.WORKBENCH 10 格 = 9 合成 + 1 结果
+                crate::item::ids::WORKBENCH => (1u8, 10u16),
+                // 燃烧中的熔炉(62)也要能打开 用的是同一个容器
+                crate::item::ids::FURNACE | 62 => (2u8, 3u16),
+                crate::item::ids::CHEST => (0u8, 27u16),
+                crate::item::ids::TRAPPED_CHEST => (0u8, 27u16),
+                _ => return true,
+            };
+            let meta = manager.meta(x, y, z);
+            let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
+            buffer.push(RegionOutbound {
+                to: None,
+                skip: None,
+                around: None,
+                bodies: Vec::new(),
+                events: vec![RegionEvent::ContainerOpen {
+                    addr,
+                    window_id: 1,
+                    kind,
+                    slots,
+                    x,
+                    y,
+                    z,
+                    meta,
+                }],
+                chunks_complete: false,
+            });
+        }
+        // 网络层请求挖方块 挖完把结果作为事件交回去
+        // 超速请求不直接拒: 客户端本地已经把方块删了 拒绝就是回弹
+        // 先排进队列 到下一个允许的 tick 依次补上 速度上限仍是 MIN_DIG_TICKS
+        RegionMsg::BreakBlockFor { addr, x, y, z } => {
+            let admit = match players.get_mut(&addr) {
+                // 玩家不在本分片(跨分片挖)没有节流状态 直接放行
+                None => DigAdmit::Now,
+                Some(player) => {
+                    if ticks >= player.next_dig_tick {
+                        player.next_dig_tick = ticks + MIN_DIG_TICKS;
+                        DigAdmit::Now
+                    } else if player.dig_queue.len() < MAX_DIG_QUEUE {
+                        player.dig_queue.push_back((x, y, z));
+                        DigAdmit::Queued
+                    } else {
+                        DigAdmit::Reject
+                    }
+                }
+            };
+            match admit {
+                DigAdmit::Now => dig_block(manager, &outbound, addr, x, y, z),
+                DigAdmit::Queued => {}
+                // 队列都满了 判定异常流量 回执带上原方块让客户端补回去
+                DigAdmit::Reject => {
+                    let id = manager.block(x, y, z);
+                    let meta = manager.meta(x, y, z);
+                    push_block_broken(&outbound, addr, x, y, z, id, meta, false, None);
+                }
+            }
+        }
+        // 网络层请求放方块 点击的方块要在 目标格要空 双格的第二格也要空
         RegionMsg::PlaceBlockFor {
             addr,
             click,
             target,
-            id,
+            cells,
+            item,
         } => {
             let (cx, cy, cz) = click;
             let (tx, ty, tz) = target;
-            let ok = manager.block(cx, cy, cz) != 0
-                && manager.block(tx, ty, tz) == 0
-                && manager.set_block(tx, ty, tz, id);
+            let mut cells = cells;
+            let mut ok = manager.block(cx, cy, cz) != 0 && placeable(manager, tx, ty, tz);
+            if ok {
+                if let Some(second) = cells.second {
+                    let (sx, sy, sz) = (tx + second.dx, ty + second.dy, tz + second.dz);
+                    ok = placeable(manager, sx, sy, sz);
+                }
+            }
+            // 铰链位要读放置前的邻居 所以放在写入之前算
+            if ok
+                && cells.second.is_some()
+                && crate::level::generator::blocks::is_door(cells.first.id)
+                && door_hinged(manager, tx, ty, tz, cells.first.meta, cells.first.id)
+            {
+                if let Some(second) = cells.second.as_mut() {
+                    second.meta |= 0x01;
+                }
+            }
+            if ok {
+                manager.set_block_meta(tx, ty, tz, cells.first.id, cells.first.meta);
+                if let Some(second) = cells.second {
+                    let (sx, sy, sz) = (tx + second.dx, ty + second.dy, tz + second.dz);
+                    manager.set_block_meta(sx, sy, sz, second.id, second.meta);
+                }
+            }
             let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
             buffer.push(RegionOutbound {
                 to: None,
@@ -1270,10 +1790,9 @@ fn dispatch(
                 bodies: Vec::new(),
                 events: vec![RegionEvent::BlockPlaced {
                     addr,
-                    x: tx,
-                    y: ty,
-                    z: tz,
-                    id,
+                    origin: target,
+                    cells,
+                    item,
                     ok,
                 }],
                 chunks_complete: false,
@@ -1323,7 +1842,110 @@ fn dispatch(
             view_distance,
         } => {
             // 视野按新位置重建 区块队列重新排队
-            players.insert(addr, RegionPlayer::new(player.state, view_distance));
+            let mut fresh = RegionPlayer::new(player.state, view_distance);
+            // 传送后的纠正标记要跟着走 否则落地第一包就被旧坐标盖掉
+            fresh.force_position = player.force_position;
+            players.insert(addr, fresh);
+        }
+        // 服务端发起的传送 照搬 Nukkit Player.teleport
+        // 顺序固定：先让客户端知道落点 再改权威坐标与区块队列 最后处理跨分片
+        RegionMsg::Teleport {
+            addr,
+            position,
+            yaw,
+            pitch,
+        } => {
+            let Some(player) = players.get(&addr) else {
+                return true;
+            };
+            // 出生流程自己会把位置摆好 没出生不接受传送
+            if !player.state.spawned {
+                return true;
+            }
+            let eid = player.state.eid;
+            // 权威坐标与下发队列 传送后视野整个重排 朝新位置补区块
+            {
+                let player = players.get_mut(&addr).expect("刚刚查过");
+                player.state.position = position;
+                player.state.yaw = yaw;
+                player.state.pitch = pitch;
+                player.view.update(position, view_distance);
+                // 在途的旧移动包还在路上 到位前一律按落点纠正
+                player.force_position = Some(position);
+            }
+
+            // 跨分片走和玩家自己走过去同一条两段式 目标分片接管并重建视野
+            let new_region =
+                RegionId::of_block(position.0.floor() as i32, position.2.floor() as i32);
+            let (owner, state) = if new_region == id {
+                (id, players[&addr].state.clone())
+            } else {
+                let moved = players.remove(&addr).expect("刚刚查过");
+                let delivered = registry.lookup(new_region).is_some_and(|target| {
+                    target
+                        .send(RegionMsg::Transfer {
+                            addr,
+                            player: Box::new(moved.clone()),
+                            view_distance,
+                        })
+                        .is_ok()
+                });
+                let state = moved.state.clone();
+                if delivered {
+                    (new_region, state)
+                } else {
+                    warn!(
+                        region_x = id.x,
+                        region_z = id.z,
+                        target_x = new_region.x,
+                        target_z = new_region.z,
+                        "传送目标分片不可用 玩家留在本分片"
+                    );
+                    players.insert(addr, moved);
+                    (id, state)
+                }
+            };
+
+            // 落点与归属放进同一批 全局镜像不会晚一拍才更新
+            let reset = MovePlayerPacket::teleport(0, position, yaw, pitch).encode();
+            push_outbound(
+                outbound,
+                RegionOutbound {
+                    to: Some(addr),
+                    skip: None,
+                    around: None,
+                    bodies: vec![reset],
+                    events: vec![RegionEvent::PlayerRegion {
+                        addr,
+                        region: owner,
+                        state: Box::new(state),
+                    }],
+                    chunks_complete: false,
+                },
+            );
+            // 附近的人只收位移 不用重新 spawn 一次
+            let moved = MoveEntityPacket {
+                entries: vec![MoveEntityEntry {
+                    eid,
+                    // 0.14 客户端把移动包里的 y 当眼睛位置
+                    position: (position.0, position.1 + EYE_HEIGHT, position.2),
+                    yaw,
+                    head_yaw: yaw,
+                    pitch,
+                }],
+            }
+            .encode();
+            push_outbound(
+                outbound,
+                RegionOutbound {
+                    to: None,
+                    skip: Some(addr),
+                    around: Some((position, view_radius_blocks(view_distance))),
+                    bodies: vec![moved],
+                    events: Vec::new(),
+                    chunks_complete: false,
+                },
+            );
         }
         // 包在属主分片里消费 状态与广播都在这里落地
         RegionMsg::HandlePacket {
@@ -1375,6 +1997,8 @@ fn dispatch(
         }
         // 光照算完了 写回缓存 让等它的玩家重新排队下发
         RegionMsg::LightDone { receipt } => {
+            // 一个任务一份回执 停机 drain 靠这个计数等所有在途任务落地
+            *light_in_flight = light_in_flight.saturating_sub(1);
             let keys: Vec<(i32, i32)> =
                 receipt.chunks.iter().map(|data| (data.x, data.z)).collect();
             manager.apply_light_receipt(receipt);
@@ -1440,8 +2064,8 @@ mod tests {
         loop {
             for item in region.drain_outbound() {
                 for event in item.events {
-                    if let RegionEvent::BlockBroken { id, .. } = event {
-                        return id;
+                    if let RegionEvent::BlockBroken { id, ok, .. } = event {
+                        return if ok { Some(id) } else { None };
                     }
                 }
             }
@@ -1474,10 +2098,77 @@ mod tests {
         }
     }
 
+    // 同一 tick 里连挖两格 第二下排队到下一个允许的 tick 而不是拒掉
+    // 拒掉会让客户端本地已删的方块回弹 所以这里必须等到成功回执
+    #[test]
+    fn digging_needs_two_ticks_between_breaks() {
+        let region = spawn_flat(0, 0);
+        let addr: std::net::SocketAddr = "127.0.0.1:50097".parse().unwrap();
+        // 节流状态挂在玩家身上 分片里得先有这个人
+        region.join(addr, player_at((0.5, 5.0, 0.5), crate::config::DEFAULT_VIEW_DISTANCE));
+        region.break_block_for(addr, 0, 4, 0);
+        region.break_block_for(addr, 1, 4, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen: Vec<(i32, bool, u8)> = Vec::new();
+        while seen.len() < 2 {
+            for item in region.drain_outbound() {
+                for event in item.events {
+                    if let RegionEvent::BlockBroken { x, id, ok, .. } = event {
+                        seen.push((x, ok, id));
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "挖掘没有回执");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 第一下立刻生效
+        assert_eq!(seen[0], (0, true, GRASS));
+        // 第二下排队两拍后照样挖掉 客户端不会看到回弹
+        assert_eq!(seen[1], (1, true, GRASS));
+        assert_eq!(region.block(1, 4, 0), 0);
+    }
+
     fn player_at(position: (f32, f32, f32), radius: i32) -> RegionPlayer {
         let mut state = PlayerState::default();
         state.position = position;
         RegionPlayer::new(state, radius)
+    }
+
+    // 停机 drain：还没照亮就发生的编辑不能在退线程时丢掉
+    // 这里直接调 stop_drain 因为走完整分片时异步光照往往已经先算完了
+    #[test]
+    fn stop_drain_flushes_edits_on_unlit_chunks() {
+        use crate::level::chunk_loader::ChunkLoader;
+
+        let path = std::env::temp_dir().join(format!(
+            "mojor-drain-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let loader = Arc::new(ChunkLoader::open(&path).unwrap());
+        let mut manager = ChunkManager::with_shared_loader(loader.clone());
+
+        // 生成区块并挖掉一格 这时光照还没算 lit=false
+        assert_eq!(manager.block(0, 4, 0), GRASS);
+        assert_eq!(manager.break_block(0, 4, 0), Some(GRASS));
+        assert!(!manager.is_lit(0, 0));
+
+        let light = LightService::start();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut in_flight = 0;
+        stop_drain(&mut manager, &light, &tx, &rx, &mut in_flight);
+        assert_eq!(in_flight, 0, "回执都该收完");
+
+        // 重新打开存档确认落的是挖过之后的方块
+        let mut reopened = ChunkManager::with_shared_loader(loader);
+        assert_eq!(reopened.block(0, 4, 0), 0, "停机前没等到光照 编辑丢了");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1489,6 +2180,186 @@ mod tests {
         assert_eq!(region.block(0, 4, 0), 0);
         // 已经是空气 再挖一次没有东西
         assert_eq!(break_and_wait(&region, 0, 4, 0), None);
+    }
+
+    // 门是两格 下半朝向下半 8 上半只有 0x08 两格都要落盘且都带 meta
+    #[test]
+    fn door_writes_two_cells_with_meta() {
+        let region = spawn_flat(0, 0);
+        assert_eq!(region.block(0, 4, 0), GRASS);
+
+        let cells = crate::block::placement::Placement {
+            first: crate::block::placement::Cell {
+                dx: 0,
+                dy: 0,
+                dz: 0,
+                id: crate::level::generator::blocks::WOOD_DOOR_BLOCK,
+                meta: 2,
+            },
+            second: Some(crate::block::placement::Cell {
+                dx: 0,
+                dy: 1,
+                dz: 0,
+                id: crate::level::generator::blocks::WOOD_DOOR_BLOCK,
+                meta: 0x08,
+            }),
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:50096".parse().unwrap();
+        region.place_cells_for(addr, (0, 4, 0), (0, 5, 0), cells);
+        // 等回执
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut done = false;
+            for item in region.drain_outbound() {
+                for event in item.events {
+                    if let RegionEvent::BlockPlaced { ok, .. } = event {
+                        assert!(ok);
+                        done = true;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "放置没有回执");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(region.block(0, 5, 0), crate::level::generator::blocks::WOOD_DOOR_BLOCK);
+        assert_eq!(region.block(0, 6, 0), crate::level::generator::blocks::WOOD_DOOR_BLOCK);
+        assert_eq!(region.meta(0, 5, 0), 2);
+        assert_eq!(region.meta(0, 6, 0), 0x08);
+    }
+
+    fn door_cells(meta: u8) -> crate::block::placement::Placement {
+        use crate::block::placement::{Cell, Placement};
+        let id = crate::level::generator::blocks::WOOD_DOOR_BLOCK;
+        Placement {
+            first: Cell { dx: 0, dy: 0, dz: 0, id, meta },
+            second: Some(Cell { dx: 0, dy: 1, dz: 0, id, meta: 0x08 }),
+        }
+    }
+
+    // 等一条放置回执
+    fn wait_placed(region: &RegionHandle) -> (bool, crate::block::placement::Placement) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            for item in region.drain_outbound() {
+                for event in item.events {
+                    if let RegionEvent::BlockPlaced { ok, cells, .. } = event {
+                        return (ok, cells);
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "放置没有回执");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // 等一条挖掘回执
+    fn wait_broken(region: &RegionHandle) -> (bool, Option<(i32, i32, i32, u8, u8)>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            for item in region.drain_outbound() {
+                for event in item.events {
+                    if let RegionEvent::BlockBroken { ok, paired, .. } = event {
+                        return (ok, paired);
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "挖掘没有回执");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // 等一条开关门回执
+    fn wait_toggled(region: &RegionHandle) -> (i32, u8) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            for item in region.drain_outbound() {
+                for event in item.events {
+                    if let RegionEvent::DoorToggled { y, meta, .. } = event {
+                        return (y, meta);
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "开关门没有回执");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // 点门开关 翻下半 meta 的 0x04 Nukkit BlockDoor::toggle
+    #[test]
+    fn toggling_door_flips_open_bit() {
+        let region = spawn_flat(0, 0);
+        let addr: std::net::SocketAddr = "127.0.0.1:50110".parse().unwrap();
+        region.place_cells_for(addr, (0, 4, 0), (0, 5, 0), door_cells(0));
+        assert!(wait_placed(&region).0);
+        assert_eq!(region.meta(0, 5, 0), 0);
+
+        // 点下半 开
+        region.toggle_door_for(addr, 0, 5, 0);
+        let (y, meta) = wait_toggled(&region);
+        assert_eq!((y, meta), (5, 0x04));
+        assert_eq!(region.meta(0, 5, 0), 0x04);
+
+        // 再点一次 关
+        region.toggle_door_for(addr, 0, 5, 0);
+        let (_, meta) = wait_toggled(&region);
+        assert_eq!(meta, 0);
+        assert_eq!(region.meta(0, 5, 0), 0);
+    }
+
+    // 点上半也是翻下半 回执报告的是下半坐标 Nukkit BlockDoor::toggle
+    #[test]
+    fn toggling_door_upper_half_targets_lower() {
+        let region = spawn_flat(0, 0);
+        let addr: std::net::SocketAddr = "127.0.0.1:50111".parse().unwrap();
+        region.place_cells_for(addr, (0, 4, 0), (0, 5, 0), door_cells(0));
+        assert!(wait_placed(&region).0);
+
+        region.toggle_door_for(addr, 0, 6, 0);
+        let (y, meta) = wait_toggled(&region);
+        assert_eq!((y, meta), (5, 0x04));
+        assert_eq!(region.meta(0, 5, 0), 0x04);
+    }
+
+    // 铰链侧已经有门 第二扇的上半要带 0x01 Nukkit BlockDoor::place
+    #[test]
+    fn door_hinge_follows_neighbor() {
+        let region = spawn_flat(0, 0);
+        let addr: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
+        // 朝向 0(南) 铰链侧是北 z-1 第一扇放 (3,5,3) 正好在第二扇 (3,5,4) 的铰链侧
+        // 都放在 chunk 0 内 跨分片的目标格 placeable 会拒
+        region.place_cells_for(addr, (3, 4, 3), (3, 5, 3), door_cells(0));
+        assert!(wait_placed(&region).0);
+        region.place_cells_for(addr, (3, 4, 4), (3, 5, 4), door_cells(0));
+        let (ok, cells) = wait_placed(&region);
+
+        assert!(ok);
+        assert_eq!(cells.second.unwrap().meta, 0x08 | 0x01);
+        assert_eq!(region.meta(3, 6, 3), 0x08);
+        assert_eq!(region.meta(3, 6, 4), 0x08 | 0x01);
+    }
+
+    // 拆门的任意一半 另一半也要拆掉 Nukkit BlockDoor::onBreak
+    #[test]
+    fn breaking_door_removes_both_halves() {
+        let region = spawn_flat(0, 0);
+        let addr: std::net::SocketAddr = "127.0.0.1:50101".parse().unwrap();
+        region.place_cells_for(addr, (0, 4, 0), (0, 5, 0), door_cells(0));
+        assert!(wait_placed(&region).0);
+
+        region.break_block_for(addr, 0, 5, 0);
+        let (ok, paired) = wait_broken(&region);
+
+        assert!(ok);
+        assert_eq!(
+            paired,
+            Some((0, 6, 0, crate::level::generator::blocks::WOOD_DOOR_BLOCK, 0x08))
+        );
+        assert_eq!(region.block(0, 5, 0), 0);
+        assert_eq!(region.block(0, 6, 0), 0);
     }
 
     #[test]

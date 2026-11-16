@@ -23,6 +23,8 @@ pub const DEAD_BUSH: u8 = 32;
 pub const DANDELION: u8 = 37;
 pub const RED_FLOWER: u8 = 38;
 pub const DIAMOND_ORE: u8 = 56;
+pub const FURNACE: u8 = 61;
+pub const BURNING_FURNACE: u8 = 62;
 pub const REDSTONE_ORE: u8 = 73;
 pub const SNOW_LAYER: u8 = 78;
 pub const ICE: u8 = 79;
@@ -32,6 +34,53 @@ pub const WATER_LILY: u8 = 111;
 pub const LEAVES2: u8 = 161;
 pub const LOG2: u8 = 162;
 pub const DOUBLE_PLANT: u8 = 175;
+
+// 放置对照表用到的方块 id 与 BlockIds.php 一致
+pub const BED_BLOCK: u8 = 26;
+pub const SLAB: u8 = 44;
+pub const TORCH: u8 = 50;
+pub const REDSTONE_WIRE: u8 = 55;
+pub const WHEAT_BLOCK: u8 = 59;
+pub const SIGN_POST: u8 = 63;
+pub const WOOD_DOOR_BLOCK: u8 = 64;
+pub const WALL_SIGN: u8 = 68;
+pub const IRON_DOOR_BLOCK: u8 = 71;
+pub const CAKE_BLOCK: u8 = 92;
+pub const PUMPKIN_STEM: u8 = 104;
+pub const MELON_STEM: u8 = 105;
+pub const BREWING_STAND_BLOCK: u8 = 117;
+pub const CAULDRON_BLOCK: u8 = 118;
+pub const FLOWER_POT_BLOCK: u8 = 140;
+pub const CARROT_BLOCK: u8 = 141;
+pub const POTATO_BLOCK: u8 = 142;
+pub const SKULL_BLOCK: u8 = 144;
+pub const WOOD_SLAB: u8 = 158;
+pub const RED_SANDSTONE_SLAB: u8 = 182;
+pub const SPRUCE_DOOR_BLOCK: u8 = 193;
+pub const BIRCH_DOOR_BLOCK: u8 = 194;
+pub const JUNGLE_DOOR_BLOCK: u8 = 195;
+pub const ACACIA_DOOR_BLOCK: u8 = 196;
+pub const DARK_OAK_DOOR_BLOCK: u8 = 197;
+pub const BEETROOT_BLOCK: u8 = 244;
+
+// 挖不动的方块 与 Nukkit Block::isBreakable 一致 0.14 里只有基岩
+pub fn is_breakable(id: u8) -> bool {
+    id != BEDROCK
+}
+
+// 双格门 上下两半是同一个 id 拆一边要连带另一边
+pub fn is_door(id: u8) -> bool {
+    matches!(
+        id,
+        WOOD_DOOR_BLOCK
+            | IRON_DOOR_BLOCK
+            | SPRUCE_DOOR_BLOCK
+            | BIRCH_DOOR_BLOCK
+            | JUNGLE_DOOR_BLOCK
+            | ACACIA_DOOR_BLOCK
+            | DARK_OAK_DOOR_BLOCK
+    )
+}
 
 // 树干元数据 与 BlockWood 一致
 pub const WOOD_OAK: u8 = 0;

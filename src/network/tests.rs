@@ -10,7 +10,7 @@ use crate::network::protocol::pid::{
     ADD_ITEM_ENTITY, PLAY_STATUS, PLAYER_LIST, REMOVE_ENTITY, REMOVE_PLAYER, RESPAWN,
     SET_DIFFICULTY, TEXT,
     SET_PLAYER_GAMETYPE, SET_SPAWN_POSITION, SET_TIME, START_GAME, TAKE_ITEM_ENTITY,
-    UPDATE_ATTRIBUTES, UPDATE_BLOCK,
+    LEVEL_EVENT, UPDATE_ATTRIBUTES, UPDATE_BLOCK, CRAFTING_DATA,
 };
 use crate::network::protocol::text::TYPE_RAW;
 use crate::entity::player::{FLAG_SNEAKING, FLAG_SPRINTING};
@@ -127,18 +127,23 @@ fn chat_packet(message: &str) -> Vec<u8> {
     w.freeze().to_vec()
 }
 
+// 空闲窗口 2s 会跨过世界时间的 200 tick 同步周期
+// 周期性的 SetTime 是背景噪声 不该混进"这次操作发了什么包"的断言里
+// 关心时间同步的用例直接用 bodies_of 看原始包
+fn without_periodic(ids: impl Iterator<Item = u8>) -> Vec<u8> {
+    ids.filter(|id| *id != SET_TIME).collect()
+}
+
 fn packet_ids(commands: &[SendCmd]) -> Vec<u8> {
-    commands
-        .iter()
-        .flat_map(|cmd| bodies(cmd).iter().map(|body| body[0]).collect::<Vec<_>>())
-        .collect()
+    without_periodic(
+        commands
+            .iter()
+            .flat_map(|cmd| bodies(cmd).iter().map(|body| body[0]).collect::<Vec<_>>()),
+    )
 }
 
 fn packet_ids_of(commands: &[SendCmd], target: SocketAddr) -> Vec<u8> {
-    bodies_of(commands, target)
-        .iter()
-        .map(|body| body[0])
-        .collect()
+    without_periodic(bodies_of(commands, target).iter().map(|body| body[0]))
 }
 
 fn bodies_of(commands: &[SendCmd], target: SocketAddr) -> Vec<Bytes> {
@@ -163,21 +168,128 @@ async fn spawn_two(gamemode: u8) -> (NetworkState, SocketAddr, SocketAddr) {
     (state, alice, bob)
 }
 
+// 挖不动的时候(基岩) 客户端可能已经把这格本地删了 只给他本人补一条方块更新
+#[tokio::test]
+async fn refused_break_restores_block_for_breaker_only() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_CREATIVE).await;
+    let mut out = Vec::new();
+    state.on_region_event(
+        crate::level::actor::RegionEvent::BlockBroken {
+            addr: alice,
+            x: 0,
+            y: 1,
+            z: 0,
+            id: crate::level::generator::blocks::BEDROCK,
+            meta: 0,
+            ok: false,
+            paired: None,
+        },
+        &mut out,
+    );
+
+    // 只有挖的人收包 旁观者不该看到任何变化
+    assert_eq!(packet_ids(&out), vec![UPDATE_BLOCK]);
+    assert!(bodies_of(&out, bob).is_empty());
+    let bodies = bodies_of(&out, alice);
+    assert_eq!(bodies.len(), 1);
+    // 0 pid | 1..5 count | 5..9 x | 9..13 z | 13 y | 14 id | 15 flags|meta
+    assert_eq!(bodies[0][14], crate::level::generator::blocks::BEDROCK);
+}
+
+// 拆门的两半 两格都要广播空气与碎屑 旁观者也看得见
+#[tokio::test]
+async fn paired_door_break_broadcasts_both_cells() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_CREATIVE).await;
+    let mut out = Vec::new();
+    state.on_region_event(
+        crate::level::actor::RegionEvent::BlockBroken {
+            addr: alice,
+            x: 0,
+            y: 5,
+            z: 0,
+            id: crate::level::generator::blocks::WOOD_DOOR_BLOCK,
+            meta: 0,
+            ok: true,
+            paired: Some((0, 6, 0, crate::level::generator::blocks::WOOD_DOOR_BLOCK, 0x08)),
+        },
+        &mut out,
+    );
+
+    // 两个已出生玩家 每格各收一条方块更新与碎屑
+    assert_eq!(
+        packet_ids(&out),
+        vec![
+            UPDATE_BLOCK, UPDATE_BLOCK, UPDATE_BLOCK, UPDATE_BLOCK, LEVEL_EVENT, LEVEL_EVENT,
+            LEVEL_EVENT, LEVEL_EVENT
+        ]
+    );
+    assert_eq!(bodies_of(&out, alice).len(), 4);
+    assert_eq!(bodies_of(&out, bob).len(), 4);
+}
+
+// 开关门 新 meta 和音效都要广播给视野内的人 旁观者也看得见
+#[tokio::test]
+async fn toggling_door_broadcasts_state_and_sound() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_CREATIVE).await;
+    let mut out = Vec::new();
+    state.on_region_event(
+        crate::level::actor::RegionEvent::DoorToggled {
+            addr: alice,
+            x: 0,
+            y: 5,
+            z: 0,
+            id: crate::level::generator::blocks::WOOD_DOOR_BLOCK,
+            meta: 0x04,
+        },
+        &mut out,
+    );
+
+    // 先全员方块更新 再全员门音效 每人各一条
+    assert_eq!(
+        packet_ids(&out),
+        vec![UPDATE_BLOCK, UPDATE_BLOCK, LEVEL_EVENT, LEVEL_EVENT]
+    );
+    assert_eq!(bodies_of(&out, alice).len(), 2);
+    assert_eq!(bodies_of(&out, bob).len(), 2);
+    // 音效的 evid 是 1003 小端写在 1..3
+    let sound = bodies_of(&out, alice)
+        .into_iter()
+        .find(|b| b[0] == LEVEL_EVENT)
+        .unwrap();
+    assert_eq!(&sound[1..3], &1003i16.to_be_bytes());
+}
+
 // 挖方块要改服务端世界 并在原位生成掉落物
 #[tokio::test]
 async fn digging_updates_world_and_spawns_drop() {
-    let (mut state, alice, _) = spawn_two(GAMEMODE_SURVIVAL).await;
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
     assert_eq!(state.block_at(0, 4, 0), crate::level::generator::flat::GRASS);
 
     // 挖掘交给属主分片去做 结果以事件回来
     state.handle_game_packet(alice, &remove_block(0, 4, 0));
-    let commands = pump(&mut state).await;
+    // 两个人都先挪开 长窗口里掉落物会被脚底下的玩家捡走
+    state.players.get_mut(&alice).unwrap().position = (0.5, 5.0, 8.5);
+    state.players.get_mut(&bob).unwrap().position = (20.5, 5.0, 20.5);
+    // 掉落物一出现就收手 再等物理就把它推走了
+    let commands = pump_until(&mut state, |ids| {
+        ids.iter().filter(|id| **id == ADD_ITEM_ENTITY).count() >= 2
+    })
+    .await;
     assert_eq!(state.block_at(0, 4, 0), 0);
-    // 两个已出生玩家各收方块更新与掉落物 背包不再立刻刷新
+    // 两个已出生玩家各收方块更新与破坏碎屑 再各收一份掉落物
     assert_eq!(
         packet_ids(&commands),
-        vec![UPDATE_BLOCK, UPDATE_BLOCK, ADD_ITEM_ENTITY, ADD_ITEM_ENTITY]
+        vec![
+            UPDATE_BLOCK,
+            UPDATE_BLOCK,
+            LEVEL_EVENT,
+            LEVEL_EVENT,
+            ADD_ITEM_ENTITY,
+            ADD_ITEM_ENTITY
+        ]
     );
+    // 掉落物镜像是每 tick 的快照 可能比实体包晚一拍
+    wait_for_drop(&mut state).await;
     assert_eq!(state.drops.len(), 1);
     assert!(state.players[&alice].inventory[0].is_none());
 }
@@ -234,6 +346,57 @@ async fn edited_block_survives_reload() {
     let _ = std::fs::remove_file(&path);
 }
 
+// 区块刚生成、光照还没回执就退出 编辑也不能丢
+// 分片停机必须先 drain 在途光照 否则 lit=false 的区块会被 flush 跳过
+#[tokio::test]
+async fn edit_before_light_done_survives_logout() {
+    let path = std::env::temp_dir().join(format!(
+        "mojor-net-drain-{}-{}.redb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    {
+        let mut state = NetworkState::with_loader(
+            GAMEMODE_SURVIVAL,
+            ChunkLoader::open(&path).unwrap(),
+            Generator::flat(),
+            0,
+            DEFAULT_VIEW_DISTANCE,
+            1,
+            "world".to_string(),
+        );
+        let alice = peer(50005);
+        state.handle_game_packet(alice, &login_packet_for("alice", [0x55; 16]));
+        drain_by_peer(&mut state).await;
+
+        // 走远 让属主现场生成一批还没照亮的新区块
+        state.handle_game_packet(alice, &move_player(10.5, 5.0, 40.5));
+        // 新区块的方块可以挖 只校验距离 不要求已经 lit
+        state.handle_game_packet(alice, &remove_block(10, 4, 40));
+        // 不 drain：光照回执还没回来就撤分片 停机路径要先 drain 再落盘
+        state.on_session_closed(0, &alice, "Disconnected");
+    }
+
+    {
+        let mut state = NetworkState::with_loader(
+            GAMEMODE_SURVIVAL,
+            ChunkLoader::open(&path).unwrap(),
+            Generator::flat(),
+            0,
+            DEFAULT_VIEW_DISTANCE,
+            1,
+            "world".to_string(),
+        );
+        assert_eq!(state.block_at(10, 4, 40), 0, "停机前没等到光照 编辑丢了");
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // 掉落物从方块中心上抛再落地 站在上层够不到 掉进坑里才捡得到
 #[tokio::test]
 async fn drop_lands_then_is_picked_up() {
@@ -245,8 +408,8 @@ async fn drop_lands_then_is_picked_up() {
     state.handle_game_packet(alice, &remove_block(0, 4, 0));
     // 先挪开 避免掉落物一出现就被捡走
     state.players.get_mut(&alice).unwrap().position = (0.5, 5.0, 8.5);
-    // 挖掘在分片线程里完成 等掉落物出现
-    drain_by_peer(&mut state).await;
+    // 挖掘在分片线程里完成 掉落物一出现就读 等长窗口物理已经落地了
+    wait_for_drop(&mut state).await;
     // 与 Nukkit 一致 掉落物从方块中心起步 这时已经被物理推上去一点
     let (x, y, z) = state.drops[0].position;
     assert_eq!((x, z), (0.5, 0.5));
@@ -317,8 +480,11 @@ async fn creative_digging_has_no_drop() {
     state.handle_game_packet(alice, &remove_block(0, 4, 0));
     let commands = pump(&mut state).await;
     assert_eq!(state.block_at(0, 4, 0), 0);
-    // 每个已出生玩家只收方块更新
-    assert_eq!(packet_ids(&commands), vec![UPDATE_BLOCK, UPDATE_BLOCK]);
+    // 每个已出生玩家收方块更新与破坏碎屑 创造不掉落
+    assert_eq!(
+        packet_ids(&commands),
+        vec![UPDATE_BLOCK, UPDATE_BLOCK, LEVEL_EVENT, LEVEL_EVENT]
+    );
 }
 
 // 聊天广播给所有已出生玩家 来源以服务端记录的用户名为准
@@ -365,11 +531,26 @@ async fn chat_before_spawn_is_ignored() {
 async fn placing_block_targets_clicked_face() {
     // 创造模式不扣物品 才能单独验证放置位置
     let (mut state, alice, _) = spawn_two(GAMEMODE_CREATIVE).await;
-    // 点击 (0,4,0) 的上表面 石头放到 (0,5,0)
-    state.handle_game_packet(alice, &use_item(0, 4, 0, 1, 1));
+    // 点击 (2,4,2) 的上表面 石头放到 (2,5,2) 避开玩家身体
+    state.handle_game_packet(alice, &use_item(2, 4, 2, 1, 1));
     // 放置交给属分片去做 等结果回来
     drain_by_peer(&mut state).await;
-    assert_eq!(state.block_at(0, 5, 0), 1);
+    assert_eq!(state.block_at(2, 5, 2), 1);
+}
+
+// 固体方块不能放进自己身体里 站在 (0.5,5,0.5) 往脚下放会被拒
+#[tokio::test]
+async fn placing_into_own_body_is_rejected() {
+    let (mut state, alice, _) = spawn_two(GAMEMODE_CREATIVE).await;
+    // 点 (0,4,0) 上表面 目标 (0,5,0) 正是玩家站着的那一格
+    let commands = state.handle_game_packet(alice, &use_item(0, 4, 0, 1, 1));
+
+    assert_eq!(state.block_at(0, 5, 0), 0);
+    // 客户端已经在本地摆上了 只回一条空气把它撤掉
+    assert_eq!(
+        without_periodic(packet_ids(&commands).into_iter()),
+        vec![UPDATE_BLOCK]
+    );
 }
 
 // 生存模式背包里没有方块就不能放
@@ -403,6 +584,10 @@ async fn placing_consumes_item_from_inventory() {
         Some(2)
     );
 
+    // 走开一点 否则是往自己脚下放 会被身体碰撞挡住
+    // 用移动包而不是直接改字段 分片里的位置才会跟着变
+    state.handle_game_packet(alice, &move_player(0.5, 5.0, 3.5));
+    drain_by_peer(&mut state).await;
     // 点 (0,3,0) 上表面 把草放回 (0,4,0)
     let commands = state.handle_game_packet(alice, &use_item(0, 3, 0, 1, 2));
     // 背包在投递时就扣掉了 刷新包也在那时发出
@@ -459,8 +644,8 @@ async fn login_returns_initial_sequence() {
     assert_eq!(commands.len(), 2);
 
     let packets = game_bodies(&commands);
-    // 8 个登录包 半径更新照 Nukkit 等客户端请求再回 不在登录批次里
-    assert_eq!(packets.len(), 8);
+    // 9 个登录包 末尾是配方表 半径更新照 Nukkit 等客户端请求再回
+    assert_eq!(packets.len(), 9);
     assert_eq!(packets[0][0], PLAY_STATUS);
     assert_eq!(packets[1][0], START_GAME);
     assert_eq!(packets[2][0], SET_TIME);
@@ -469,6 +654,7 @@ async fn login_returns_initial_sequence() {
     assert_eq!(packets[5][0], SET_DIFFICULTY);
     assert_eq!(packets[6][0], SET_PLAYER_GAMETYPE);
     assert_eq!(packets[7][0], ADVENTURE_SETTINGS);
+    assert_eq!(packets[8][0], CRAFTING_DATA);
 
     // 默认生存：StartGame 的 gamemode 字段为 0 且不给飞行权限
     assert_eq!(i32::from_be_bytes(packets[1][10..14].try_into().unwrap()), 0);
@@ -498,8 +684,10 @@ async fn repeated_login_is_ignored() {
 }
 
 // 区块由 region 线程按自己的周期推进 连续这么多轮空 tick 才认为真的没活了
-// 光照异步化后首批区块要等 worker 回执（1-2 个 region tick） 空闲窗口放宽到 600ms
-const IDLE_POLLS: usize = 30;
+// 空 bodies 的回执会被网络层丢掉 所以只能靠静默超时判断
+// 窗口 2s：光照 worker 在 CPU 争抢时回执间隔可能远超 600ms，宁可多等
+// 有产出就重置 所以只影响真的卡住的情形
+const IDLE_POLLS: usize = 100;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 // 反复 tick 直到 region 线程连续几轮没有产出 期间的下行全部收下
@@ -517,6 +705,55 @@ async fn pump(state: &mut NetworkState) -> Vec<SendCmd> {
         }
     }
     out
+}
+
+// 掉落物一出现就读 不能等 pump 的长窗口：
+// 12 个 region tick 足够物理把它推到地面 初相位断言就失效了
+async fn wait_for_drop(state: &mut NetworkState) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while state.drops.is_empty() {
+        state.tick().await;
+        assert!(std::time::Instant::now() < deadline, "掉落物没有出现");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// 玩家存档是后台线程落盘 并发跑测试时可能晚几拍 轮询等它出现
+async fn wait_player_data(dir: &std::path::Path, uuid: Uuid, name: &str) -> PlayerData {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(data) = PlayerData::load(dir, uuid, name) {
+            return data;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "玩家存档一直没落盘：{name}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// 收到想要的包就收手 不等空闲窗口
+// 窗口拉长之后掉落物可能已经被捡走 再多等只会把后续拾取包也收进来
+async fn pump_until(state: &mut NetworkState, want: impl Fn(&[u8]) -> bool) -> Vec<SendCmd> {
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let commands = state.tick().await;
+        if !commands.is_empty() {
+            out.extend(commands);
+            let ids = packet_ids(&out);
+            if want(&ids) {
+                return out;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等不到期望的包：{:?}",
+            packet_ids(&out)
+        );
+        tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+    }
 }
 
 // 实体 tick 在 region 线程按自己的周期跑 测试要按真实时间推进
@@ -538,7 +775,8 @@ async fn drain(state: &mut NetworkState) -> (Vec<Bytes>, Vec<u8>) {
         for packet in bodies(cmd) {
             if packet[0] == FULL_CHUNK_DATA {
                 chunks.push(packet.clone());
-            } else {
+            } else if packet[0] != SET_TIME {
+                // 长空闲窗口会撞上世界时间同步 不是这批断言关心的
                 others.push(packet[0]);
             }
         }
@@ -863,7 +1101,8 @@ async fn moving_streams_new_chunks_only() {
 
     // 同一位置再上报不应重复下发
     state.handle_game_packet(addr(), &move_player(16.5, 5.0, 0.5));
-    assert!(state.tick().await.is_empty());
+    let extra = packet_ids(&state.tick().await);
+    assert!(extra.is_empty(), "同一位置不该再下发：{extra:?}");
 }
 
 // tick 产生的下行按目标地址聚合包 id
@@ -873,9 +1112,11 @@ async fn drain_by_peer(state: &mut NetworkState) -> HashMap<SocketAddr, Vec<u8>>
         let SendCmd::GamePackets { addr, bodies } = cmd else {
             continue;
         };
-        let entry = out.entry(*addr).or_default();
+        let entry: &mut Vec<u8> = out.entry(*addr).or_default();
         for body in bodies {
-            entry.push(body[0]);
+            if body[0] != SET_TIME {
+                entry.push(body[0]);
+            }
         }
     }
     out
@@ -1344,6 +1585,54 @@ async fn spawn_point_lands_on_land() {
     let _ = std::fs::remove_file(&path);
 }
 
+// RTG 地形下出生点也要脚踩实体上方是空气
+#[tokio::test]
+async fn spawn_point_lands_on_land_rtg() {
+    let path = std::env::temp_dir().join(format!(
+        "mojor-spawn-rtg-{}-{}.redb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut state = NetworkState::with_loader(
+        GAMEMODE_SURVIVAL,
+        ChunkLoader::open(&path).unwrap(),
+        Generator::realistic(1337),
+        1337,
+        DEFAULT_VIEW_DISTANCE,
+        1,
+        "world".to_string(),
+    );
+    let (block, _) = state.spawn_point();
+    let (x, y, z) = block;
+    assert_eq!(state.block_at(x, y, z), 0, "出生格不是空气: {block:?}");
+    assert_ne!(state.block_at(x, y - 1, z), 0, "脚下不是实体: {block:?}");
+    assert_eq!(state.block_at(x, y + 1, z), 0, "头顶不是空气: {block:?}");
+
+    // 下发给客户端的实体 y 要带眼睛高度 否则玩家会被埋进地里约两格
+    use crate::network::protocol::move_player::EYE_HEIGHT;
+    use crate::network::protocol::login::LoginPacket;
+    let login = LoginPacket::decode(&login_packet()[1..]).unwrap();
+    let packets = crate::network::login::login_sequence(
+        &login,
+        GAMEMODE_SURVIVAL,
+        1337,
+        block,
+        (x as f32 + 0.5, y as f32, z as f32 + 0.5),
+        &crate::level::WorldTime::default(),
+    );
+    let start_game = &packets[1];
+    assert_eq!(start_game[0], START_GAME);
+    let sent_y = f32::from_be_bytes(start_game[38..42].try_into().unwrap());
+    assert!(
+        (sent_y - (y as f32 + EYE_HEIGHT)).abs() < 0.01,
+        "StartGame 的 y 没带眼睛高度: {sent_y}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 // 出生点选点耗时 33x33 列现在一次批量取回 不再逐列跨线程
 #[tokio::test]
 #[ignore]
@@ -1365,6 +1654,19 @@ fn creative_spawn_sends_creative_inventory() {
     assert!(
         pkts.iter()
             .any(|b| b[0] == CONTAINER_SET_CONTENT && b[1] == SPECIAL_CREATIVE)
+    );
+}
+
+// 出生时的 Respawn 包 y 也要带眼睛高度 否则 StartGame 抬起后又被拉回地下
+#[test]
+fn spawn_respawn_carries_eye_height() {
+    use crate::network::protocol::move_player::EYE_HEIGHT;
+    let pkts = spawn_sequence((0.0, 4.0, 0.0), GAMEMODE_SURVIVAL);
+    let respawn = pkts.iter().find(|b| b[0] == RESPAWN).unwrap();
+    let sent_y = f32::from_be_bytes(respawn[5..9].try_into().unwrap());
+    assert!(
+        (sent_y - (4.0 + EYE_HEIGHT)).abs() < 0.01,
+        "Respawn 的 y 没带眼睛高度: {sent_y}"
     );
 }
 
@@ -1407,11 +1709,8 @@ async fn player_data_persists_across_sessions() {
         let alice = peer(50004);
         state.handle_game_packet(alice, &login_packet_for("alice", [0x44; 16]));
         drain_by_peer(&mut state).await;
-        // 进入即存 登录后立刻应出现 players/alice.dat
-        assert!(
-            PlayerData::load(&dir, login_uuid(0x44), "alice").is_some(),
-            "登录即应写出玩家存档"
-        );
+        // 进入即存 登录后应出现 players/alice.dat
+        wait_player_data(&dir, login_uuid(0x44), "alice").await;
         // move_player 传的是眼睛坐标 存档里记脚下坐标
         state.handle_game_packet(alice, &move_player(12.5, 30.0 + 1.62, -4.5));
         drain_by_peer(&mut state).await;
@@ -1569,8 +1868,6 @@ async fn stale_session_does_not_overwrite_reconnected_save() {
 // 同名的另一台设备带来的是另一个 uuid 只能拿到自己那份存档
 #[tokio::test]
 async fn same_name_different_uuid_gets_own_save() {
-    use crate::entity::PlayerData;
-
     let dir = std::env::temp_dir().join(format!(
         "mojor-uuid-save-{}-{}",
         std::process::id(),
@@ -1603,13 +1900,129 @@ async fn same_name_different_uuid_gets_own_save() {
     state.handle_game_packet(device_b, &login_packet_for("alice", [0xb2; 16]));
     drain_by_peer(&mut state).await;
 
-    let mine = PlayerData::load(&dir, login_uuid(0xb2), "alice").expect("登录即存");
+    let mine = wait_player_data(&dir, login_uuid(0xb2), "alice").await;
     assert!(
         (mine.position.0 - 40.5).abs() > 0.01,
         "同名换 uuid 不能读到别人的坐标"
     );
-    let theirs = PlayerData::load(&dir, login_uuid(0xa1), "alice").expect("原存档还在");
+    let theirs = wait_player_data(&dir, login_uuid(0xa1), "alice").await;
     assert!((theirs.position.0 - 40.5).abs() < 0.01);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 传送落地时客户端要收到 MODE_RESET 落点
+// 服务端内部坐标是脚部 包里要换成客户端用的眼睛高度
+#[tokio::test]
+async fn tp_resets_client_at_destination() {
+    use crate::network::protocol::move_player::{EYE_HEIGHT, MODE_RESET};
+
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let alice = addr();
+    state.handle_game_packet(alice, &login_packet());
+    drain_by_peer(&mut state).await;
+
+    let out = state.handle_game_packet(alice, &chat_packet("/tp 100 20 100"));
+    // 回执照 Nukkit 的 commands.tp.success.coordinates 打给发起者
+    assert!(packet_ids_of(&out, alice).contains(&TEXT));
+    // 镜像立刻跟上 权威位置由属主分片在 tick 里落地
+    assert_eq!(state.players[&alice].position, (100.0, 20.0, 100.0));
+
+    let commands = pump_until(&mut state, |ids| ids.contains(&MOVE_PLAYER)).await;
+    let bodies = bodies_of(&commands, alice);
+    let reset = bodies
+        .iter()
+        .find(|body| body[0] == MOVE_PLAYER)
+        .expect("传送后应下发落点");
+    // 0 pid | 1..9 eid | 9..13 x | 13..17 y | 17..21 z | ... | 33 mode
+    assert_eq!(reset[33], MODE_RESET);
+    let y = f32::from_be_bytes(reset[13..17].try_into().unwrap());
+    assert!(
+        (y - (20.0 + EYE_HEIGHT)).abs() < 0.001,
+        "reset 包的 y 没带眼睛高度: {y}"
+    );
+    assert_eq!(state.players[&alice].position, (100.0, 20.0, 100.0));
+}
+
+// 跨 512 分片边界传送 归属表要跟着换 之后包还要能正常处理
+#[tokio::test]
+async fn tp_across_region_updates_ownership() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let alice = addr();
+    state.handle_game_packet(alice, &login_packet());
+    drain_by_peer(&mut state).await;
+
+    state.handle_game_packet(alice, &chat_packet("/tp 600 20 5"));
+    pump_until(&mut state, |ids| ids.contains(&MOVE_PLAYER)).await;
+
+    assert_eq!(
+        state.player_index[&alice],
+        crate::level::region::RegionId { x: 1, z: 0 }
+    );
+    assert_eq!(state.players[&alice].position, (600.0, 20.0, 5.0));
+
+    // 客户端确认落点 纠正标记解除 随后的正常移动被接受
+    state.handle_game_packet(alice, &move_player(600.0, 20.0 + 1.62, 5.0));
+    state.handle_game_packet(alice, &move_player(600.5, 20.0 + 1.62, 5.5));
+    assert_eq!(state.players[&alice].position, (600.5, 20.0, 5.5));
+}
+
+// 传送前发出的旧移动包不能把玩家拉回原处 照搬 Nukkit 的 forceMovement 纠正
+#[tokio::test]
+async fn stale_move_after_tp_does_not_drag_player_back() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let alice = addr();
+    state.handle_game_packet(alice, &login_packet());
+    drain_by_peer(&mut state).await;
+
+    state.handle_game_packet(alice, &chat_packet("/tp 100 20 100"));
+    pump_until(&mut state, |ids| ids.contains(&MOVE_PLAYER)).await;
+
+    // 还在路上的旧坐标到了 分片要再补一次落点并且不接受
+    let out = state.handle_game_packet(alice, &move_player(8.5, 5.0 + 1.62, 8.5));
+    assert!(
+        packet_ids_of(&out, alice).contains(&MOVE_PLAYER),
+        "旧坐标应触发一次落点纠正"
+    );
+    assert_eq!(state.players[&alice].position, (100.0, 20.0, 100.0));
+
+    // 客户端真正到位的确认包被接受 玩家可以正常移动
+    state.handle_game_packet(alice, &move_player(100.0, 20.0 + 1.62, 100.0));
+    state.handle_game_packet(alice, &move_player(100.5, 20.0 + 1.62, 100.5));
+    assert_eq!(state.players[&alice].position, (100.5, 20.0, 100.5));
+}
+
+// /tps 只读主循环写进来的采样 掉拍时 TPS 要跟着掉 而不是永远报 20
+#[tokio::test]
+async fn tps_command_reads_tick_meter() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    // 一拍都还没跑完时不能报 0 会给标称值加提示
+    let out = state.run_command("/tps");
+    assert_eq!(out.messages[0], "§bServer Health Report");
+    assert!(out.messages[3].contains("no sample yet"), "{}", out.messages[3]);
+
+    // 20 拍满速 每拍只花 1ms
+    for _ in 0..20 {
+        state.record_tick(Duration::from_millis(50), Duration::from_millis(1));
+    }
+    let out = state.run_command("tps");
+    assert!(
+        out.messages[3].contains("§a20.00 TPS") && out.messages[3].contains("1.00/1.00 ms"),
+        "主循环行不对: {}",
+        out.messages[3]
+    );
+
+    // 换一台"卡住"的服务器 100ms 一拍即 10 TPS 要标红
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    for _ in 0..20 {
+        state.record_tick(Duration::from_millis(100), Duration::from_millis(90));
+    }
+    let out = state.run_command("tps");
+    assert!(out.messages[3].contains("§c10.00 TPS"), "{}", out.messages[3]);
+    // 每拍落后 50ms 20 拍累计 1000ms
+    assert!(
+        out.messages[3].contains("lag §a1000 ms"),
+        "lag 统计不对: {}",
+        out.messages[3]
+    );
 }

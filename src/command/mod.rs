@@ -16,7 +16,9 @@ pub(crate) mod tell;
 pub(crate) mod seed;
 pub(crate) mod time;
 pub(crate) mod clear;
-mod special;
+pub(crate) mod teleport;
+pub(crate) mod tps;
+pub(crate) mod top;
 
 pub use version::CommandVersion;
 pub(crate) use stop::CommandStop;
@@ -26,6 +28,9 @@ pub(crate) use say::CommandSay;
 pub(crate) use tell::CommandTell;
 pub(crate) use seed::CommandSeed;
 pub(crate) use time::CommandTime;
+pub(crate) use teleport::TeleportCommand;
+pub(crate) use tps::CommandTps;
+pub(crate) use top::TopCommand;
 
 // 主循环发给 RakNet 层的下行命令
 // 只带游戏包包体 0x8e 前缀由 RakNet 层封装时补 避免多一次整包拷贝
@@ -90,6 +95,9 @@ pub enum Command {
     Tell(CommandTell),
     Seed(CommandSeed),
     Time(CommandTime),
+    Teleport(TeleportCommand),
+    Tps(CommandTps),
+    Top(TopCommand),
     // 参数不对时里面是用法提示 未知命令时是命令名
     Version(CommandVersion),
     Stop(CommandStop),
@@ -140,6 +148,15 @@ fn build_seed(_args: &[&str]) -> Command {
 fn build_time(args: &[&str]) -> Command {
     parse_time(args)
 }
+fn build_tp(args: &[&str]) -> Command {
+    Command::Teleport(TeleportCommand::parse(args))
+}
+fn build_tps(_args: &[&str]) -> Command {
+    Command::Tps(CommandTps::Tps)
+}
+fn build_top(_args: &[&str]) -> Command {
+    Command::Top(TopCommand::Top)
+}
 fn build_version(_args: &[&str]) -> Command {
     Command::Version(CommandVersion::Version)
 }
@@ -168,6 +185,9 @@ pub static COMMANDS: &[CommandDef] = &[
     CommandDef { name: "stop", description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, parse: Some(build_stop) },
     CommandDef { name: "seed", description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, parse: Some(build_seed) },
     CommandDef { name: "time", description: "A Mojang provided command.", args: Args::Subcommands, children: TIME_SUBS, parse: Some(build_time) },
+    CommandDef { name: "tp", description: "Teleports the given player (or yourself) to another player or coordinates", args: Args::Free, children: NO_ARGS, parse: Some(build_tp) },
+    CommandDef { name: "tps", description: "Shows the server TPS and MSPT", args: Args::None, children: NO_ARGS, parse: Some(build_tps) },
+    CommandDef { name: "top", description: "Shows CPU, memory and tick statistics", args: Args::None, children: NO_ARGS, parse: Some(build_top) },
     CommandDef { name: "version", description: "Gets the version of this server including any plugins in use", args: Args::None, children: NO_ARGS, parse: Some(build_version) },
     // ver 是 version 的别名 命令/补全仍可用 但不进 /help 列表
     CommandDef { name: "ver", description: "Gets the version of this server including any plugins in use", args: Args::None, children: NO_ARGS, parse: Some(build_version) },
@@ -240,6 +260,7 @@ fn parse_tell(args: &[&str]) -> Command {
     Command::Tell(CommandTell::Tell { target, message })
 }
 
+
 // 终端 Tab 自动补全: 给定当前输入(可含前导 /) 返回候选命令/子命令
 // 仅在末尾 token 上做前缀匹配 空格结尾时补全下一个位置的词
 pub fn complete(input: &str) -> Vec<String> {
@@ -284,6 +305,20 @@ fn candidates_for(before: &[&str], prefix: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // /help 的每行带 § 颜色码 比对前先剥掉
+    fn plain(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '§' {
+                chars.next();
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
 
     #[test]
     fn time_constants_match_nukkit() {
@@ -370,6 +405,9 @@ mod tests {
                 "stop".to_string(),
                 "tell".to_string(),
                 "time".to_string(),
+                "top".to_string(),
+                "tp".to_string(),
+                "tps".to_string(),
                 "ver".to_string(),
                 "version".to_string(),
             ]
@@ -400,13 +438,15 @@ mod tests {
             assert!(def.parse.is_some(), "{} 缺解析入口", def.name);
             if def.name == "ver" {
                 // ver 是 version 的别名 命令可用但不进 /help 列表
-                assert!(!lines.iter().any(|line| line.starts_with("/ver:")));
+                assert!(!lines.iter().any(|line| plain(line).starts_with("/ver:")));
                 continue;
             }
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.starts_with(&format!("/{}:", def.name)))
+                    .any(|line| plain(line).starts_with(&format!("/{}:", def.name))),
+                "{} 不在 /help 列表里",
+                def.name
             );
         }
         assert!(!lines.iter().any(|line| line.starts_with("/?:")));
@@ -446,6 +486,91 @@ mod tests {
         );
         // 别名 msg / w 暂未接入 这里只验证主命令
         assert_eq!(complete("te"), vec!["tell".to_string()]);
+    }
+
+    #[test]
+    fn parses_tp_like_nukkit() {
+        assert_eq!(parse("/tp"), Some(Command::Teleport(TeleportCommand::Usage)));
+        assert_eq!(
+            parse("/tp bob"),
+            Some(Command::Teleport(TeleportCommand::Player {
+                target: None,
+                destination: "bob".to_string()
+            }))
+        );
+        assert_eq!(
+            parse("/tp alice bob"),
+            Some(Command::Teleport(TeleportCommand::Player {
+                target: Some("alice".to_string()),
+                destination: "bob".to_string()
+            }))
+        );
+        assert_eq!(
+            parse("/tp 1 5 1"),
+            Some(Command::Teleport(TeleportCommand::Coords {
+                target: None,
+                position: (1, 5, 1),
+                rotation: None
+            }))
+        );
+        assert_eq!(
+            parse("/tp bob 1 5 1"),
+            Some(Command::Teleport(TeleportCommand::Coords {
+                target: Some("bob".to_string()),
+                position: (1, 5, 1),
+                rotation: None
+            }))
+        );
+        assert_eq!(
+            parse("/tp 1 5 1 90 -30"),
+            Some(Command::Teleport(TeleportCommand::Coords {
+                target: None,
+                position: (1, 5, 1),
+                rotation: Some((90, -30))
+            }))
+        );
+        assert_eq!(
+            parse("/tp bob 1 5 1 90 -30"),
+            Some(Command::Teleport(TeleportCommand::Coords {
+                target: Some("bob".to_string()),
+                position: (1, 5, 1),
+                rotation: Some((90, -30))
+            }))
+        );
+        // y 越界夹进世界高度 与 TeleportCommand 的 clamp 一致
+        assert_eq!(
+            parse("/tp 1 999 1"),
+            Some(Command::Teleport(TeleportCommand::Coords {
+                target: None,
+                position: (1, 128, 1),
+                rotation: None
+            }))
+        );
+        // 坐标不是整数按用法提示处理
+        assert_eq!(
+            parse("/tp 1.5 5 1"),
+            Some(Command::Teleport(TeleportCommand::Usage))
+        );
+        // tp 不是唯一候选了 tps 也是 tp 开头
+        assert_eq!(complete("tp"), vec!["tp".to_string(), "tps".to_string()]);
+        assert_eq!(
+            complete("t"),
+            vec![
+                "tell".to_string(),
+                "time".to_string(),
+                "top".to_string(),
+                "tp".to_string(),
+                "tps".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tps() {
+        assert_eq!(parse("/tps"), Some(Command::Tps(CommandTps::Tps)));
+        // 不接受参数 多打的词直接忽略 与其它 Args::None 命令一致
+        assert_eq!(parse("/tps now"), Some(Command::Tps(CommandTps::Tps)));
+        assert!(complete("tps").is_empty());
     }
 
     #[test]

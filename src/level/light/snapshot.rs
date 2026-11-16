@@ -34,6 +34,9 @@ pub struct ChunkLight {
 }
 
 pub struct LightReceipt {
+    // 这次任务的目标区块 只有它是全量算过的
+    // 回执里其它区块只是在边界上被牵动
+    pub owner: (i32, i32),
     pub chunks: Vec<ChunkLight>,
 }
 
@@ -223,7 +226,10 @@ impl Snapshot {
                 block_light: packed_light,
             });
         }
-        LightReceipt { chunks }
+        LightReceipt {
+            owner: (cx, cz),
+            chunks,
+        }
     }
 }
 

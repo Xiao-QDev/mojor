@@ -1,12 +1,16 @@
 use std::net::SocketAddr;
 
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::entity::{PlayerData, RegionPlayer, assign_uuid};
 use crate::level::actor::RegionEvent;
 use crate::level::region::RegionId;
+use crate::network::protocol::container::ContainerOpenPacket;
+use crate::network::protocol::container_set_content::ContainerSetContentPacket;
 use crate::network::protocol::item::ItemStack;
+use crate::network::protocol::level_event::LevelEventPacket;
 use crate::network::protocol::login::LoginPacket;
+use crate::network::protocol::update_block::UpdateBlockPacket;
 
 use super::broadcast::reply;
 use super::login::{login_sequence, protocol_accepted};
@@ -63,16 +67,6 @@ impl NetworkState {
         state.spawn_pending = accepted;
         let player_position = state.position;
         let snapshot = state.clone();
-        // 登录日志带上分配到的 uuid 同一台设备重登应看到同一个值
-        // 存档目录 playerdata/<uuid>.dat 就是按这个值找的
-        info!(
-            "[{addr}] {} login uuid {uuid} batch pids {:02x?}",
-            state.username,
-            bodies
-                .iter()
-                .filter_map(|body| body.first().copied())
-                .collect::<Vec<_>>()
-        );
         // 登录完成 放开这条连接的下行 旧会话在途的残包在此之前已被丢弃
         out.push(SendCmd::SessionReady { addr });
         out.push(reply(addr, bodies));
@@ -108,22 +102,60 @@ impl NetworkState {
     // global region 只管玩家目录 背包与下行 实体本身归分片
     pub(crate) fn on_region_event(&mut self, event: RegionEvent, out: &mut Vec<SendCmd>) {
         match event {
-            RegionEvent::BlockBroken { addr: _, x, y, z, id } => {
-                let Some(block_id) = id else {
+            RegionEvent::BlockBroken {
+                addr,
+                x,
+                y,
+                z,
+                id,
+                meta,
+                ok,
+                paired,
+            } => {
+                if !ok {
+                    // 没让挖(基岩) 客户端可能已经把这格本地删了 只发给他本人补回去
+                    // 空气没什么可补 避免白白打一条包
+                    if id != 0 {
+                        let packet = UpdateBlockPacket::single(x, y, z, id, meta).encode();
+                        out.push(reply(addr, vec![packet]));
+                    }
                     return;
-                };
-                out.extend(self.broadcast_block(x, y, z, 0, 0));
+                }
+                let block_id = id;
+                // 门连带另一半 两格都要让所有人看到变空气与碎屑
+                let mut cells = vec![(x, y, z, id, meta)];
+                if let Some(other) = paired {
+                    cells.push(other);
+                }
+                for &(bx, by, bz, _, _) in &cells {
+                    out.extend(self.broadcast_block(bx, by, bz, 0, 0));
+                }
+                for &(bx, by, bz, bid, bmeta) in &cells {
+                    out.extend(self.broadcast_destroy(bx, by, bz, bid, bmeta));
+                }
+                // 容器方块被挖掉 容器内容与打开关联都要一起清
+                // 否则残留状态还会被 tick 甚至往空气里写方块
+                if matches!(block_id, 61 | 62 | 58 | 84 | 86 | 116 | 117 | 118) {
+                    self.containers.blocks.remove(&(x, y, z));
+                    let viewers: Vec<std::net::SocketAddr> = self
+                        .containers
+                        .opened
+                        .iter()
+                        .filter(|(_, pos)| **pos == (x, y, z))
+                        .map(|(a, _)| *a)
+                        .collect();
+                    for viewer in viewers {
+                        self.containers.close(viewer);
+                    }
+                }
                 // 掉落物交给方块属主分片生成 创造模式没有掉落
+                // 按 Nukkit Block::getDrops 换算 有些方块状态位不能带进物品 damage
                 if self.gamemode & GAMEMODE_CREATIVE == 0 {
-                    let eid = self.next_eid;
-                    self.next_eid += 1;
-                    self.level.add_drop(
-                        x,
-                        z,
-                        eid,
-                        ItemStack::new(block_id as i16, 1),
-                        (x, y, z),
-                    );
+                    for drop in crate::item::drops::drops_for(block_id, meta, x, y, z) {
+                        let eid = self.next_eid;
+                        self.next_eid += 1;
+                        self.level.add_drop(x, z, eid, drop, (x, y, z));
+                    }
                 }
             }
             RegionEvent::Pickup { addr, item } => {
@@ -148,29 +180,100 @@ impl NetworkState {
                 self.player_index.insert(addr, region);
                 self.players.insert(addr, *state);
             }
+            RegionEvent::Health { health } => {
+                // 只存快照 分片退出后由 RegionIdle 顺手清掉
+                self.region_health
+                    .insert(RegionId { x: health.region.0, z: health.region.1 }, health);
+            }
             RegionEvent::RegionIdle { region } => {
                 // 还有玩家归属这里就不撤 分片退出后下次用到会按需重建
                 if !self.player_index.values().any(|&id| id == region) {
                     if self.level.remove_region(region) {
-                        // 分片没了 它的掉落物镜像也要一起清掉
+                        // 分片没了 它的掉落物与健康快照也要一起清掉
+                        self.region_health.remove(&region);
                         self.drops_by_region.remove(&region);
                         self.drops = self.drops_by_region.values().flatten().cloned().collect();
                     }
                 }
             }
-            RegionEvent::BlockPlaced {
-                addr,
+            RegionEvent::DoorToggled {
+                addr: _,
                 x,
                 y,
                 z,
                 id,
+                meta,
+            } => {
+                // 门真的翻了才到这 把新 meta 和开关音效一起推给视野内的人
+                out.extend(self.broadcast_block(x, y, z, id, meta));
+                let sound = LevelEventPacket::sound_door(x, y, z).encode();
+                out.extend(self.broadcast_level_event(x, y, z, sound));
+            }
+            RegionEvent::ContainerOpen {
+                addr,
+                window_id: _,
+                kind,
+                slots: _,
+                x,
+                y,
+                z,
+                meta,
+            } => {
+                // 按坐标取已存的容器 关窗再开内容还在
+                // 窗口 id 由注册表分配 同一个容器重复点击不再重发 open 只刷新内容
+                let (state, already) = self.containers.open(addr, (x, y, z), kind, meta);
+                let window_id = state.window_id;
+                let mut bodies = Vec::new();
+                if !already {
+                    bodies.push(
+                        ContainerOpenPacket {
+                            window_id,
+                            kind,
+                            slots: state.slots.len() as u16,
+                            x,
+                            y,
+                            z,
+                            entity_id: -1,
+                        }
+                        .encode(),
+                    );
+                }
+                bodies.push(
+                    ContainerSetContentPacket {
+                        window_id,
+                        slots: state.slots.clone(),
+                        hotbar: Vec::new(),
+                    }
+                    .encode(),
+                );
+                // 熔炉进度条 ContainerSetData 先不发 0.14 客户端收到会整进程闪退
+                // 烧制逻辑照常跑 产物/燃料靠上面的 ContainerSetContent 与槽位更新同步
+                let _ = kind;
+                out.push(reply(addr, bodies));
+            }
+            RegionEvent::ContainerSlot {
+                addr,
+                window_id: _,
+                slot,
+                item,
+            } => {
+                self.containers.set_slot(addr, slot, item);
+            }
+            RegionEvent::ContainerClosed { addr } => {
+                self.containers.close(addr);
+            }
+            RegionEvent::BlockPlaced {
+                addr,
+                origin,
+                cells,
+                item,
                 ok,
             } => {
                 if !ok {
-                    // 目标格被占 没放下去 把扣掉的方块退回来
+                    // 目标格被占 没放下去 把扣掉的物品原样退回来
                     let updated = if self.gamemode & GAMEMODE_CREATIVE == 0 {
                         self.players.get_mut(&addr).and_then(|state| {
-                            state.add_item(ItemStack::new(id as i16, 1));
+                            state.add_item(ItemStack::new(item, 1));
                             out.push(reply(addr, vec![state.inventory_packet().encode()]));
                             Some(state.clone())
                         })
@@ -182,7 +285,20 @@ impl NetworkState {
                     }
                     return;
                 }
-                out.extend(self.broadcast_block(x, y, z, id, 0));
+                // 门/床 一次两格 每格都要广播 客户端才会把另一半也画出来
+                let mut written = vec![cells.first];
+                if let Some(second) = cells.second {
+                    written.push(second);
+                }
+                for cell in written {
+                    out.extend(self.broadcast_block(
+                        origin.0 + cell.dx,
+                        origin.1 + cell.dy,
+                        origin.2 + cell.dz,
+                        cell.id,
+                        cell.meta,
+                    ));
+                }
             }
         }
     }

@@ -21,6 +21,14 @@ use mojor::tick;
 // 内置默认 banner 用户可以在运行目录的 resources/ 里放自己的文本覆盖
 const DEFAULT_BANNER: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/resources/banner.txt"));
+const FALLBACK_BANNER: &str = "\
+███╗   ███╗ ██████╗      ██╗ ██████╗ ██████╗
+████╗ ████║██╔═══██╗     ██║██╔═══██╗██╔══██╗
+██╔████╔██║██║   ██║     ██║██║   ██║██████╔╝
+██║╚██╔╝██║██║   ██║██   ██║██║   ██║██╔══██╗
+██║ ╚═╝ ██║╚██████╔╝╚█████╔╝╚██████╔╝██║  ██║
+╚═╝     ╚═╝ ╚═════╝  ╚════╝  ╚═════╝ ╚═╝  ╚═╝
+";
 
 // 从运行目录的 resources 里找 banner 文本 支持 txt 与 ansi 取字典序第一个
 // 目录为空就生成一份内置模板 用户照着改即可
@@ -52,68 +60,20 @@ fn load_banner() -> String {
     DEFAULT_BANNER.to_string()
 }
 
-// Wine 的 wineconsole 是 tty 但不支持 VT/ANSI
-// 靠 ntdll 导出的 wine_get_version 识别 Wine 环境 只有 Wine 才有这个符号
-#[cfg(windows)]
-fn running_under_wine() -> bool {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetModuleHandleA(module: *const u8) -> *mut std::ffi::c_void;
-        fn GetProcAddress(
-            module: *mut std::ffi::c_void,
-            name: *const u8,
-        ) -> *mut std::ffi::c_void;
-    }
-    unsafe {
-        let module = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
-        if module.is_null() {
-            return false;
-        }
-        !GetProcAddress(module, b"wine_get_version\0".as_ptr()).is_null()
-    }
-}
-
-#[cfg(not(windows))]
-fn running_under_wine() -> bool {
-    false
-}
-
-// 去掉 ANSI 转义序列 老终端或重定向到文件时输出纯文本
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            // 吃掉直到终止字母 如 m 或 h 或 l
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+fn supports_ansi() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
 fn print_banner() {
-    let text = load_banner();
-    // 非终端或设置了 NO_COLOR 时剥离颜色 老终端与日志文件都不会看到转义
-    let text = if std::env::var_os("NO_COLOR").is_some()
-        || !std::io::stdout().is_terminal()
-        || running_under_wine()
-    {
-        strip_ansi(&text)
+    let text = if supports_ansi() {
+        load_banner()
     } else {
-        text
+        FALLBACK_BANNER.to_string()
     };
     print!("{text}");
     if !text.ends_with('\n') {
         println!();
     }
-    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 // 启动日志用 [INFO] 前缀 对齐 Nukkit 的输出风格
@@ -136,15 +96,25 @@ where
             .map(|d| d.as_secs())
             .unwrap_or(0)
             % 86_400;
+        // 格式照 Paper 1.12.2 的 [01:52:44 INFO]: 时间与等级在同一个方括号里
         write!(
             writer,
-            "{:02}:{:02}:{:02} [{}] ",
+            "[{:02}:{:02}:{:02} {}]: ",
             secs / 3600,
             (secs % 3600) / 60,
             secs % 60,
             event.metadata().level()
         )?;
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        // 日志内容里的 § 颜色码在这里翻译 终端给 ANSI 重定向到文件时剥掉
+        // 先写进 String 再整段翻译 避免字段格式化内部一半带码一半不带
+        let mut body = String::new();
+        ctx.field_format()
+            .format_fields(Writer::new(&mut body), event)?;
+        write!(
+            writer,
+            "{}",
+            mojor::utils::color::sections(&body, std::io::stdout().is_terminal())
+        )?;
         writeln!(writer)
     }
 }
@@ -192,10 +162,9 @@ async fn main() -> Result<()> {
     info!("Default game type: {mode}");
     info!("Start Minecraft:PE server on : {}", config.bind);
     info!(
-        "This server is running Mojor version {} (MCPE: {}) (Plugin API {})",
+        "This server is running Mojor version {} (MC: {}|API: Lunar API)",
         env!("CARGO_PKG_VERSION"),
         mojor::config::server::VERSION,
-        env!("CARGO_PKG_VERSION")
     );
     info!("Mojor is released under the AGPLv3.0 license");
     info!("Preparing to generate the level \"{}\"", config.world);
@@ -248,7 +217,7 @@ async fn main() -> Result<()> {
     });
 
     info!(
-        "Done ({:.4}s)! For help, type \"help\" or \"?\"",
+        "Done ({:.2}ms)! For help, type \"help\" or \"?\"",
         started.elapsed().as_secs_f64()
     );
 

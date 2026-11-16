@@ -18,8 +18,8 @@ const VERSION: u8 = 2;
 // 旧版按用户名存的格式 没有 uuid 头 只用于一次性迁移
 const LEGACY_VERSION: u8 = 1;
 const INVENTORY_SLOTS: usize = 27;
-// 与 PlayerState 一致 0.14 的 ContainerSetContent 快捷栏映射是 36 项
-const HOTBAR_SLOTS: usize = 36;
+// 0.14 的快捷栏映射固定 9 项 值是槽位索引 +9(Nukkit PlayerInventory.sendContents)
+const HOTBAR_SLOTS: usize = 9;
 // Java 版的存档目录名
 const DATA_DIR: &str = "playerdata";
 // 早期版本放玩家存档的目录 只用于迁移
@@ -41,7 +41,7 @@ impl Default for PlayerData {
             yaw: 0.0,
             pitch: 0.0,
             inventory: vec![None; INVENTORY_SLOTS],
-            hotbar: (0..HOTBAR_SLOTS as i32).map(|slot| slot + 36).collect(),
+            hotbar: (0..HOTBAR_SLOTS as i32).map(|slot| slot + 9).collect(),
         }
     }
 }
@@ -142,15 +142,25 @@ impl PlayerData {
         }
         inventory.resize(INVENTORY_SLOTS, None);
 
+        // 旧档曾存过 36 项映射 全部读出来再截成 0.14 的 9 项 别让老玩家变成坏档
         let hotbar_len = r.get_u8().ok()? as usize;
-        if hotbar_len > HOTBAR_SLOTS {
+        if hotbar_len > 64 {
             return None;
         }
-        let mut hotbar = Vec::with_capacity(HOTBAR_SLOTS);
+        let mut hotbar = Vec::with_capacity(hotbar_len);
         for _ in 0..hotbar_len {
             hotbar.push(r.get_i32().ok()?);
         }
-        hotbar.resize(HOTBAR_SLOTS, -1);
+        hotbar.truncate(HOTBAR_SLOTS);
+        if hotbar.len() < HOTBAR_SLOTS {
+            hotbar.resize(HOTBAR_SLOTS, -1);
+        }
+        // 旧值是 +36 的越界映射 统一改成 +9
+        for slot in &mut hotbar {
+            if *slot >= 36 {
+                *slot -= 27;
+            }
+        }
 
         Some(Self {
             position,

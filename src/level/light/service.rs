@@ -66,8 +66,8 @@ impl LightService {
                                     .into_receipt()
                             }
                         };
-                        // region 已经退出（停机）就丢回执
-                        // 光照没回来的区块不会落盘 不会污染存档
+                        // 分片停机时会 drain 在途任务 回执必须送出去
+                        // 送不出去说明 region 已经没了 那批区块也没落盘 不算脏数据
                         let _ = job.reply.send(RegionMsg::LightDone { receipt });
                     }
                 });
@@ -77,7 +77,7 @@ impl LightService {
     }
 
     // 提交任务 非阻塞
-    pub fn submit(&self, job: LightJob) {
+    pub(crate) fn submit(&self, job: LightJob) {
         let _ = self.tx.send(job);
     }
 }

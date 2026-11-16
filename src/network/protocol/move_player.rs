@@ -1,6 +1,8 @@
+use bytes::Bytes;
+
 use crate::error::{Error, Result};
 use crate::network::protocol::pid::MOVE_PLAYER;
-use crate::utils::binary::BinaryReader;
+use crate::utils::binary::{BinaryReader, BinaryWriter};
 
 pub const MODE_NORMAL: u8 = 0;
 pub const MODE_RESET: u8 = 1;
@@ -67,6 +69,37 @@ impl MovePlayerPacket {
             (self.position.2.floor() as i32) >> 4,
         )
     }
+
+    // 服务端主动把玩家摆到某个位置 照搬 Nukkit Player.sendPosition 的 MODE_RESET
+    // position 传脚部坐标 包里写的是客户端用的眼睛高度
+    // 发给自己时 eid 固定 0 Nukkit 也是这么写的
+    pub fn teleport(eid: i64, position: (f32, f32, f32), yaw: f32, pitch: f32) -> Self {
+        Self {
+            eid,
+            position: (position.0, position.1 + EYE_HEIGHT, position.2),
+            yaw,
+            head_yaw: yaw,
+            pitch,
+            mode: MODE_RESET,
+            on_ground: true,
+        }
+    }
+
+    // 0x9d | eid(i64) | x y z(f32) | yaw headYaw pitch(f32) | mode(u8) | onGround(u8)
+    pub fn encode(&self) -> Bytes {
+        let mut w = BinaryWriter::with_capacity(35);
+        w.put_u8(MOVE_PLAYER);
+        w.put_i64(self.eid);
+        w.put_f32(self.position.0);
+        w.put_f32(self.position.1);
+        w.put_f32(self.position.2);
+        w.put_f32(self.yaw);
+        w.put_f32(self.head_yaw);
+        w.put_f32(self.pitch);
+        w.put_u8(self.mode);
+        w.put_u8(self.on_ground as u8);
+        Bytes::from(w.freeze())
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +137,27 @@ mod tests {
         assert_eq!(packet.pitch, -10.0);
         assert_eq!(packet.mode, MODE_NORMAL);
         assert!(packet.on_ground);
+    }
+
+    // 服务端下发的传送包 y 要带眼睛高度 客户端才会落在脚部坐标上
+    #[test]
+    fn teleport_encodes_eye_height_and_reset_mode() {
+        let packet = MovePlayerPacket::teleport(0, (16.5, 5.0, -0.5), 90.0, -10.0);
+        let data = packet.encode();
+        assert_eq!(data.len(), 35);
+        assert_eq!(data[0], MOVE_PLAYER);
+        assert_eq!(&data[1..9], &0i64.to_be_bytes());
+        assert_eq!(
+            f32::from_be_bytes(data[9..13].try_into().unwrap()),
+            16.5
+        );
+        assert_eq!(
+            f32::from_be_bytes(data[13..17].try_into().unwrap()),
+            5.0 + EYE_HEIGHT
+        );
+        assert_eq!(data[33], MODE_RESET);
+        // 解回来脚部坐标与原来一致
+        assert_eq!(MovePlayerPacket::decode(&data).unwrap().feet_position(), (16.5, 5.0, -0.5));
     }
 
     // 负坐标必须向下取整 否则 (-0.5, -0.5) 会算成区块 (0, 0)

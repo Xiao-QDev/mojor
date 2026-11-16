@@ -8,16 +8,26 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::warn;
 
-use crate::entity::{PlayerDirectory, PlayerState, RegionPlayer};
-use crate::level::region::RegionId;
+use crate::block::placement::{self, Context as PlacementContext};
+use crate::entity::{
+    PLAYER_HALF_WIDTH, PLAYER_HEIGHT, PlayerDirectory, PlayerState, RegionPlayer,
+};
+use crate::level::generator::blocks;
+use crate::network::protocol::update_block::UpdateBlockPacket;
+use crate::level::region::{REGION_BLOCKS, RegionId};
 use crate::level::actor::{RegionMsg, RegionRegistry};
+use crate::item::inventory::CraftingManager;
 use crate::network::protocol::animate::AnimatePacket;
+use crate::network::protocol::container::{
+    ContainerClosePacket, ContainerSetSlotPacket, CraftingEventPacket, WINDOW_INVENTORY,
+};
 use crate::network::protocol::move_entity::{MoveEntityEntry, MoveEntityPacket};
 use crate::network::protocol::move_player::{EYE_HEIGHT, MovePlayerPacket};
 use crate::network::protocol::chunk_radius::{ChunkRadiusUpdatePacket, RequestChunkRadiusPacket};
 use crate::network::protocol::entity_data::Metadata;
 use crate::network::protocol::pid::{
-    ANIMATE, MOVE_PLAYER, PLAYER_ACTION, REMOVE_BLOCK, REQUEST_CHUNK_RADIUS, TEXT, USE_ITEM,
+    ANIMATE, CONTAINER_CLOSE, CONTAINER_SET_SLOT, CRAFTING_EVENT, MOVE_PLAYER, PLAYER_ACTION,
+    REMOVE_BLOCK, REQUEST_CHUNK_RADIUS, TEXT, USE_ITEM,
 };
 use crate::network::protocol::player_action::{
     ACTION_START_SNEAK, ACTION_START_SPRINT, ACTION_STOP_SNEAK, ACTION_STOP_SPRINT,
@@ -123,6 +133,11 @@ pub(crate) fn handle_packet(
             gamemode,
             &mut commands,
         ),
+        CRAFTING_EVENT => on_crafting_event(players, addr, packet, &mut commands),
+        CONTAINER_SET_SLOT => {
+            on_container_set_slot(players, addr, packet, &mut events);
+        }
+        CONTAINER_CLOSE => on_container_close(addr, packet, &mut commands, &mut events),
         TEXT => on_text(players, directory, addr, packet, view_distance, &mut commands),
         PLAYER_ACTION => {
             on_player_action(players, directory, addr, packet, view_distance, &mut commands);
@@ -168,6 +183,20 @@ fn on_move_player(
     };
     // 客户端发的是眼睛位置 换成脚部坐标
     let position = mv.feet_position();
+
+    // 传送落点还没被客户端确认时 在路上晃的旧坐标不能把玩家拉回去
+    // 照搬 Nukkit handleDataPacket 的 forceMovement 距离校验 每次偏差都重发一次落点
+    if let Some(forced) = player.force_position {
+        let dx = position.0 - forced.0;
+        let dy = position.1 - forced.1;
+        let dz = position.2 - forced.2;
+        if dx * dx + dy * dy + dz * dz > 0.1 {
+            let body = MovePlayerPacket::teleport(0, forced, mv.yaw, mv.pitch).encode();
+            commands.push(reply(addr, vec![body]));
+            return;
+        }
+    }
+
     let old_region = RegionId::of_block(
         player.state.position.0.floor() as i32,
         player.state.position.2.floor() as i32,
@@ -180,6 +209,8 @@ fn on_move_player(
         player.state.yaw = mv.yaw;
         player.state.pitch = mv.pitch;
         player.view.update(position, view_distance);
+        // 客户端已经站到落点上了 传送纠正结束
+        player.force_position = None;
     }
 
     // 移动同步给附近的其他玩家
@@ -230,9 +261,36 @@ fn on_move_player(
                 target_z = new_region.z,
                 "目标分片不可用 玩家留在本分片"
             );
+            // 回滚不能只把玩家塞回来: 坐标已经跨出本分片了
+            // 归属还在本分片会让区块队列越界 放置校验也按本分片边界算
+            // 所以把坐标夹回内侧发一次传送纠正 客户端跟着回来
+            let mut moved = moved;
+            let safe = clamp_into(id, moved.state.position);
+            moved.state.position = safe;
+            moved.view.update(safe, view_distance);
+            // 客户端确认站位前不采信它的移动包
+            moved.force_position = Some(safe);
+            let body =
+                MovePlayerPacket::teleport(0, safe, moved.state.yaw, moved.state.pitch).encode();
+            commands.push(reply(addr, vec![body]));
             players.insert(addr, moved);
         }
     }
+}
+
+// 把坐标夹回指定分片内侧 留 1 格余量 免得下一包又立刻判成跨区
+// 只在迁移回滚时用: 目标分片不可用 玩家必须留在原分片里
+fn clamp_into(id: RegionId, position: (f32, f32, f32)) -> (f32, f32, f32) {
+    const MARGIN: f32 = 1.0;
+    let min_x = (id.x * REGION_BLOCKS) as f32 + MARGIN;
+    let max_x = ((id.x + 1) * REGION_BLOCKS) as f32 - MARGIN;
+    let min_z = (id.z * REGION_BLOCKS) as f32 + MARGIN;
+    let max_z = ((id.z + 1) * REGION_BLOCKS) as f32 - MARGIN;
+    (
+        position.0.clamp(min_x, max_x),
+        position.1,
+        position.2.clamp(min_z, max_z),
+    )
 }
 
 // 挖方块 校验距离后交给方块属主分片去挖
@@ -270,6 +328,128 @@ fn on_remove_block(
     post_to(registry, tx, id, RegionId::of_block(dig.x, dig.z), msg);
 }
 
+// 客户端按服务端下发的配方表算好产物后上报 服务端校验扣料给产物
+// 0.14 的合成由客户端主导 这里只认配方表里存在的产物 挡住凭空造物
+fn on_crafting_event(
+    players: &mut HashMap<SocketAddr, RegionPlayer>,
+    addr: SocketAddr,
+    packet: &[u8],
+    commands: &mut Vec<SendCmd>,
+) {
+    let Ok(event) = CraftingEventPacket::decode(&packet[1..]) else {
+        return;
+    };
+    let Some(player) = players.get_mut(&addr) else {
+        return;
+    };
+    let manager = CraftingManager::new();
+    let reported = event.output.iter().find(|s| !s.is_empty()).copied();
+
+    // 优先按 CraftingData 下发的配方 UUID 精确校验: 产物逐字段一致 + 材料多重集合匹配
+    // 客户端某些版本回传的 UUID/网格不是服务端这套 命中失败时退回宽松路径 别把合成改坏
+    let strict = manager.recipe_by_uuid(&event.uuid).filter(|(expected, ingredients)| {
+        if reported != Some(*expected) {
+            return false;
+        }
+        let inputs: Vec<&crate::network::protocol::item::ItemStack> = event
+            .input
+            .iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if inputs.len() != ingredients.len() {
+            return false;
+        }
+        let mut used = vec![false; inputs.len()];
+        ingredients.iter().all(|need| {
+            inputs
+                .iter()
+                .enumerate()
+                .any(|(i, got)| !used[i] && need.matches(got) && {
+                    used[i] = true;
+                    true
+                })
+        })
+    });
+
+    if let Some((expected, ingredients)) = strict {
+        for need in &ingredients {
+            player.state.consume_item(need.id);
+        }
+        player.state.add_item(expected);
+    } else if let Some(result) = reported.filter(|r| {
+        r.id > 0
+            && r.id <= 512
+            && r.damage >= 0
+            && (manager.shaped.iter().any(|x| x.result.id == r.id)
+                || manager.shapeless.iter().any(|x| x.result.id == r.id)
+                || manager.furnace.iter().any(|x| x.result.id == r.id))
+    }) {
+        // 宽松兜底: 只认产物是配方表里有的 按客户端上报的 input 扣料
+        for stack in &event.input {
+            if !stack.is_empty() {
+                for _ in 0..stack.count.min(64) {
+                    player.state.consume_item(stack.id);
+                }
+            }
+        }
+        player.state.add_item(result);
+    }
+    // 无论成没成 都把服务端背包推回去 客户端本地预测与服务端对齐
+    commands.push(reply(addr, vec![player.state.inventory_packet().encode()]));
+}
+
+// 客户端拖动背包/合成网格里的物品 同步服务端槽位 否则放置时按旧背包扣料
+fn on_container_set_slot(
+    players: &mut HashMap<SocketAddr, RegionPlayer>,
+    addr: SocketAddr,
+    packet: &[u8],
+    events: &mut Vec<crate::level::actor::RegionEvent>,
+) {
+    let Ok(slot) = ContainerSetSlotPacket::decode(&packet[1..]) else {
+        return;
+    };
+    if slot.slot < 0 {
+        return;
+    }
+    if slot.window_id != WINDOW_INVENTORY {
+        // 容器窗口交给 global 的容器注册表 关窗后仍保留内容
+        events.push(crate::level::actor::RegionEvent::ContainerSlot {
+            addr,
+            window_id: slot.window_id,
+            slot: slot.slot as usize,
+            item: slot.item,
+        });
+        return;
+    }
+    let Some(player) = players.get_mut(&addr) else {
+        return;
+    };
+    let index = slot.slot as usize;
+    if index < player.state.inventory.len() {
+        // 客户端上报的槽位只接受合法物品 越界 id 会让它自己渲染背包时崩溃
+        player.state.inventory[index] = slot
+            .item
+            .filter(|item| item.id > 0 && item.id <= 512 && item.damage >= 0);
+    }
+}
+
+// 客户端关窗口 回一个确认并通知 global 解除关联
+fn on_container_close(
+    addr: SocketAddr,
+    packet: &[u8],
+    commands: &mut Vec<SendCmd>,
+    events: &mut Vec<crate::level::actor::RegionEvent>,
+) {
+    let Some(&window_id) = packet.get(2) else {
+        return;
+    };
+    commands.push(reply(
+        addr,
+        vec![ContainerClosePacket { window_id }.encode()],
+    ));
+    events.push(crate::level::actor::RegionEvent::ContainerClosed { addr });
+}
+
 // 放方块 扣背包后交给方块属主分片判定并写入
 fn on_use_item(
     players: &mut HashMap<SocketAddr, RegionPlayer>,
@@ -281,8 +461,8 @@ fn on_use_item(
     gamemode: u8,
     commands: &mut Vec<SendCmd>,
 ) {
-    let position = match players.get(&addr) {
-        Some(player) if player.state.spawned => player.state.position,
+    let (position, yaw) = match players.get(&addr) {
+        Some(player) if player.state.spawned => (player.state.position, player.state.yaw),
         _ => return,
     };
 
@@ -292,9 +472,36 @@ fn on_use_item(
             return;
         }
     };
+    // 空手/手持点方块都先交给属主分片做交互判定: 门开关 + 容器 UI
+    // Nukkit Level::useItemOn 里 target.onActivate 优先于放置
+    // 交互目标是被点的那一格本身(可能点门上半) 不是放置用的 target_block
+    // 潜行时不触发 跨线程拿不到结果 所以放置照常走 分片各自静默处理非交互方块
+    if use_item.face <= 5 && within_reach(position, use_item.x, use_item.y, use_item.z) {
+        let sneaking = players.get(&addr).is_some_and(|p| p.state.sneaking);
+        if !sneaking {
+            let owner = RegionId::of_block(use_item.x, use_item.z);
+            let (x, y, z) = (use_item.x, use_item.y, use_item.z);
+            post_to(
+                registry,
+                tx,
+                id,
+                owner,
+                RegionMsg::ToggleDoorFor { addr, x, y, z },
+            );
+            post_to(
+                registry,
+                tx,
+                id,
+                owner,
+                RegionMsg::OpenContainerFor { addr, x, y, z },
+            );
+        }
+    }
+
     if use_item.item_id <= 0 {
         return;
     }
+
     let Some((x, y, z)) = use_item.target_block() else {
         return;
     };
@@ -302,12 +509,40 @@ fn on_use_item(
         return;
     }
 
-    let block_id = use_item.item_id as u8;
+    // 手持物品 -> 实际放的方块 门/床/告示牌 的物品 id 与方块 id 不是一个数
+    let context = PlacementContext {
+        item_id: use_item.item_id,
+        item_meta: use_item.item_damage,
+        face: use_item.face,
+        yaw,
+        fy: use_item.fy,
+    };
+    let Some(cells) = placement::resolve(&context) else {
+        return;
+    };
+
+    // 固体方块不能塞进自己身体里 原版客户端也会拦这一步 否则就是站在方块里穿模
+    let blocked: Vec<(i32, i32, i32)> = cells
+        .iter_abs(x, y, z)
+        .filter(|&(cx, cy, cz, cell)| blocks::is_solid(cell.id) && covers_player(cx, cy, cz, position))
+        .map(|(cx, cy, cz, _)| (cx, cy, cz))
+        .collect();
+    if !blocked.is_empty() {
+        // 客户端已经在本地把方块摆上了 把这几格推回空气
+        let bodies = blocked
+            .iter()
+            .map(|&(bx, by, bz)| UpdateBlockPacket::single(bx, by, bz, 0, 0).encode())
+            .collect();
+        commands.push(reply(addr, bodies));
+        return;
+    }
+
+    // 生存扣的是手持物品 不是放下去的方块 id
     if gamemode & GAMEMODE_CREATIVE == 0 {
         let Some(player) = players.get_mut(&addr) else {
             return;
         };
-        if !player.state.consume_item(block_id) {
+        if !player.state.consume_item(use_item.item_id) {
             return;
         }
         commands.push(reply(
@@ -320,7 +555,8 @@ fn on_use_item(
         addr,
         click: (use_item.x, use_item.y, use_item.z),
         target: (x, y, z),
-        id: block_id,
+        cells,
+        item: use_item.item_id,
     };
     post_to(registry, tx, id, RegionId::of_block(x, z), msg);
 }
@@ -495,9 +731,48 @@ fn on_request_radius(
 }
 
 // 交互距离限制 超过四格不认
+// 这一格和玩家碰撞盒(0.6 x 1.8)有没有重叠 三维都要重叠才算
+fn covers_player(x: i32, y: i32, z: i32, position: (f32, f32, f32)) -> bool {
+    let (px, py, pz) = position;
+    let overlap_x = (x as f32) < px + PLAYER_HALF_WIDTH && (x + 1) as f32 > px - PLAYER_HALF_WIDTH;
+    let overlap_y = (y as f32) < py + PLAYER_HEIGHT && (y + 1) as f32 > py;
+    let overlap_z = (z as f32) < pz + PLAYER_HALF_WIDTH && (z + 1) as f32 > pz - PLAYER_HALF_WIDTH;
+    overlap_x && overlap_y && overlap_z
+}
+
 fn within_reach(position: (f32, f32, f32), x: i32, y: i32, z: i32) -> bool {
     let dx = position.0 - x as f32;
     let dy = position.1 - y as f32;
     let dz = position.2 - z as f32;
     dx * dx + dy * dy + dz * dz <= 64.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_pulls_back_into_region() {
+        let id = RegionId { x: 0, z: 0 };
+        // 已经跨到 x=512 的那一侧 要被夹回 511 附近
+        let (x, y, z) = clamp_into(id, (520.5, 64.0, 3.0));
+        assert!(x < 512.0 && x >= 511.0, "x 没夹回来: {x}");
+        assert_eq!(y, 64.0, "y 不该动");
+        assert_eq!(z, 3.0);
+        assert_eq!(RegionId::of_block(x.floor() as i32, z.floor() as i32), id);
+
+        // 已经在分片内部就不动
+        let inside = clamp_into(id, (100.5, 64.0, 100.5));
+        assert_eq!(inside, (100.5, 64.0, 100.5));
+    }
+
+    #[test]
+    fn clamp_handles_negative_regions() {
+        // 负分片边界要按位运算算 不能直接乘
+        let id = RegionId { x: -1, z: -1 };
+        let (x, _, z) = clamp_into(id, (-0.5, 64.0, -0.5));
+        assert!(x < 0.0 && x >= -1.0, "x 没夹回来: {x}");
+        assert!(z < 0.0 && z >= -1.0, "z 没夹回来: {z}");
+        assert_eq!(RegionId::of_block(x.floor() as i32, z.floor() as i32), id);
+    }
 }

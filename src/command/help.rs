@@ -1,12 +1,18 @@
+// /help 的单行格式: §f/§e<命令>§f: §f<描述>
+// 斜杠与冒号是白色 命令名黄色 描述白色 与游戏内原版观感一致
 const HELP_ENTRIES: &[(&str, &str)] = &[
-    ("help", "Shows the help menu"),
+    ("help", "shows the help menu"),
     ("list", "A Mojang provided command."),
     ("say", "Broadcasts the given message as the sender"),
+    ("teleport", "A Mojang provided command."),
     ("tell", "A Mojang provided command."),
+    ("time", "A Mojang provided command."),
+    ("tp", "A Mojang provided command."),
+    ("tps", "Gets the current ticks per second for the server."),
+    ("top", "Real-time system metrics."),
     ("stop", "A Mojang provided command."),
     ("seed", "A Mojang provided command."),
-    ("time", "A Mojang provided command."),
-    ("version", "Gets the version of this server including any plugins in use"),
+    ("version", "Gets the version of this server including any plugins in use."),
 ];
 
 #[derive(Eq, PartialEq, Debug)]
@@ -17,11 +23,11 @@ pub enum CommandHelp {
 impl CommandHelp {
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![
-            "--------- Help: Index ---------------------------".to_string(),
+            "§6--------- §f§lHelp: Index§r §6---------------------------".to_string(),
             "Use /help [n] to get page n of help.".to_string(),
         ];
         for (name, description) in HELP_ENTRIES {
-            lines.push(format!("/{}: {}", name, description));
+            lines.push(format!("§6/{name}: §f§l{description}§r"));
         }
         lines
     }

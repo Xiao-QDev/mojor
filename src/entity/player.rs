@@ -30,7 +30,7 @@ pub struct PlayerState {
     pub(crate) pitch: f32,
     // 背包 27 个主格
     pub(crate) inventory: Vec<Option<ItemStack>>,
-    // 快捷栏位置 -> 包内槽位 + 36 与 Nukkit 的换算一致
+    // 快捷栏 9 项 值是槽位索引 +9 与 Nukkit PlayerInventory.sendContents 一致
     pub(crate) hotbar: Vec<i32>,
     pub(crate) sneaking: bool,
     pub(crate) sprinting: bool,
@@ -54,7 +54,8 @@ impl Default for PlayerState {
             yaw: 0.0,
             pitch: 0.0,
             inventory: vec![None; 27],
-            hotbar: (0..36).map(|slot| slot + 36).collect(),
+            // 0.14 快捷栏映射固定 9 项 值是槽位索引 +9 与 Nukkit/Genisys 一致
+            hotbar: (0..9).map(|slot| slot + 9).collect(),
             sneaking: false,
             sprinting: false,
         }
@@ -187,7 +188,21 @@ impl PlayerState {
     }
 
     pub(crate) fn inventory_packet(&self) -> ContainerSetContentPacket {
-        ContainerSetContentPacket::inventory(self.inventory.clone(), self.hotbar.clone())
+        // 下发前兜底归一化 通配 damage(0xFFFF) 或越界 id 会让客户端渲染背包时崩溃
+        let slots = self
+            .inventory
+            .iter()
+            .map(|slot| {
+                slot.and_then(|item| {
+                    (item.id > 0 && item.id <= 512 && item.count > 0).then_some(ItemStack {
+                        id: item.id,
+                        count: item.count,
+                        damage: if item.damage < 0 { 0 } else { item.damage },
+                    })
+                })
+            })
+            .collect();
+        ContainerSetContentPacket::inventory(slots, self.hotbar.clone())
     }
 
     // 先叠同类再找空位 放不下返回 false
@@ -207,12 +222,12 @@ impl PlayerState {
         false
     }
 
-    // 扣掉一个指定方块 返回是否扣成功
-    pub(crate) fn consume_item(&mut self, block_id: u8) -> bool {
+    // 扣掉一个指定物品 返回是否扣成功
+    pub(crate) fn consume_item(&mut self, item_id: i16) -> bool {
         let Some(index) = self
             .inventory
             .iter()
-            .position(|slot| slot.is_some_and(|item| item.id == block_id as i16 && item.count > 0))
+            .position(|slot| slot.is_some_and(|item| item.id == item_id && item.count > 0))
         else {
             return false;
         };
@@ -256,12 +271,25 @@ impl PlayerState {
 pub(crate) struct RegionPlayer {
     pub(crate) state: PlayerState,
     pub(crate) view: PlayerView,
+    // 下一次允许挖掘的 region tick 早于它的请求先排队不直接拒
+    pub(crate) next_dig_tick: u64,
+    // 超速请求的待办 攒到下一个允许的 tick 依次执行
+    // 满了说明流量远超合法速度 才回退成拒绝
+    pub(crate) dig_queue: VecDeque<(i32, i32, i32)>,
+    // 传送落点 客户端到位前丢弃在途的旧坐标 照搬 Nukkit 的 forceMovement
+    pub(crate) force_position: Option<(f32, f32, f32)>,
 }
 
 impl RegionPlayer {
     pub(crate) fn new(state: PlayerState, radius: i32) -> Self {
         let view = PlayerView::new(state.position, radius);
-        Self { state, view }
+        Self {
+            state,
+            view,
+            next_dig_tick: 0,
+            dig_queue: VecDeque::new(),
+            force_position: None,
+        }
     }
 }
 

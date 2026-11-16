@@ -4,8 +4,11 @@ use tracing::warn;
 use crate::network::protocol::adventure_settings::{
     AdventureSettingsPacket, FLAG_ALLOW_FLIGHT, FLAG_AUTO_JUMP, PERMISSION_MEMBER,
 };
+use crate::item::inventory::CraftingManager;
+use crate::network::protocol::container::CraftingDataPacket;
 use crate::network::protocol::container_set_content::ContainerSetContentPacket;
 use crate::network::protocol::login::LoginPacket;
+use crate::network::protocol::move_player::EYE_HEIGHT;
 use crate::network::protocol::pid::CURRENT_PROTOCOL;
 use crate::network::protocol::play_status::{
     LOGIN_FAILED_CLIENT, LOGIN_SUCCESS, PLAYER_SPAWN, PlayStatusPacket,
@@ -59,8 +62,9 @@ pub(crate) fn login_sequence(
             gamemode: (gamemode & 0x01) as i32,
             // 与 Nukkit 一致 客户端自视角的实体 id 固定为 0
             eid: 0,
+            // spawn 是方块坐标不动 实体 position 的 y 客户端按眼睛位置解释
             spawn: spawn_block,
-            position: spawn_position,
+            position: (spawn_position.0, spawn_position.1 + EYE_HEIGHT, spawn_position.2),
             b1: true,
             b2: true,
             b3: false,
@@ -93,6 +97,11 @@ pub(crate) fn login_sequence(
         .encode(),
     );
     packets.push(adventure_settings(gamemode).encode());
+    // 客户端靠这张表在合成网格里算产物 没下发就完全不能合成
+    packets.push(
+        CraftingDataPacket { clean_recipes: true }
+            .encode(&CraftingManager::new()),
+    );
     packets
 }
 
@@ -126,7 +135,8 @@ pub(crate) fn spawn_sequence(position: (f32, f32, f32), gamemode: u8) -> Vec<Byt
     packets.push(
         RespawnPacket {
             x: position.0,
-            y: position.1,
+            // 与 StartGame 一致 客户端把这里的 y 当眼睛位置
+            y: position.1 + EYE_HEIGHT,
             z: position.2,
         }
         .encode(),
