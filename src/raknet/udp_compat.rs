@@ -77,7 +77,7 @@ mod windows_impl {
     const SIO_UDP_CONNRESET: u32 = 0x9800_0012;
 
     #[link(name = "ws2_32")]
-    extern "system" {
+    unsafe extern "system" {
         fn WSAIoctl(
             socket: usize,
             control_code: u32,
