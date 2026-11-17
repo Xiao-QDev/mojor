@@ -1,20 +1,24 @@
-# mojor
+# violin
+
+<p align="center">
+  <img src="assets/violin.png" alt="violin" width="180">
+</p>
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Protocol](https://img.shields.io/badge/MCPE-0.14.3%20(Protocol%2070)-green.svg)](https://minecraft.wiki/w/Minecraft_Wiki)
+[![Protocol](https://img.shields.io/badge/MCPE-0.14.0-0.14.3%20(45-70)-green.svg)](https://minecraft.wiki/w/Minecraft_Wiki)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
 
 > A Minecraft: Pocket Edition (MCPE / Bedrock) server written from scratch in Rust.
 
-**mojor** is a from-scratch MCPE server implementation targeting **MCPE 0.14.3 (protocol 70)**.
+**violin** is a from-scratch MCPE server implementation for **MCPE 0.14.0-0.14.3 (protocols 45-70)**.
 It does not depend on any third-party game library — instead it implements its own
-RakNet transport, MCPE binary protocol, chunk storage format (`mojoregion`), and
+RakNet transport, MCPE binary protocol, chunk storage format (`violinregion`), and
 noise-based terrain generation, all running on top of the `tokio` async runtime.
 
-- **Protocol:** `CURRENT_PROTOCOL = 70` (MCPE 0.14.3)
-- **Server version:** `mojor 0.0.1`
+- **Protocol:** `CURRENT_PROTOCOL = 70` (target 0.14.3), `ACCEPTED_PROTOCOLS = [45, 46, 60, 70]` accepts MCPE 0.14.0–0.14.3
+- **Server version:** `violin 0.0.1`
 - **License:** [AGPLv3.0](LICENSE)
 
 ## Features
@@ -24,28 +28,28 @@ noise-based terrain generation, all running on top of the `tokio` async runtime.
 | **RakNet transport** | Custom reliable/ordered UDP transport: frame encapsulation, fragment reassembly, session management |
 | **MCPE protocol** | Single-byte packet IDs for the 0.14 protocol: login, chunk sending, entity movement, world time, etc. |
 | **World generation** | Noise-based terrain (default) + flat terrain (for testing); caves, ores, trees, vegetation population |
-| **Chunk storage** | Custom `mojoregion` format (`.mjr`) with blob deduplication and region-file storage |
+| **Chunk storage** | Custom `violinregion` format (`.mjr`) with blob deduplication and region-file storage |
 | **Chunk management** | View-distance driven load/unload, background prefetch thread pool, smooth dirty-block flush, periodic save |
 | **Command system** | `/help`, `/list`, `/seed`, `/time`, `/version` |
-| **Configuration** | Two TOML files (`server.toml` + `mojor.toml`) with environment-variable overrides |
+| **Configuration** | Two TOML files (`server.toml` + `violin.toml`) with environment-variable overrides |
 
 ## Repository layout
 
 ```text
-mojor-main/
+violin-main/
 ├── Cargo.toml              # Dependencies & package (edition 2024)
 ├── server.toml            # Basic server config (à la Nukkit's server.properties)
-├── mojor.toml             # Advanced config: performance tuning & feature switches
+├── violin.toml             # Advanced config: performance tuning & feature switches
 ├── src/
 │   ├── main.rs            # Entry point: banner, logging, config load, task orchestration
 │   ├── lib.rs             # Module declarations
 │   ├── command/           # Command parsing & execution
-│   ├── config/            # Config loading (server.toml / mojor.toml / env vars)
+│   ├── config/            # Config loading (server.toml / violin.toml / env vars)
 │   │   └── resources/banner.txt
 │   ├── entity/            # Players, dropped items and other entities
 │   ├── level/             # World, chunks, lighting, region management, generation
 │   │   ├── generator/     # Noise terrain / flat / biomes / populators
-│   │   └── format/        # Chunk serialization + mojoregion storage
+│   │   └── format/        # Chunk serialization + violinregion storage
 │   ├── network/           # MCPE protocol parsing & networking
 │   │   └── protocol/      # Per-packet (de)code (pid.rs defines packet IDs)
 │   ├── raknet/            # RakNet server + protocol
@@ -60,7 +64,7 @@ Requires Rust (edition 2024 — a recent stable ≥ 1.85 or nightly) with a work
 
 ```bash
 # Enter the source directory
-cd mojor-main
+cd violin-main
 
 # Build
 cargo build --release
@@ -69,7 +73,7 @@ cargo build --release
 cargo run --release
 ```
 
-On first run, server.toml, mojor.toml and resources/banner.txt are created
+On first run, server.toml, violin.toml and resources/banner.txt are created
 automatically, and an ASCII banner is printed (ANSI colors supported; auto-stripped
 when not a terminal, when redirected, when NO_COLOR is set, or under Wine).
 
@@ -84,7 +88,7 @@ Field names use kebab-case; missing fields fall back to Default:
 
 Field Default Description
 bind 0.0.0.0:19132 Listen address host:port
-motd Mojor Server For Minecraft:PE Server display name
+motd Violin Server For Minecraft:PE Server display name
 max-players 20 Max player count
 gamemode 1 0=survival, 1=creative
 world world World directory (holds region/*.mjr)
@@ -102,7 +106,7 @@ enable-rcon false RCON (not yet wired in)
 Note: some fields (mob spawning, whitelist, PvP, nether, RCON, etc.) are config
 placeholders only — the gameplay logic is not fully wired in yet.
 
-mojor.toml (advanced / performance)
+violin.toml (advanced / performance)
 
 Field Default Description
 io-workers 0 Background chunk-load threads, 0=vCPU count
@@ -114,14 +118,14 @@ save-interval-ticks 200 Periodic save interval (ticks)
 sync-interval-secs 12 Background disk-sync interval (seconds)
 idle-shutdown-ticks 40 Ticks idle before a slice is reclaimed
 prefetch-enabled true Enable load-circle prefetch
-log-level mojor=info tracing filter, e.g. mojor=debug
+log-level violin=info tracing filter, e.g. violin=debug
 
 Environment-variable overrides (highest priority, no file edits)
 
-For containerized deployments, override via env vars: MOJOR_BIND, MOJOR_MOTD,
-MOJOR_MAX_PLAYERS, MOJOR_GAMEMODE, MOJOR_WORLD, MOJOR_GENERATOR, MOJOR_SEED,
-MOJOR_VIEW_DISTANCE, MOJOR_IO_WORKERS, MOJOR_TOKIO_WORKERS, MOJOR_LOG.
-Additionally MOJOR_SERVER_ID pins the server ID (for stable RakNet handshakes).
+For containerized deployments, override via env vars: VIOLIN_BIND, VIOLIN_MOTD,
+VIOLIN_MAX_PLAYERS, VIOLIN_GAMEMODE, VIOLIN_WORLD, VIOLIN_GENERATOR, VIOLIN_SEED,
+VIOLIN_VIEW_DISTANCE, VIOLIN_IO_WORKERS, VIOLIN_TOKIO_WORKERS, VIOLIN_LOG.
+Additionally VIOLIN_SERVER_ID pins the server ID (for stable RakNet handshakes).
 
 Commands
 
@@ -148,7 +152,7 @@ Startup (src/main.rs)
 1. Print the colored banner (before the logging system, no timestamp).
 2. On Linux, lower the mmap threshold via mallopt + a 10s malloc_trim fallback to tame fragmentation.
 3. Initialize tracing logging (custom [INFO] time prefix, Nukkit-style; reloaded to log-level after config load).
-4. Load config (mojor.toml + server.toml + env vars).
+4. Load config (violin.toml + server.toml + env vars).
 5. Bind the UDP socket, build the RakNetServer listener (its own tokio task for the recv loop).
 6. Enter tick::run: process network packets, tick the world (load/generate/unload chunks, entities, time), run commands.
 
@@ -160,13 +164,19 @@ Networking layers
 World & chunks
 
 · level/generator/: phase 1 generate_chunk (lay terrain), phase 2 populate_chunk (caves, ores, trees, vegetation) — the latter only for noise terrain.
-· level/format/mojoregion/: custom region storage; blob.rs does blob dedup + compression (flate2), region_file.rs manages .mjr region files, store.rs is the backend.
+· level/format/violinregion/: custom region storage; blob.rs does blob dedup + compression (flate2), region_file.rs manages .mjr region files, store.rs is the backend.
 · level/chunk_manager.rs + level/region_handler.rs: view-distance driven scheduling of chunk load/generate/unload/save, backed by background IO thread pools.
 
 Protocol version
 
-src/network/protocol/pid.rs pins the MCPE 0.14 single-byte packet-ID set, CURRENT_PROTOCOL = 70.
-server.rs pins VERSION = "0.14.3".
+src/network/protocol/pid.rs pins the MCPE 0.14 single-byte packet-ID set. CURRENT_PROTOCOL = 70
+(the target version, 0.14.3), while ACCEPTED_PROTOCOLS = [45, 46, 60, 70] accepts clients from
+MCPE 0.14.0 through 0.14.3 — the same set as the iTX/Genisys Info.php. Login validates either
+protocol1 or protocol2 against this list; a rejected client gets LOGIN_FAILED_CLIENT when it is
+too old or LOGIN_FAILED_SERVER when it is too new (mirrors Genisys Player.php). The client's
+negotiated protocol is stored per player and used to decode version-sensitive packets: for
+example UseItemPacket only carries the extra slot field on protocol >= 70, matching Genisys
+UseItemPacket::decodeAdditional. server.rs pins VERSION = "0.14.3" (the server's target version).
 
 Tests
 

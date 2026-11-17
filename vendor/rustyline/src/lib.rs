@@ -162,7 +162,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         } else {
             return Ok(None);
         }
-        // mojor patch: 照搬 Paper 1.12.2 用的 JLine 3 补全流程
+        // violin patch: 照搬 Paper 1.12.2 用的 JLine 3 补全流程
         // doComplete 补公共前缀后 第一次 Tab 就走 doList(AUTO_LIST 默认开)
         // doList 里只有候选数 >= LIST_MAX(100) 或列表放不下屏幕时才问一句
         // 列表作为 post 画在输入行下面 输入行不动 再按 Tab 才进 doMenu
@@ -176,9 +176,9 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         let asked = (list_max > 0 && candidates.len() >= list_max)
             || num_rows >= s.out.get_rows().saturating_sub(prompt_lines);
         if asked {
-            // getAppName() 在 Paper 里是 "Paper" 这里是 "Mojor"
+            // getAppName() 在 Paper 里是 "Paper" 这里是 "Violin"
             let msg = format!(
-                "\nMojor: do you wish to see all {} possibilities ({} lines)?",
+                "\nViolin: do you wish to see all {} possibilities ({} lines)?",
                 candidates.len(),
                 num_rows
             );
@@ -211,7 +211,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
             return Ok(Some(cmd));
         }
         {
-            // mojor patch: 第二次 Tab 进 doMenu
+            // violin patch: 第二次 Tab 进 doMenu
             // 列表画在输入行下面 已输入的前缀标青 选中的一项反显
             // Tab 切换时上面的输入行跟着变 回车只确认选中项 Esc 取消
             let mut idx = candidates
@@ -249,7 +249,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
                         return Ok(None);
                     }
                     Cmd::AcceptLine | Cmd::Newline | Cmd::AcceptOrInsertLine { .. } => {
-                        // mojor patch: 照搬 Paper 菜单 回车只是确认选中项 不提交
+                        // violin patch: 照搬 Paper 菜单 回车只是确认选中项 不提交
                         // 列表收起后命令行留在屏幕上 再按一次回车才执行
                         paint_menu_below(s, num_rows, None)?;
                         s.changes.end();
@@ -432,7 +432,7 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
     Ok(None)
 }
 
-// mojor patch: 候选菜单按列排版 已输入的前缀标蓝 选中的一项反显 和 Paper 的菜单一样
+// violin patch: 候选菜单按列排版 已输入的前缀标蓝 选中的一项反显 和 Paper 的菜单一样
 // JLine 的 doList 画候选列表时没有选中项 用 usize::MAX 表示
 const NO_SELECTION: usize = usize::MAX;
 
@@ -495,7 +495,7 @@ fn completion_menu_rows<C: Candidate, H: Helper, P: Prompt + ?Sized>(
     (num_rows, rows)
 }
 
-// mojor patch: 提示语自己占一行 换到下一行再把 layout 归零
+// violin patch: 提示语自己占一行 换到下一行再把 layout 归零
 // 这样下一次 refresh_line 会把输入行重画在提示语下面 而不是盖在提示语那一行
 fn start_below_prompt<H: Helper, P: Prompt + ?Sized>(
     s: &mut State<'_, '_, H, P>,
@@ -505,7 +505,7 @@ fn start_below_prompt<H: Helper, P: Prompt + ?Sized>(
     Ok(())
 }
 
-// mojor patch: 候选列表画在输入行下面 画完把光标放回输入行
+// violin patch: 候选列表画在输入行下面 画完把光标放回输入行
 // 屏幕上是 "> ver" 在上 候选列表在下 Paper 的菜单就是这样
 fn paint_menu_below<H: Helper, P: Prompt + ?Sized>(
     s: &mut State<'_, '_, H, P>,

@@ -298,7 +298,7 @@ async fn digging_updates_world_and_spawns_drop() {
 #[tokio::test]
 async fn edited_block_survives_reload() {
     let path = std::env::temp_dir().join(format!(
-        "mojor-net-persist-{}-{}.redb",
+        "violin-net-persist-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -351,7 +351,7 @@ async fn edited_block_survives_reload() {
 #[tokio::test]
 async fn edit_before_light_done_survives_logout() {
     let path = std::env::temp_dir().join(format!(
-        "mojor-net-drain-{}-{}.redb",
+        "violin-net-drain-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -884,7 +884,7 @@ async fn idle_region_stops_and_is_recreated_on_demand() {
 #[tokio::test]
 async fn idle_region_saves_dirty_chunks_before_stopping() {
     let path = std::env::temp_dir().join(format!(
-        "mojor-idle-save-{}-{}.redb",
+        "violin-idle-save-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1560,7 +1560,7 @@ async fn swing_is_forwarded_to_others() {
 #[tokio::test]
 async fn spawn_point_lands_on_land() {
     let path = std::env::temp_dir().join(format!(
-        "mojor-spawn-{}-{}.redb",
+        "violin-spawn-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1594,7 +1594,7 @@ async fn spawn_point_lands_on_land() {
 #[tokio::test]
 async fn spawn_point_lands_on_land_rtg() {
     let path = std::env::temp_dir().join(format!(
-        "mojor-spawn-rtg-{}-{}.redb",
+        "violin-spawn-rtg-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1692,7 +1692,7 @@ async fn player_data_persists_across_sessions() {
     use crate::entity::PlayerData;
 
     let dir = std::env::temp_dir().join(format!(
-        "mojor-player-save-{}-{}",
+        "violin-player-save-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1757,7 +1757,7 @@ async fn shutdown_saves_online_players() {
     use crate::entity::PlayerData;
 
     let dir = std::env::temp_dir().join(format!(
-        "mojor-shutdown-save-{}-{}",
+        "violin-shutdown-save-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1827,7 +1827,7 @@ async fn stale_session_does_not_overwrite_reconnected_save() {
     use crate::entity::PlayerData;
 
     let dir = std::env::temp_dir().join(format!(
-        "mojor-reconnect-save-{}-{}",
+        "violin-reconnect-save-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1874,7 +1874,7 @@ async fn stale_session_does_not_overwrite_reconnected_save() {
 #[tokio::test]
 async fn same_name_different_uuid_gets_own_save() {
     let dir = std::env::temp_dir().join(format!(
-        "mojor-uuid-save-{}-{}",
+        "violin-uuid-save-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

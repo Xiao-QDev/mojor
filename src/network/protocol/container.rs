@@ -165,7 +165,7 @@ fn read_slots(r: &mut BinaryReader<'_>) -> Result<Vec<ItemStack>> {
 // CraftingManager::recipe_by_uuid 按同一套编号反查 别改顺序
 pub fn recipe_uuid(index: usize) -> [u8; 16] {
     let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(b"MojorRcp");
+    uuid[..8].copy_from_slice(b"ViolinRc");
     uuid[8..].copy_from_slice(&(index as u64).to_be_bytes());
     uuid
 }

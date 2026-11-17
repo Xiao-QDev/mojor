@@ -625,7 +625,7 @@ impl CraftingManager {
     // 按 CraftingData 下发的配方 UUID 反查 编号顺序与 container.rs 编码一致
     // 返回 (期望产物, 材料 id 列表) 用于校验客户端上报的合成事件
     pub fn recipe_by_uuid(&self, uuid: &[u8; 16]) -> Option<(ItemStack, Vec<Ingredient>)> {
-        if !uuid.starts_with(b"MojorRcp") {
+        if !uuid.starts_with(b"ViolinRc") {
             return None;
         }
         let index = u64::from_be_bytes(uuid[8..].try_into().ok()?) as usize;

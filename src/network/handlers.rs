@@ -13,7 +13,7 @@ use crate::network::protocol::login::LoginPacket;
 use crate::network::protocol::update_block::UpdateBlockPacket;
 
 use super::broadcast::reply;
-use super::login::{login_sequence, protocol_accepted};
+use super::login::{client_protocol, login_sequence, protocol_accepted};
 use super::{GAMEMODE_CREATIVE, NetworkState, SendCmd};
 
 impl NetworkState {
@@ -53,12 +53,16 @@ impl NetworkState {
             .data_dir()
             .and_then(|dir| PlayerData::load(dir, uuid, &login.username));
 
+        // 记下客户端协议版本 供 region 线程按版本解析 UseItem 等有差异的包
+        // 必须放在移动 login.username / login.skin 之前
+        let client_protocol = client_protocol(&login);
         let state = self.players.entry(addr).or_default();
         state.logged_in = true;
         state.eid = eid;
         state.uuid = uuid;
         state.username = login.username;
         state.skin = login.skin;
+        state.protocol = client_protocol;
         state.position = spawn_position;
         if let Some(data) = saved {
             data.apply_to(state);

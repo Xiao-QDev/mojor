@@ -9,9 +9,9 @@ use crate::network::protocol::container::CraftingDataPacket;
 use crate::network::protocol::container_set_content::ContainerSetContentPacket;
 use crate::network::protocol::login::LoginPacket;
 use crate::network::protocol::move_player::EYE_HEIGHT;
-use crate::network::protocol::pid::CURRENT_PROTOCOL;
+use crate::network::protocol::pid::{ACCEPTED_PROTOCOLS, CURRENT_PROTOCOL};
 use crate::network::protocol::play_status::{
-    LOGIN_FAILED_CLIENT, LOGIN_SUCCESS, PLAYER_SPAWN, PlayStatusPacket,
+    LOGIN_FAILED_CLIENT, LOGIN_FAILED_SERVER, LOGIN_SUCCESS, PLAYER_SPAWN, PlayStatusPacket,
 };
 use crate::network::protocol::respawn::RespawnPacket;
 use crate::network::protocol::set_difficulty::{NORMAL, SetDifficultyPacket};
@@ -24,7 +24,15 @@ use super::GAMEMODE_CREATIVE;
 use crate::level::WorldTime;
 
 pub(crate) fn protocol_accepted(login: &LoginPacket) -> bool {
-    login.protocol1 == CURRENT_PROTOCOL || login.protocol2 == CURRENT_PROTOCOL
+    // 与 ITX/Genisys Player.php 的 in_array(protocol1, ACCEPTED_PROTOCOLS) 对齐
+    // 同时兼容 protocol2 字段 覆盖 0.14.0=45 0.14.1=46 0.14.2=60 0.14.3=70
+    ACCEPTED_PROTOCOLS.contains(&login.protocol1) || ACCEPTED_PROTOCOLS.contains(&login.protocol2)
+}
+
+// 折算出与客户端握手时使用的协议号 供后续按版本区分包结构(如 UseItem 的 slot 字段)
+// Nukkit/Genisys 用 protocol1 作为玩家的 protocol
+pub(crate) fn client_protocol(login: &LoginPacket) -> i32 {
+    login.protocol1
 }
 
 pub(crate) fn login_sequence(
@@ -43,12 +51,13 @@ pub(crate) fn login_sequence(
             protocol2 = login.protocol2,
             "客户端协议版本不匹配"
         );
-        packets.push(
-            PlayStatusPacket {
-                status: LOGIN_FAILED_CLIENT,
-            }
-            .encode(),
-        );
+        // 照搬 ITX/Genisys Player.php: 低于当前协议提示客户端过旧 否则提示服务端过旧
+        let status = if login.protocol1 < CURRENT_PROTOCOL {
+            LOGIN_FAILED_CLIENT
+        } else {
+            LOGIN_FAILED_SERVER
+        };
+        packets.push(PlayStatusPacket { status }.encode());
         return packets;
     }
 
@@ -115,6 +124,64 @@ pub(crate) fn adventure_settings(gamemode: u8) -> AdventureSettingsPacket {
         flags,
         user_permission: PERMISSION_MEMBER,
         global_permission: PERMISSION_MEMBER,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::protocol::login::Skin;
+
+    fn login_with(protocol: i32) -> LoginPacket {
+        LoginPacket {
+            username: "tester".to_string(),
+            protocol1: protocol,
+            protocol2: protocol,
+            client_id: 0,
+            client_uuid: [0; 16],
+            server_address: String::new(),
+            client_secret: Bytes::new(),
+            skin: Skin {
+                model: String::new(),
+                data: Bytes::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn accepts_all_014_protocols() {
+        // 0.14.0~0.14.3 四个协议号都要放行 与 Info.php ACCEPTED_PROTOCOLS 一致
+        for &p in &ACCEPTED_PROTOCOLS {
+            assert!(protocol_accepted(&login_with(p)), "协议 {p} 应被接受");
+            assert_eq!(client_protocol(&login_with(p)), p);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_protocols() {
+        assert!(!protocol_accepted(&login_with(44)));
+        assert!(!protocol_accepted(&login_with(80)));
+    }
+
+    #[test]
+    fn protocol2_can_satisfy_acceptance() {
+        // 有些客户端只把协议号写进 protocol2
+        let mut login = login_with(0);
+        login.protocol2 = 70;
+        assert!(protocol_accepted(&login));
+    }
+
+    #[test]
+    fn rejected_client_gets_status_following_version() {
+        use crate::network::protocol::play_status::LOGIN_FAILED_SERVER;
+        // 过旧客户端 -> LOGIN_FAILED_CLIENT
+        let old = login_sequence(&login_with(44), 1, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
+        assert!(!old.is_empty());
+        assert_eq!(old[0][..], [0x90, 0, 0, 0, LOGIN_FAILED_CLIENT as u8]);
+        // 过新客户端 -> LOGIN_FAILED_SERVER
+        let new = login_sequence(&login_with(80), 1, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
+        assert!(!new.is_empty());
+        assert_eq!(new[0][..], [0x90, 0, 0, 0, LOGIN_FAILED_SERVER as u8]);
     }
 }
 

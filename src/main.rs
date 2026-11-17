@@ -11,12 +11,12 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt, reload};
 
-use mojor::config::Config;
-use mojor::error::Result;
-use mojor::level::ChunkLoader;
-use mojor::level::generator::Generator;
-use mojor::raknet::server::socket::RakNetServer;
-use mojor::tick;
+use violin::config::Config;
+use violin::error::Result;
+use violin::level::ChunkLoader;
+use violin::level::generator::Generator;
+use violin::raknet::server::socket::RakNetServer;
+use violin::tick;
 // 好想玩三角符文第六章啊QAQ
 // 内置默认 banner 用户可以在运行目录的 resources/ 里放自己的文本覆盖
 const DEFAULT_BANNER: &str =
@@ -113,7 +113,7 @@ where
         write!(
             writer,
             "{}",
-            mojor::utils::color::sections(&body, std::io::stdout().is_terminal())
+            violin::utils::color::sections(&body, std::io::stdout().is_terminal())
         )?;
         writeln!(writer)
     }
@@ -133,9 +133,9 @@ async fn main() -> Result<()> {
     let started = std::time::Instant::now();
 
     // 先按环境变量/默认级别初始化 让配置文件加载过程也能打日志
-    // 读取 mojor.toml 后再按 log-level reload 生效
+    // 读取 violin.toml 后再按 log-level reload 生效
     let (filter, reload_handle) = reload::Layer::new(
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mojor=info")),
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("violin=info")),
     );
     tracing_subscriber::registry()
         .with(filter)
@@ -143,16 +143,16 @@ async fn main() -> Result<()> {
             fmt::layer()
                 .event_format(BracketFormat)
                 // 日志走控制台输出器: 有正在编辑的输入行时先擦掉再打印
-                .with_writer(mojor::console::ConsoleWriter),
+                .with_writer(violin::console::ConsoleWriter),
         )
         .init();
 
     // 原始模式必须在任何退出路径恢复 否则 shell 会留在无回显状态
-    let _terminal = mojor::console::terminal_guard();
+    let _terminal = violin::console::terminal_guard();
 
-    // 加载配置过程中会输出 Loading mojor.toml / server.toml
+    // 加载配置过程中会输出 Loading violin.toml / server.toml
     let config = Arc::new(Config::load());
-    let _ = reload_handle.reload(EnvFilter::new(config.mojor.log_level.as_str()));
+    let _ = reload_handle.reload(EnvFilter::new(config.violin.log_level.as_str()));
 
     let mode = if config.gamemode & 1 == 0 {
         "SURVIVAL"
@@ -162,11 +162,11 @@ async fn main() -> Result<()> {
     info!("Default game type: {mode}");
     info!("Start Minecraft:PE server on : {}", config.bind);
     info!(
-        "This server is running Mojor version {} (MC: {}|API: Lunar API)",
+        "This server is running Violin version {} (MC: {}|API: Lunar API)",
         env!("CARGO_PKG_VERSION"),
-        mojor::config::server::VERSION,
+        violin::config::server::VERSION,
     );
-    info!("Mojor is released under the AGPLv3.0 license");
+    info!("Violin is released under the AGPLv3.0 license");
     info!("Preparing to generate the level \"{}\"", config.world);
 
     // 数字 IP 直连 静态 glibc 下避开 getaddrinfo 去 dlopen 系统的 libnss
@@ -177,15 +177,18 @@ async fn main() -> Result<()> {
     });
     // Windows 上关掉 SIO_UDP_CONNRESET 否则客户端在列表刷新一次就可能把监听打挂
     // 其它平台是空操作 编译后零开销
-    mojor::raknet::udp_compat::fix_udp_socket(&*socket)?;
-    let server_id = std::env::var("MOJOR_SERVER_ID")
+    // 这只是优化：失败时最多偶发 10054，不应阻止启动
+    if let Err(e) = violin::raknet::udp_compat::fix_udp_socket(&*socket) {
+        tracing::warn!("SIO_UDP_CONNRESET 设置失败（不影响运行）: {e}");
+    }
+    let server_id = std::env::var("VIOLIN_SERVER_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
-                .unwrap_or(0x006d_6f6a_6f72)
+                .unwrap_or(0x0000_7669_6f6c_696e)
         });
     let (net_tx, net_rx) = mpsc::channel(1024);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -228,7 +231,7 @@ async fn main() -> Result<()> {
     );
 
     tokio::select! {
-        res = tick::run(net_rx, cmd_tx, config.gamemode, storage, generator, config.seed, config.view_distance, config.mojor.effective_io_workers(), config.world.clone(), config.max_players) => { res?; }
+        res = tick::run(net_rx, cmd_tx, config.gamemode, storage, generator, config.seed, config.view_distance, config.violin.effective_io_workers(), config.world.clone(), config.max_players) => { res?; }
     }
 
     udp.abort();

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::format::chunk::{CHUNK_HEIGHT, Chunk};
-use crate::level::format::mojoregion::blob;
+use crate::level::format::violinregion::blob;
 use crate::level::generator::blocks::is_breakable;
 use crate::level::generator::Generator;
 use crate::level::generator::world::GenWorld;
@@ -904,7 +904,7 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "mojor-{name}-{}-{}.redb",
+            "violin-{name}-{}-{}.redb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
