@@ -140,7 +140,12 @@ impl ChunkManager {
         let chunk = data
             .and_then(|data| blob::decode(chunk_x, chunk_z, &data))
             .unwrap_or_else(|| Chunk::empty(chunk_x, chunk_z));
-        self.chunks.insert((chunk_x, chunk_z), chunk);
+        let key = (chunk_x, chunk_z);
+        self.chunks.insert(key, chunk);
+        // 存档解码出来的区块 lit 固定为 false。generated/populated 已经是 true，
+        // ensure_generated/ensure_populated 不会再补光照任务；这里必须显式排队，
+        // 否则区块会一直卡在下发门槛外，表现为走过的地方再也刷不出地形。
+        self.pending_light_init.insert(key);
     }
 
     // 第一阶段：铺基础地形
@@ -403,7 +408,11 @@ impl ChunkManager {
     pub fn insert_loaded_chunk(&mut self, chunk_x: i32, chunk_z: i32, chunk: Option<Chunk>) {
         match chunk {
             Some(chunk) => {
-                self.chunks.insert((chunk_x, chunk_z), chunk);
+                let key = (chunk_x, chunk_z);
+                self.chunks.insert(key, chunk);
+                // 与 insert_loaded 同理：磁盘上的区块带光照数据但 lit=false，
+                // 不补一次 Init 就永远等不到下发。
+                self.pending_light_init.insert(key);
             }
             None => {
                 self.chunks
@@ -783,15 +792,17 @@ impl ChunkManager {
         // Init 回执在光照没有变化时不含目标区块（不变脏就不打包）
         // 但任务本身已经完成 门槛照样要开 不然这个区块永远不下发
         let init_done = self.light_init_in_flight.remove(&owner);
+        if init_done {
+            if let Some(chunk) = self.chunks.get_mut(&owner) {
+                chunk.lit = true;
+            }
+        }
         for data in receipt.chunks {
             let key = (data.x, data.z);
             if let Some(chunk) = self.chunks.get_mut(&key) {
                 let (_, _, sky, light) = chunk.parts_mut();
                 sky.copy_from_slice(&data.sky_light);
                 light.copy_from_slice(&data.block_light);
-                if init_done && key == owner {
-                    chunk.lit = true;
-                }
                 self.dirty.insert(key);
             }
         }
@@ -1392,6 +1403,28 @@ mod tests {
         let mut reloaded = ChunkManager::with_loader(ChunkLoader::open(&path).unwrap());
         assert_eq!(reloaded.block(x, 5, z), 9);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // 从存档加载的区块必须重新排光照；空回执也要开 lit，
+    // 否则区块会一直卡在下发门槛外，新地形永远刷不出来。
+    #[test]
+    fn loaded_chunk_waits_for_light_then_opens_on_empty_receipt() {
+        let mut manager = ChunkManager::new();
+        manager.insert_loaded_chunk(0, 0, Some(Chunk::empty(0, 0)));
+        assert!(manager.pending_light_init.contains(&(0, 0)));
+        assert!(!manager.is_lit(0, 0));
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let jobs = manager.take_light_jobs(&tx);
+        assert_eq!(jobs.len(), 1);
+        assert!(manager.light_init_in_flight.contains(&(0, 0)));
+
+        manager.apply_light_receipt(LightReceipt {
+            owner: (0, 0),
+            chunks: Vec::new(),
+        });
+        assert!(manager.is_lit(0, 0));
+        assert!(manager.light_init_in_flight.is_empty());
     }
 }
 
