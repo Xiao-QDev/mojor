@@ -466,7 +466,11 @@ fn on_use_item(
         _ => return,
     };
 
-    let use_item = match UseItemPacket::decode(&packet[1..]) {
+    // 协议号取自该玩家的握手结果 0.14.0~0.14.2 的包没有 slot 字段 需按版本解析
+    let protocol = players.get(&addr).map(|p| p.state.protocol).unwrap_or(
+        crate::network::protocol::pid::CURRENT_PROTOCOL,
+    );
+    let use_item = match UseItemPacket::decode(&packet[1..], protocol) {
         Ok(item) => item,
         Err(_) => {
             return;

@@ -55,7 +55,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:19132".into(),
-            motd: "Mojor Server For Minecraft:PE".into(),
+            motd: "Violin Server For Minecraft:PE".into(),
             online_players: 0,
             max_players: DEFAULT_MAX_PLAYERS,
             gamemode: 1,

@@ -2143,7 +2143,7 @@ mod tests {
         use crate::level::chunk_loader::ChunkLoader;
 
         let path = std::env::temp_dir().join(format!(
-            "mojor-drain-{}-{}.redb",
+            "violin-drain-{}-{}.redb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

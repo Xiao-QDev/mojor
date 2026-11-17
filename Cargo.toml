@@ -1,7 +1,12 @@
 [package]
-name = "mojor"
+name = "violin"
 version = "0.0.1"
 edition = "2024"
+
+# Windows 构建时把 assets/violin.ico 嵌入为可执行文件图标
+# 非 Windows 目标下 winres 是空操作 不影响 Linux/macOS 构建
+[build-dependencies]
+winres = "0.1"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }

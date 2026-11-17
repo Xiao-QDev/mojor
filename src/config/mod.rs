@@ -1,12 +1,12 @@
 // 配置入口 两份 toml:
 //   server.toml 服务器基础配置 对标 Nukkit 的 server.properties
-//   mojor.toml  高级配置 特性开关与性能调配
-pub mod mojor;
+//   violin.toml  高级配置 特性开关与性能调配
+pub mod violin;
 pub mod server;
 
 use std::ops::Deref;
 
-pub use mojor::MoJorConfig;
+pub use violin::ViolinConfig;
 pub use server::ServerConfig;
 
 // 视距上限 再大单次要下发的区块数量会让内存与网络都吃不消
@@ -18,7 +18,7 @@ pub const DEFAULT_VIEW_DISTANCE: i32 = 2;
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub server: ServerConfig,
-    pub mojor: MoJorConfig,
+    pub violin: ViolinConfig,
 }
 
 impl Deref for Config {
@@ -33,8 +33,8 @@ impl Config {
     // 先读两份 toml 缺文件就按内置模板生成一份 再让环境变量覆盖
     pub fn load() -> Self {
         let mut config = Self {
-            // 先加载 mojor.toml 再 server.toml 与启动日志顺序一致
-            mojor: load_or_create::<MoJorConfig>("mojor.toml", DEFAULT_MOJOR_TOML),
+            // 先加载 violin.toml 再 server.toml 与启动日志顺序一致
+            violin: load_or_create::<ViolinConfig>("violin.toml", DEFAULT_VIOLIN_TOML),
             server: load_or_create::<ServerConfig>("server.toml", DEFAULT_SERVER_TOML),
         };
         config.apply_env();
@@ -52,50 +52,50 @@ impl Config {
 
     // 环境变量优先级最高 容器里不用改文件就能覆盖
     fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("MOJOR_BIND") {
+        if let Ok(v) = std::env::var("VIOLIN_BIND") {
             self.server.bind = v;
         }
-        if let Ok(v) = std::env::var("MOJOR_MOTD") {
+        if let Ok(v) = std::env::var("VIOLIN_MOTD") {
             self.server.motd = v;
         }
-        if let Ok(v) = std::env::var("MOJOR_MAX_PLAYERS")
+        if let Ok(v) = std::env::var("VIOLIN_MAX_PLAYERS")
             && let Ok(n) = v.parse::<u32>()
         {
             self.server.max_players = n;
         }
-        if let Ok(v) = std::env::var("MOJOR_GAMEMODE")
+        if let Ok(v) = std::env::var("VIOLIN_GAMEMODE")
             && let Ok(n) = v.parse::<u8>()
         {
             self.server.gamemode = n & 0x01;
         }
-        if let Ok(v) = std::env::var("MOJOR_WORLD") {
+        if let Ok(v) = std::env::var("VIOLIN_WORLD") {
             self.server.world = v;
         }
-        if let Ok(v) = std::env::var("MOJOR_GENERATOR") {
+        if let Ok(v) = std::env::var("VIOLIN_GENERATOR") {
             self.server.generator = v;
         }
-        if let Ok(v) = std::env::var("MOJOR_SEED")
+        if let Ok(v) = std::env::var("VIOLIN_SEED")
             && let Ok(n) = v.parse::<u32>()
         {
             self.server.seed = n;
         }
-        if let Ok(v) = std::env::var("MOJOR_VIEW_DISTANCE")
+        if let Ok(v) = std::env::var("VIOLIN_VIEW_DISTANCE")
             && let Ok(n) = v.parse::<i32>()
         {
             self.server.view_distance = n.clamp(1, MAX_VIEW_DISTANCE);
         }
-        if let Ok(v) = std::env::var("MOJOR_IO_WORKERS")
+        if let Ok(v) = std::env::var("VIOLIN_IO_WORKERS")
             && let Ok(n) = v.parse::<usize>()
         {
-            self.mojor.io_workers = n;
+            self.violin.io_workers = n;
         }
-        if let Ok(v) = std::env::var("MOJOR_TOKIO_WORKERS")
+        if let Ok(v) = std::env::var("VIOLIN_TOKIO_WORKERS")
             && let Ok(n) = v.parse::<usize>()
         {
-            self.mojor.tokio_workers = n;
+            self.violin.tokio_workers = n;
         }
-        if let Ok(v) = std::env::var("MOJOR_LOG") {
-            self.mojor.log_level = v;
+        if let Ok(v) = std::env::var("VIOLIN_LOG") {
+            self.violin.log_level = v;
         }
         // toml 里可能写到超范围 再夹一次
         self.server.view_distance = self.server.view_distance.clamp(1, MAX_VIEW_DISTANCE);
@@ -104,7 +104,7 @@ impl Config {
 
 // 配置模板随二进制一起编译进来 首次启动按模板生成带注释的文件
 const DEFAULT_SERVER_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/seting/server.toml"));
-const DEFAULT_MOJOR_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/seting/mojor.toml"));
+const DEFAULT_VIOLIN_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/seting/violin.toml"));
 
 // 文件不存在就按模板创建 然后读取解析 失败都回退默认值 不让坏配置挡住启动
 fn load_or_create<T: serde::de::DeserializeOwned + Default>(path: &str, template: &str) -> T {
@@ -136,14 +136,14 @@ mod tests {
 
     #[test]
     fn io_workers_zero_means_auto() {
-        let mojor = MoJorConfig::default();
-        assert!(mojor.effective_io_workers() >= 1);
+        let violin = ViolinConfig::default();
+        assert!(violin.effective_io_workers() >= 1);
     }
 
     // 文件不存在时要按模板创建出来 再读取解析
     #[test]
     fn creates_missing_config_file() {
-        let dir = std::env::temp_dir().join(format!("mojor-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("violin-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("server.toml");
         let _ = std::fs::remove_file(&path);

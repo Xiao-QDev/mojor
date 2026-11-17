@@ -26,9 +26,9 @@ const PROMPT: &str = "> ";
 const HISTORY_FILE: &str = ".console_history";
 
 // 把补全/高亮/校验打包成 rustyline 的 Helper 等价 Paper 那几处 JLine 配置
-struct MojorHelper;
+struct ViolinHelper;
 
-type ConsoleEditor = Editor<MojorHelper, DefaultHistory>;
+type ConsoleEditor = Editor<ViolinHelper, DefaultHistory>;
 
 // 日志通道: 行编辑在跑时由 rustyline 负责擦行/打印/重画 不在跑时它直接写 tty
 static PRINTER: OnceLock<Mutex<Box<dyn ExternalPrinter + Send>>> = OnceLock::new();
@@ -56,11 +56,11 @@ pub fn run(tx: Sender<String>) {
 fn build_editor() -> Option<ConsoleEditor> {
     let config = Config::builder()
         // 照搬 Paper 1.12.2 的 JLine 3 默认补全: 第一次 Tab 补公共前缀并列出候选
-        // 第二次 Tab 进菜单 (vendor/rustyline 里打了补丁 见 lib.rs 的 mojor patch)
+        // 第二次 Tab 进菜单 (vendor/rustyline 里打了补丁 见 lib.rs 的 violin patch)
         .completion_type(CompletionType::List)
         // JLine LineReaderImpl.DEFAULT_LIST_MAX = 100
         // 候选数达到这个数 或列表行数超过屏幕剩余行数时 第一次 Tab 才会问
-        // "Mojor: do you wish to see all N possibilities (M lines)?"
+        // "Violin: do you wish to see all N possibilities (M lines)?"
         // Paper 有 160 个命令 (>100) 所以会问 这里设成 8 让顶格 Tab 也能问
         // 想完全照 Paper 就把这里改回 100 想每次补全都问就设成 1
         .completion_prompt_limit(8)
@@ -74,7 +74,7 @@ fn build_editor() -> Option<ConsoleEditor> {
         .build();
     let mut editor = ConsoleEditor::with_config(config).ok()?;
     // with_config 不挂 Helper 补全/高亮都会失效 必须显式设置
-    editor.set_helper(Some(MojorHelper));
+    editor.set_helper(Some(ViolinHelper));
     let _ = editor.load_history(HISTORY_FILE);
     // 输出不是终端时拿不到 printer 日志退回直写 stdout
     if let Ok(printer) = editor.create_external_printer() {
@@ -177,7 +177,7 @@ pub fn terminal_guard() -> TerminalGuard {
 }
 
 // 补全: 只在光标所在的那个词上做 与 JLine 的 COMPLETE_IN_WORD 等价
-impl Completer for MojorHelper {
+impl Completer for ViolinHelper {
     type Candidate = Pair;
 
     fn complete(
@@ -214,11 +214,11 @@ impl Completer for MojorHelper {
     }
 }
 
-impl Hinter for MojorHelper {
+impl Hinter for ViolinHelper {
     type Hint = String;
 }
 
-impl Highlighter for MojorHelper {
+impl Highlighter for ViolinHelper {
     // 照 Paper 的 BrigadierCommandHighlighter: 认出来的命令字面量保持默认色
     // 参数依次换颜色 认不出来的部分标红
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
@@ -245,9 +245,9 @@ impl Highlighter for MojorHelper {
     }
 }
 
-impl Validator for MojorHelper {}
+impl Validator for ViolinHelper {}
 
-impl Helper for MojorHelper {}
+impl Helper for ViolinHelper {}
 
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn highlights_literals_arguments_and_errors() {
-        let helper = MojorHelper;
+        let helper = ViolinHelper;
         // 字面量不着色
         assert_eq!(helper.highlight("stop", 4), "stop");
         // 参数按颜色表上色
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn highlights_say_arguments() {
-        let helper = MojorHelper;
+        let helper = ViolinHelper;
         // /say 是已注册命令 参数按颜色表轮流上色 不能整行标红
         let colored = helper.highlight("say hello world", 15);
         assert!(!colored.contains(RED), "{colored}");
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn completes_word_at_cursor() {
-        let helper = MojorHelper;
+        let helper = ViolinHelper;
         let history = DefaultHistory::new();
         let ctx = Context::new(&history);
         let (start, pairs) = helper.complete("time s", 6, &ctx).unwrap();

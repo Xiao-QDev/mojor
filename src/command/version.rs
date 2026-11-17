@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 static BASE: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "This server is running Mojor version {} (MC: {}|API: Lunar API)",
+        "This server is running Violin version {} (MC: {}|API: Lunar API)",
         env!("CARGO_PKG_VERSION"),
         crate::config::server::VERSION
     )

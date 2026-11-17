@@ -1,7 +1,7 @@
 // 玩家数据存档 与 Java 版一样按 uuid 落到 <世界目录>/playerdata/<uuid>.dat
 // 用户名不参与路径 换台设备用同名登录拿不到这份数据
 // 早期版本按用户名存在 players/<name>.dat 升级后第一次登录时迁移到 uuid 名下 只迁一次
-// mojor 没有 NBT 实现 这里用等价的定长二进制格式 字段与 Nukkit saveNBT 对齐:
+// violin 没有 NBT 实现 这里用等价的定长二进制格式 字段与 Nukkit saveNBT 对齐:
 // Pos / Rotation / Inventory / 快捷栏映射
 use std::path::{Path, PathBuf};
 
@@ -240,7 +240,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "mojor-player-data-{name}-{}-{}",
+            "violin-player-data-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

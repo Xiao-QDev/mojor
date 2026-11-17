@@ -23,6 +23,8 @@ pub struct PlayerState {
     pub(crate) uuid: Uuid,
     pub(crate) username: String,
     pub(crate) skin: Skin,
+    // 客户端握手协议号 45/46/60/70 用于按版本区分包结构(如 UseItem 的 slot 字段)
+    pub(crate) protocol: i32,
     // 区块队列清空后由 region 通知 再补出生状态
     pub(crate) spawn_pending: bool,
     pub(crate) position: (f32, f32, f32),
@@ -49,6 +51,8 @@ impl Default for PlayerState {
                 model: String::new(),
                 data: Bytes::new(),
             },
+            // 默认按当前协议 真实值在登录时由 LoginPacket 覆盖
+            protocol: crate::network::protocol::pid::CURRENT_PROTOCOL,
             spawn_pending: false,
             position: SPAWN_POSITION,
             yaw: 0.0,

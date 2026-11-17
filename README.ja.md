@@ -1,20 +1,24 @@
-# mojor
+# violin
+
+<p align="center">
+  <img src="assets/violin.png" alt="violin" width="180">
+</p>
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Protocol](https://img.shields.io/badge/MCPE-0.14.3%20(Protocol%2070)-green.svg)](https://minecraft.wiki/w/Minecraft_Wiki)
+[![Protocol](https://img.shields.io/badge/MCPE-0.14.0-0.14.3%20(45-70)-green.svg)](https://minecraft.wiki/w/Minecraft_Wiki)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
 
 > Rust でゼロから書かれた Minecraft: Pocket Edition（MCPE / Bedrock）サーバー。
 
-**mojor** は **MCPE 0.14.3（プロトコル 70）** を対象とした、ゼロから実装された
+**violin** は **MCPE 0.14.0～0.14.3（プロトコル 45～70）** に対応した、ゼロから実装された
 MCPE サーバーです。サードパーティ製のゲームライブラリには一切依存せず、RakNet
-トランスポート、MCPE バイナリプロトコル、チャンク保存フォーマット（`mojoregion`）、
+トランスポート、MCPE バイナリプロトコル、チャンク保存フォーマット（`violinregion`）、
 ノイズベースの地形生成をすべて独自実装し、`tokio` 非同期ランタイム上で動作します。
 
-- **プロトコル：** `CURRENT_PROTOCOL = 70`（MCPE 0.14.3）
-- **サーバーバージョン：** `mojor 0.0.1`
+- **プロトコル：** `CURRENT_PROTOCOL = 70`（MCPE 0.14.3 基準）、`ACCEPTED_PROTOCOLS = [45, 46, 60, 70]` で MCPE 0.14.0～0.14.3 に対応
+- **サーバーバージョン：** `violin 0.0.1`
 - **ライセンス：** [AGPLv3.0](LICENSE)
 
 ## 機能
@@ -24,28 +28,28 @@ MCPE サーバーです。サードパーティ製のゲームライブラリに
 | **RakNet トランスポート** | 独自の信頼性/順序保証付き UDP トランスポート：フレームカプセル化、フラグメント再結合、セッション管理 |
 | **MCPE プロトコル** | 0.14 プロトコルの単一バイトパケット ID：ログイン、チャンク送信、エンティティ移動、ワールド時間など |
 | **ワールド生成** | ノイズベース地形（デフォルト）+ フラット地形（テスト用）。洞窟、鉱石、樹木、植生のポピュレート |
-| **チャンク保存** | 独自 `mojoregion` フォーマット（`.mjr`）。blob 重複排除とリージョンファイル保存 |
+| **チャンク保存** | 独自 `violinregion` フォーマット（`.mjr`）。blob 重複排除とリージョンファイル保存 |
 | **チャンク管理** | 視距離に基づくロード/アンロード、バックグラウンドプリフェッチスレッドプール、ダーティブロックのスムーズなフラッシュ、定期保存 |
 | **コマンドシステム** | `/help`、`/list`、`/seed`、`/time`、`/version` |
-| **設定** | 2 つの TOML ファイル（`server.toml` + `mojor.toml`）。環境変数による上書きに対応 |
+| **設定** | 2 つの TOML ファイル（`server.toml` + `violin.toml`）。環境変数による上書きに対応 |
 
 ## リポジトリ構成
 
 ```text
-mojor-main/
+violin-main/
 ├── Cargo.toml              # 依存関係とパッケージ（edition 2024）
 ├── server.toml            # 基本サーバー設定（Nukkit の server.properties 相当）
-├── mojor.toml             # 詳細設定：パフォーマンスチューニングと機能スイッチ
+├── violin.toml             # 詳細設定：パフォーマンスチューニングと機能スイッチ
 ├── src/
 │   ├── main.rs            # エントリポイント：バナー、ログ、設定読み込み、タスク編成
 │   ├── lib.rs             # モジュール宣言
 │   ├── command/           # コマンドの解析と実行
-│   ├── config/            # 設定読み込み（server.toml / mojor.toml / 環境変数）
+│   ├── config/            # 設定読み込み（server.toml / violin.toml / 環境変数）
 │   │   └── resources/banner.txt
 │   ├── entity/            # プレイヤー、ドロップアイテムなどのエンティティ
 │   ├── level/             # ワールド、チャンク、ライティング、リージョン管理、生成
 │   │   ├── generator/     # ノイズ地形 / フラット / バイオーム / ポピュレータ
-│   │   └── format/        # チャンクシリアライズ + mojoregion 保存
+│   │   └── format/        # チャンクシリアライズ + violinregion 保存
 │   ├── network/           # MCPE プロトコル解析とネットワーク
 │   │   └── protocol/      # パケットごとのエンコード/デコード（pid.rs がパケット ID を定義）
 │   ├── raknet/            # RakNet サーバー + プロトコル
@@ -61,7 +65,7 @@ mojor-main/
 
 ```bash
 # ソースディレクトリへ移動
-cd mojor-main
+cd violin-main
 
 # ビルド
 cargo build --release
@@ -70,7 +74,7 @@ cargo build --release
 cargo run --release
 ```
 
-初回実行時に `server.toml`、`mojor.toml`、`resources/banner.txt` が自動生成され、
+初回実行時に `server.toml`、`violin.toml`、`resources/banner.txt` が自動生成され、
 ASCII バナーが表示されます（ANSI カラー対応。非ターミナル、リダイレクト時、
 `NO_COLOR` 設定時、Wine 上では自動的に色を除去）。
 
@@ -86,7 +90,7 @@ MCPE 0.14.3 クライアントからそのアドレスに接続してくださ�
 | フィールド | デフォルト | 説明 |
 | --- | --- | --- |
 | `bind` | `0.0.0.0:19132` | 待ち受けアドレス `host:port` |
-| `motd` | `Mojor Server For Minecraft:PE` | サーバー表示名 |
+| `motd` | `Violin Server For Minecraft:PE` | サーバー表示名 |
 | `max-players` | `20` | 最大プレイヤー数 |
 | `gamemode` | `1` | `0`=サバイバル、`1`=クリエイティブ |
 | `world` | `world` | ワールドディレクトリ（`region/*.mjr` を保持） |
@@ -104,7 +108,7 @@ MCPE 0.14.3 クライアントからそのアドレスに接続してくださ�
 > 注：一部のフィールド（モブスポーン、ホワイトリスト、PvP、ネザー、RCON など）は
 > 設定上のプレースホルダのみで、ゲームプレイロジックはまだ完全には接続されていません。
 
-### `mojor.toml`（詳細 / パフォーマンス）
+### `violin.toml`（詳細 / パフォーマンス）
 
 | フィールド | デフォルト | 説明 |
 | --- | --- | --- |
@@ -117,14 +121,14 @@ MCPE 0.14.3 クライアントからそのアドレスに接続してくださ�
 | `sync-interval-secs` | `12` | バックグラウンドのディスク同期間隔（秒） |
 | `idle-shutdown-ticks` | `40` | スライス回収までのアイドル tick 数 |
 | `prefetch-enabled` | `true` | ロードサークルのプリフェッチを有効化 |
-| `log-level` | `mojor=info` | tracing フィルタ、例：`mojor=debug` |
+| `log-level` | `violin=info` | tracing フィルタ、例：`violin=debug` |
 
 ### 環境変数による上書き（最優先、ファイル編集不要）
 
-コンテナ運用向けに、環境変数で上書き可能：`MOJOR_BIND`、`MOJOR_MOTD`、
-`MOJOR_MAX_PLAYERS`、`MOJOR_GAMEMODE`、`MOJOR_WORLD`、`MOJOR_GENERATOR`、
-`MOJOR_SEED`、`MOJOR_VIEW_DISTANCE`、`MOJOR_IO_WORKERS`、`MOJOR_TOKIO_WORKERS`、
-`MOJOR_LOG`。さらに `MOJOR_SERVER_ID` でサーバー ID を固定できます（安定した
+コンテナ運用向けに、環境変数で上書き可能：`VIOLIN_BIND`、`VIOLIN_MOTD`、
+`VIOLIN_MAX_PLAYERS`、`VIOLIN_GAMEMODE`、`VIOLIN_WORLD`、`VIOLIN_GENERATOR`、
+`VIOLIN_SEED`、`VIOLIN_VIEW_DISTANCE`、`VIOLIN_IO_WORKERS`、`VIOLIN_TOKIO_WORKERS`、
+`VIOLIN_LOG`。さらに `VIOLIN_SERVER_ID` でサーバー ID を固定できます（安定した
 RakNet ハンドシェイク用）。
 
 ## コマンド
@@ -153,7 +157,7 @@ RakNet ハンドシェイク用）。
 1. カラーバナーを表示（ログシステムより前、タイムスタンプなし）。
 2. Linux では `mallopt` で mmap 閾値を下げ、10 秒の `malloc_trim` フォールバックで断片化を抑制。
 3. `tracing` ログを初期化（独自の `[INFO]` 時間プレフィックス、Nukkit スタイル。設定読み込み後に `log-level` で再読み込み）。
-4. 設定を読み込み（`mojor.toml` + `server.toml` + 環境変数）。
+4. 設定を読み込み（`violin.toml` + `server.toml` + 環境変数）。
 5. UDP ソケットをバインドし、`RakNetServer` リスナーを構築（recv ループ用の専用 `tokio` タスク）。
 6. `tick::run` へ：ネットワークパケット処理、ワールド tick（チャンクのロード/生成/アンロード、エンティティ、時間）、コマンド実行。
 
@@ -165,7 +169,7 @@ RakNet ハンドシェイク用）。
 ### ワールドとチャンク
 
 - `level/generator/`：フェーズ 1 `generate_chunk`（地形を敷設）、フェーズ 2 `populate_chunk`（洞窟、鉱石、樹木、植生）——後者はノイズ地形のみ。
-- `level/format/mojoregion/`：独自リージョン保存。`blob.rs` が blob 重複排除 + 圧縮（`flate2`）、`region_file.rs` が `.mjr` リージョンファイルを管理、`store.rs` がバックエンド。
+- `level/format/violinregion/`：独自リージョン保存。`blob.rs` が blob 重複排除 + 圧縮（`flate2`）、`region_file.rs` が `.mjr` リージョンファイルを管理、`store.rs` がバックエンド。
 - `level/chunk_manager.rs` + `level/region_handler.rs`：視距離に基づくチャンクのロード/生成/アンロード/保存のスケジューリング。バックグラウンド IO スレッドプールが支える。
 
 ### プロトコルバージョン

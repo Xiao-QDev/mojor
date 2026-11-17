@@ -3,10 +3,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::level::format::mojoregion::RegionStore;
+use crate::level::format::violinregion::RegionStore;
 
 // 区块存档 一个 region 文件管 32x32 个区块
-// 编解码在 format::mojoregion::blob 这里只负责按 region 分发
+// 编解码在 format::violinregion::blob 这里只负责按 region 分发
 pub struct ChunkLoader {
     store: RegionStore,
 }
@@ -57,12 +57,12 @@ impl ChunkLoader {
 mod tests {
     use super::*;
     use crate::level::format::chunk::Chunk;
-    use crate::level::format::mojoregion::blob;
+    use crate::level::format::violinregion::blob;
     use crate::level::generator::blocks::STONE;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "mojor-loader-{name}-{}-{}",
+            "violin-loader-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

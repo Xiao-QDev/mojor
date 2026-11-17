@@ -21,8 +21,14 @@ pub struct UseItemPacket {
 
 impl UseItemPacket {
     // 0xaa | x y z(i32) | face(u8) | 三个命中点(f32) | 三个玩家坐标(f32)
-    //      | slot(i32) | 手持物品槽
-    pub fn decode(buf: &[u8]) -> Result<Self> {
+    //      | [slot(i32)] | 手持物品槽 | 手持物品 item
+    //
+    // 0.14.3(协议 70) 起 玩家坐标之后多了一个 slot(i32) 字段
+    // 0.14.0~0.14.2(协议 45/46/60) 没有这个字段 直接跟手持物品
+    // 与 ITX/Genisys UseItemPacket::decodeAdditional 的
+    //   if($protocol >= Info::CURRENT_PROTOCOL) $this->slot = getInt();
+    // 完全一致 低版本客户端若不按此跳过会整体错位 导致放置失效
+    pub fn decode(buf: &[u8], protocol: i32) -> Result<Self> {
         let mut r = BinaryReader::new(buf);
         let pid = r.get_u8()?;
         if pid != USE_ITEM {
@@ -40,7 +46,12 @@ impl UseItemPacket {
         for _ in 0..3 {
             r.get_f32()?;
         }
-        let slot = r.get_i32()?;
+        // 协议 < 70 没有 slot 字段 与 Genisys 一致置 -1
+        let slot = if protocol >= crate::network::protocol::pid::CURRENT_PROTOCOL {
+            r.get_i32()?
+        } else {
+            -1
+        };
 
         let item_id = r.get_u16()? as i16;
         let (item_count, item_damage) = if item_id <= 0 {
@@ -89,7 +100,8 @@ mod tests {
     use super::*;
     use crate::utils::binary::BinaryWriter;
 
-    fn sample(face: u8, item_id: i16) -> Vec<u8> {
+    // with_slot=true 模拟协议 70 带 slot 字段 false 模拟协议 <70 无 slot
+    fn sample(face: u8, item_id: i16, with_slot: bool) -> Vec<u8> {
         let mut w = BinaryWriter::new();
         w.put_u8(USE_ITEM);
         w.put_i32(4);
@@ -99,7 +111,9 @@ mod tests {
         for _ in 0..6 {
             w.put_f32(0.0);
         }
-        w.put_i32(0);
+        if with_slot {
+            w.put_i32(0);
+        }
         if item_id <= 0 {
             w.put_u16(0);
         } else {
@@ -113,18 +127,31 @@ mod tests {
 
     #[test]
     fn use_item_decodes_held_item() {
-        let packet = UseItemPacket::decode(&sample(1, 3)).unwrap();
+        // 协议 70 带 slot
+        let packet = UseItemPacket::decode(&sample(1, 3, true), 70).unwrap();
         assert_eq!((packet.x, packet.y, packet.z), (4, 4, 0));
         assert_eq!(packet.face, 1);
         assert_eq!(packet.item_id, 3);
         assert_eq!(packet.item_count, 1);
+        assert_eq!(packet.slot, 0);
     }
 
     #[test]
     fn empty_hand_has_no_item() {
-        let packet = UseItemPacket::decode(&sample(1, 0)).unwrap();
+        let packet = UseItemPacket::decode(&sample(1, 0, true), 70).unwrap();
         assert_eq!(packet.item_id, 0);
         assert_eq!(packet.item_count, 0);
+    }
+
+    // 0.14.0~0.14.2 没有 slot 字段 旧代码会多吃 4 字节导致手持物品解析错位
+    #[test]
+    fn use_item_pre_0143_has_no_slot() {
+        for protocol in [45, 46, 60] {
+            let packet = UseItemPacket::decode(&sample(1, 3, false), protocol).unwrap();
+            assert_eq!(packet.item_id, 3, "协议 {protocol} 手持物品应正确解析");
+            assert_eq!(packet.item_count, 1);
+            assert_eq!(packet.slot, -1);
+        }
     }
 
     #[test]

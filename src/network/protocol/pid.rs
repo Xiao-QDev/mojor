@@ -38,4 +38,10 @@ pub const PLAYER_LIST: u8 = 0xc3;
 pub const REQUEST_CHUNK_RADIUS: u8 = 0xc8;
 pub const CHUNK_RADIUS_UPDATE: u8 = 0xc9;
 
+// 当前实现的目标协议 0.14.3
 pub const CURRENT_PROTOCOL: i32 = 70;
+
+// MCPE 0.14 各小版本协议号 与 ITX/Genisys 的 Info.php::ACCEPTED_PROTOCOLS 对齐
+// 45 = 0.14.0  46 = 0.14.1  60 = 0.14.2  70 = 0.14.3
+// 客户端 protocol1/protocol2 命中其中一个即允许进入 实现 0.14.0-0.14.3 互通
+pub const ACCEPTED_PROTOCOLS: [i32; 4] = [45, 46, 60, 70];

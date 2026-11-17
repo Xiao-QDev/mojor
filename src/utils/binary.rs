@@ -259,10 +259,10 @@ mod tests {
     #[test]
     fn string_roundtrip_and_length_limit() {
         let mut w = BinaryWriter::new();
-        w.put_string("mojor").unwrap();
+        w.put_string("violin").unwrap();
         let buf = w.freeze();
         let mut r = BinaryReader::new(&buf);
-        assert_eq!(r.get_string().unwrap(), "mojor");
+        assert_eq!(r.get_string().unwrap(), "violin");
 
         let mut w = BinaryWriter::new();
         assert!(matches!(

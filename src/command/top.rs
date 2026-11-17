@@ -14,7 +14,7 @@ pub enum TopCommand {
 impl TopCommand {
     pub fn execute(&self, os: &OsSample, ticks: Option<TickStats>) -> Vec<String> {
         let mut lines = vec![
-            "§f----------- §6§lMojor Top §f-----------§r".to_string(),
+            "§f----------- §6§lViolin Top §f-----------§r".to_string(),
             format!(
                 "§fUptime §a{}§f  Threads {}§f  Cores §a{}",
                 uptime(os.uptime_secs),
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn prints_all_sections() {
         let lines = TopCommand::Top.execute(&sample(12.3, 512, 7936), Some(stats(20.0)));
-        assert_eq!(lines[0], "§f----------- §6§lMojor Top §f-----------§r");
+        assert_eq!(lines[0], "§f----------- §6§lViolin Top §f-----------§r");
         assert!(lines.iter().any(|l| l == "§bCPU"));
         assert!(lines.iter().any(|l| l == "§bMEM"));
         assert!(lines.iter().any(|l| l == "§bTICK"));
