@@ -140,12 +140,12 @@ impl ChunkManager {
         let chunk = data
             .and_then(|data| blob::decode(chunk_x, chunk_z, &data))
             .unwrap_or_else(|| Chunk::empty(chunk_x, chunk_z));
-        let key = (chunk_x, chunk_z);
-        self.chunks.insert(key, chunk);
-        // 存档解码出来的区块 lit 固定为 false。generated/populated 已经是 true，
-        // ensure_generated/ensure_populated 不会再补光照任务；这里必须显式排队，
-        // 否则区块会一直卡在下发门槛外，表现为走过的地方再也刷不出地形。
-        self.pending_light_init.insert(key);
+        // blob::decode 出来的区块 generated/populated/lit 都是 true：存档里的
+        // 光照是之前算好一并落盘的，直接下发即可，绝不能再排一次 Init。
+        // 否则 Init 会拿缺失邻居的 bedrock 重算，把存档里正确的光照覆盖掉，
+        // 区块还会卡在 light_init_in_flight 里不下发（表现为跑图地形全消失）。
+        // decode 失败兜底的空区块 lit=false，get() 后面的 ensure_* 会生成 + 排 Init。
+        self.chunks.insert((chunk_x, chunk_z), chunk);
     }
 
     // 第一阶段：铺基础地形
@@ -408,11 +408,9 @@ impl ChunkManager {
     pub fn insert_loaded_chunk(&mut self, chunk_x: i32, chunk_z: i32, chunk: Option<Chunk>) {
         match chunk {
             Some(chunk) => {
-                let key = (chunk_x, chunk_z);
-                self.chunks.insert(key, chunk);
-                // 与 insert_loaded 同理：磁盘上的区块带光照数据但 lit=false，
-                // 不补一次 Init 就永远等不到下发。
-                self.pending_light_init.insert(key);
+                // IO 送回的 Some 区块同样来自 blob::decode，lit 已是 true，
+                // 光照随存档落盘，直接进缓存下发；不要再排 Init 重算覆盖光照。
+                self.chunks.insert((chunk_x, chunk_z), chunk);
             }
             None => {
                 self.chunks
@@ -1405,13 +1403,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // 从存档加载的区块必须重新排光照；空回执也要开 lit，
-    // 否则区块会一直卡在下发门槛外，新地形永远刷不出来。
+    // 存档 decode 出来的区块 lit=true（光照随存档落盘），直接进缓存下发。
+    // 绝不能再排一次 Init：否则 Init 拿缺失邻居重算、覆盖存档里正确的光照。
     #[test]
-    fn loaded_chunk_waits_for_light_then_opens_on_empty_receipt() {
+    fn decoded_chunk_downloads_without_extra_light_init() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.lit = true;
+        chunk.generated = true;
+        chunk.populated = true;
         let mut manager = ChunkManager::new();
-        manager.insert_loaded_chunk(0, 0, Some(Chunk::empty(0, 0)));
-        assert!(manager.pending_light_init.contains(&(0, 0)));
+        manager.insert_loaded_chunk(0, 0, Some(chunk));
+        assert!(manager.is_lit(0, 0));
+        assert!(!manager.pending_light_init.contains(&(0, 0)));
+    }
+
+    // 新生成区块的 Init 若光照无变化，回执 chunks 不含 owner；
+    // 但仍必须开 owner 的 lit，否则区块一直卡在下发门槛外（原始 bug）。
+    #[test]
+    fn init_empty_receipt_still_opens_owner_lit() {
+        let mut manager = ChunkManager::new();
+        manager.chunks.insert((0, 0), Chunk::empty(0, 0));
+        manager.pending_light_init.insert((0, 0));
         assert!(!manager.is_lit(0, 0));
 
         let (tx, _rx) = std::sync::mpsc::channel();
