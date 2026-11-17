@@ -376,6 +376,18 @@ impl PerlinSimplexNoise {
         }
     }
 
+    /// `getValue(float x, float y)`（@0x7efe30）：Σ value2(x·f, y·f)/f，f 逐级减半，不加偏移
+    pub fn get_value(&self, x: f32, y: f32) -> f32 {
+        let mut sum = 0.0f32;
+        let mut f = 1.0f32;
+        for lvl in &self.levels {
+            let v = lvl.value2(x * f, y * f);
+            sum += v / f;
+            f *= 0.5;
+        }
+        sum
+    }
+
     /// `getRegion(out, Vec2 pos, w, h, Vec2 scale, f1, f2)`，out `[z*w + x]`
     pub fn get_region(&self, pos: (f32, f32), w: usize, h: usize, scale: (f32, f32), f1: f32, f2: f32) -> Vec<f32> {
         let mut out = vec![0.0f32; w * h];

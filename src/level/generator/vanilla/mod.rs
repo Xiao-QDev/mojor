@@ -11,6 +11,7 @@
 pub mod genlayer;
 pub mod mcpe_noise;
 pub mod populator;
+pub mod surface;
 pub mod terrain;
 
 pub use terrain::TerrainGenerator;

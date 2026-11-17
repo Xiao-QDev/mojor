@@ -2,10 +2,11 @@
 // 高度场用 5×17×5 网格（世界高 128），密度公式见 example/mcpe_reader/je164.py
 use crate::level::generator::biome;
 use crate::level::generator::genlayer::BiomeGen;
-use crate::level::generator::blocks::{AIR, BEDROCK, STILL_WATER, STONE};
+use crate::level::generator::blocks::{AIR, STILL_WATER, STONE};
 use crate::level::generator::mcpe_noise::NoiseStack;
 use crate::level::generator::noise::{Noise, NoiseKind};
 use crate::level::generator::populator::{self, caves, ore};
+use crate::level::generator::vanilla::surface::SurfaceBuilder;
 use crate::level::generator::random::NukkitRandom;
 use crate::level::generator::world::GenWorld;
 
@@ -108,6 +109,7 @@ pub struct TerrainGenerator {
     stack: NoiseStack,
     biomes: BiomeGen,
     caves: Noise,
+    surface: SurfaceBuilder,
     random: NukkitRandom,
 }
 
@@ -119,6 +121,7 @@ impl Clone for TerrainGenerator {
             stack: self.stack.clone(),
             biomes: BiomeGen::new(self.seed as i64),
             caves: self.caves.clone(),
+            surface: self.surface.clone(),
             random: self.random.clone(),
         }
     }
@@ -136,6 +139,7 @@ impl TerrainGenerator {
             stack,
             biomes,
             caves,
+            surface: SurfaceBuilder::new(),
             random,
         }
     }
@@ -153,6 +157,42 @@ impl TerrainGenerator {
         // 4 格分辨率 biome（MCPE `fillRawBiomeData` = 1:4 主层 getInts(cx*4-2, cz*4-2, 10, 10)）
         let bio = self.biomes.raw_chunk(chunk_x, chunk_z);
         self.build_chunk(world, chunk_x, chunk_z, &bio);
+    }
+
+    /// 调试/对拍用：返回 (地表前方块, 地表后方块, 地表后 meta, 每方块 biome, 地表噪声)，
+    /// 方块按原版布局 `x<<11 | z<<7 | y`
+    pub fn surface_stages(&mut self, chunk_x: i32, chunk_z: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 256], Vec<f32>) {
+        use crate::level::format::chunk::Chunk;
+        let dump = |c: &Chunk| -> (Vec<u8>, Vec<u8>) {
+            let mut b = vec![0u8; 32768];
+            let mut m = vec![0u8; 32768];
+            for x in 0..16 {
+                for z in 0..16 {
+                    for y in 0..128 {
+                        b[x << 11 | z << 7 | y] = c.block(x, y, z);
+                        m[x << 11 | z << 7 | y] = c.meta(x, y, z);
+                    }
+                }
+            }
+            (b, m)
+        };
+        let mut chunks = std::collections::HashMap::new();
+        chunks.insert((chunk_x, chunk_z), Chunk::empty(chunk_x, chunk_z));
+        let bio = self.biomes.raw_chunk(chunk_x, chunk_z);
+        {
+            let mut world = GenWorld::new(&mut chunks);
+            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, false);
+        }
+        let (pre, _) = dump(&chunks[&(chunk_x, chunk_z)]);
+        let mut chunks2 = std::collections::HashMap::new();
+        chunks2.insert((chunk_x, chunk_z), Chunk::empty(chunk_x, chunk_z));
+        {
+            let mut world = GenWorld::new(&mut chunks2);
+            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, true);
+        }
+        let (post, meta) = dump(&chunks2[&(chunk_x, chunk_z)]);
+        let biomes = *self.biomes.chunk_biomes(chunk_x, chunk_z);
+        (pre, post, meta, biomes, self.surface_noise(chunk_x, chunk_z))
     }
 
     /// `buildSurfaces` 的地表噪声：PerlinSimplexNoise(+0x2c)，`[z*16 + x]`
@@ -248,6 +288,17 @@ impl TerrainGenerator {
         chunk_z: i32,
         bio: &[[u8; 10]; 10],
     ) {
+        self.build_chunk_inner(world, chunk_x, chunk_z, bio, true);
+    }
+
+    fn build_chunk_inner(
+        &mut self,
+        world: &mut GenWorld,
+        chunk_x: i32,
+        chunk_z: i32,
+        bio: &[[u8; 10]; 10],
+        with_surface: bool,
+    ) {
         self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
@@ -255,14 +306,6 @@ impl TerrainGenerator {
 
         // surface 噪声（aet.java:111）：4 八度、scale 0.03125*2
         let surf = self.surface_noise(chunk_x, chunk_z);
-
-        // 基岩深度逐列预生成，避免与区块可变借用冲突
-        let mut bed = [[0usize; 16]; 16];
-        for x in 0..16 {
-            for z in 0..16 {
-                bed[x][z] = self.random.next_range(0, 5) as usize;
-            }
-        }
 
         let Some(chunk) = world.chunk_mut(chunk_x, chunk_z) else {
             return;
@@ -280,7 +323,6 @@ impl TerrainGenerator {
         // 三线性插值 + 填充 = `RandomLevelSource::prepareHeights`（@0x814220）。
         // 原版用增量累加（f32）：y 每步 +0.125·Δ，x 每步 +0.25·Δ，z 方向首格直接取角值。
         // 密度 > 0 → 石头；否则 y ≤ 62 → 静水，其余空气。基岩在 buildSurfaces 里铺。
-        let _ = &bed;
         for cx in 0..4usize {
             for cz in 0..4usize {
                 for ck in 0..16usize {
@@ -327,48 +369,16 @@ impl TerrainGenerator {
             }
         }
 
-        // surface 层（aet.java:108-167）：从 y=127 向下，首个石头处铺草/沙，
-        // 厚度 = s/3 + 3 + rand*0.25，以下依次铺 filler
-        let mut thick = [[0i32; 16]; 16];
-        for z in 0..16 {
-            for x in 0..16 {
-                thick[x][z] =
-                    (surf[z * 16 + x] as f64 / 3.0 + 3.0 + self.random.next_double() * 0.25) as i32;
-            }
+        if !with_surface {
+            return;
         }
+        // buildSurfaces：MCPE 区块随机数 + 各 biome 的 buildSurfaceAt（含基岩）
+        let biomes = self.biomes.chunk_biomes(chunk_x, chunk_z);
+        let mut rnd = SurfaceBuilder::chunk_random(chunk_x, chunk_z);
         let Some(chunk) = world.chunk_mut(chunk_x, chunk_z) else {
             return;
         };
-        for z in 0..16 {
-            for x in 0..16 {
-                let def = biome::biome(self.pick_biome(base_x + x as i32, base_z + z as i32));
-                let cover = def.ground_cover;
-                if cover.is_empty() {
-                    continue;
-                }
-                let top = cover[0];
-                let filler = cover[1.min(cover.len() - 1)];
-                let mut left = -1i32;
-                for y in (0..128usize).rev() {
-                    if y <= bed[x][z] {
-                        break;
-                    }
-                    let cur = chunk.block(x, y, z);
-                    if cur == AIR {
-                        left = -1;
-                    } else if cur == STONE {
-                        if left == -1 {
-                            left = thick[x][z];
-                            let id = if y >= 62 { top } else { filler };
-                            chunk.set_block(x, y, z, id);
-                        } else if left > 0 {
-                            left -= 1;
-                            chunk.set_block(x, y, z, filler);
-                        }
-                    }
-                }
-            }
-        }
+        self.surface.build(chunk, chunk_x, chunk_z, &biomes, &surf, &mut rnd);
     }
 
     pub fn populate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
