@@ -350,7 +350,7 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         let (tx, rx) = mpsc::channel(16);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        let server = RakNetServer::new(socket, &Config::default(), tx, 0x006d_6f6a_6f72, cmd_rx);
+        let server = RakNetServer::new(socket, &Config::default(), tx, 0x0000_7669_6f6c_696e, cmd_rx);
         // 把下行发送端留在 task 里 否则通道关闭会让服务器立即退出
         let handle = tokio::spawn(async move {
             let _keep_cmd_tx = cmd_tx;

@@ -177,7 +177,10 @@ async fn main() -> Result<()> {
     });
     // Windows 上关掉 SIO_UDP_CONNRESET 否则客户端在列表刷新一次就可能把监听打挂
     // 其它平台是空操作 编译后零开销
-    violin::raknet::udp_compat::fix_udp_socket(&*socket)?;
+    // 这只是优化：失败时最多偶发 10054，不应阻止启动
+    if let Err(e) = violin::raknet::udp_compat::fix_udp_socket(&*socket) {
+        tracing::warn!("SIO_UDP_CONNRESET 设置失败（不影响运行）: {e}");
+    }
     let server_id = std::env::var("VIOLIN_SERVER_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -185,7 +188,7 @@ async fn main() -> Result<()> {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
-                .unwrap_or(0x006d_6f6a_6f72)
+                .unwrap_or(0x0000_7669_6f6c_696e)
         });
     let (net_tx, net_rx) = mpsc::channel(1024);
     let (cmd_tx, cmd_rx) = mpsc::channel(256);

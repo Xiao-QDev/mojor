@@ -10,8 +10,6 @@ winres = "0.1"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
-# 固定到 1.2.4，避免使用 1.2.5
-mio = "=1.2.4"
 bytes = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
