@@ -378,6 +378,11 @@ struct IoState {
     waiters: HashMap<(i32, i32), Vec<Waiter>>,
     // 进行中的跨界代发 归零才回 ForeignDone
     foreign_pending: HashMap<SocketAddr, ForeignPending>,
+    // 等光照算完才能下发的跨界区块：坐标 -> (目标玩家, 请求方分片)。
+    // 属主分片里刚生成的区块 lit=false、天空光全 0，此时若按 ForeignChunk 直接
+    // payload() 下发，客户端拿到的是全黑区块——能挖有碰撞但画面空白。
+    // 这里先挂起，等 LightDone 把光照回写、lit 打开后再真正下发并结算。
+    foreign_lit_wait: HashMap<(i32, i32), Vec<(SocketAddr, RegionId)>>,
 }
 
 impl IoState {
@@ -387,6 +392,27 @@ impl IoState {
             self.pool.submit(x, z, tx.clone());
         }
         self.waiters.entry((x, z)).or_default().push(waiter);
+    }
+
+    // 归属一个跨界代发的 remaining，归零时回 ForeignDone 让请求方结算 pending_foreign
+    // 返回本块是否为该玩家的最后一块
+    fn settle_foreign(&mut self, addr: SocketAddr, registry: &Arc<RegionRegistry>) {
+        let done = if let Some(fp) = self.foreign_pending.get_mut(&addr) {
+            fp.remaining = fp.remaining.saturating_sub(1);
+            fp.remaining == 0
+        } else {
+            false
+        };
+        if done {
+            if let Some(fp) = self.foreign_pending.remove(&addr) {
+                if let Some(t) = registry.lookup(fp.ack) {
+                    let _ = t.send(RegionMsg::ForeignDone {
+                        addr,
+                        count: fp.total,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -744,6 +770,7 @@ fn run(
         loading: HashSet::new(),
         waiters: HashMap::new(),
         foreign_pending: HashMap::new(),
+        foreign_lit_wait: HashMap::new(),
     };
     let mut ticks: u64 = 0;
     // 连续空闲的 tick 数
@@ -1541,24 +1568,34 @@ fn dispatch(
             };
             for (chunk_x, chunk_z) in chunks {
                 if manager.is_cached(chunk_x, chunk_z) {
-                    let data = manager.payload(chunk_x, chunk_z);
-                    let body = FullChunkDataPacket {
-                        chunk_x,
-                        chunk_z,
-                        order: ORDER_COLUMNS,
-                        data,
+                    if manager.is_lit(chunk_x, chunk_z) {
+                        let data = manager.payload(chunk_x, chunk_z);
+                        let body = FullChunkDataPacket {
+                            chunk_x,
+                            chunk_z,
+                            order: ORDER_COLUMNS,
+                            data,
+                        }
+                        .encode();
+                        let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
+                        buffer.push(RegionOutbound {
+                            to: Some(addr),
+                            skip: None,
+                            around: None,
+                            bodies: vec![body],
+                            events: Vec::new(),
+                            chunks_complete: false,
+                        });
+                        pending.remaining -= 1;
+                    } else {
+                        // 刚生成/还没算光照：全暗 payload 客户端会当空气不渲染。
+                        // 补排光照任务并挂起，等 LightDone 回 writes 后再下发结算。
+                        manager.prepare_for_light(chunk_x, chunk_z);
+                        io.foreign_lit_wait
+                            .entry((chunk_x, chunk_z))
+                            .or_default()
+                            .push((addr, ack));
                     }
-                    .encode();
-                    let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
-                    buffer.push(RegionOutbound {
-                        to: Some(addr),
-                        skip: None,
-                        around: None,
-                        bodies: vec![body],
-                        events: Vec::new(),
-                        chunks_complete: false,
-                    });
-                    pending.remaining -= 1;
                 } else {
                     io.request(chunk_x, chunk_z, Waiter::Foreign { addr }, tx);
                 }
@@ -1588,36 +1625,39 @@ fn dispatch(
                             }
                         }
                         Waiter::Foreign { addr } => {
-                            let data = manager.payload(x, z);
-                            let body = FullChunkDataPacket {
-                                chunk_x: x,
-                                chunk_z: z,
-                                order: ORDER_COLUMNS,
-                                data,
-                            }
-                            .encode();
-                            let mut buffer =
-                                outbound.lock().unwrap_or_else(|e| e.into_inner());
-                            buffer.push(RegionOutbound {
-                                to: Some(addr),
-                                skip: None,
-                                around: None,
-                                bodies: vec![body],
-                                events: Vec::new(),
-                                chunks_complete: false,
-                            });
-                            if let Some(fp) = io.foreign_pending.get_mut(&addr) {
-                                fp.remaining -= 1;
-                                if fp.remaining == 0 {
-                                    let (ack, total) = (fp.ack, fp.total);
-                                    io.foreign_pending.remove(&addr);
-                                    if let Some(t) = registry.lookup(ack) {
-                                        let _ = t.send(RegionMsg::ForeignDone {
-                                            addr,
-                                            count: total,
-                                        });
-                                    }
+                            if manager.is_lit(x, z) {
+                                let data = manager.payload(x, z);
+                                let body = FullChunkDataPacket {
+                                    chunk_x: x,
+                                    chunk_z: z,
+                                    order: ORDER_COLUMNS,
+                                    data,
                                 }
+                                .encode();
+                                let mut buffer =
+                                    outbound.lock().unwrap_or_else(|e| e.into_inner());
+                                buffer.push(RegionOutbound {
+                                    to: Some(addr),
+                                    skip: None,
+                                    around: None,
+                                    bodies: vec![body],
+                                    events: Vec::new(),
+                                    chunks_complete: false,
+                                });
+                                io.settle_foreign(addr, registry);
+                            } else {
+                                // 读盘回来的是新生成区块 lit=false、天空光全暗，
+                                // 直接下发同样会空白。补排光照并挂起等回执。
+                                manager.prepare_for_light(x, z);
+                                let ack = io
+                                    .foreign_pending
+                                    .get(&addr)
+                                    .map(|fp| fp.ack)
+                                    .unwrap_or(id);
+                                io.foreign_lit_wait
+                                    .entry((x, z))
+                                    .or_default()
+                                    .push((addr, ack));
                             }
                         }
                     }
@@ -1999,6 +2039,7 @@ fn dispatch(
         RegionMsg::LightDone { receipt } => {
             // 一个任务一份回执 停机 drain 靠这个计数等所有在途任务落地
             *light_in_flight = light_in_flight.saturating_sub(1);
+            let owner = receipt.owner;
             let keys: Vec<(i32, i32)> =
                 receipt.chunks.iter().map(|data| (data.x, data.z)).collect();
             manager.apply_light_receipt(receipt);
@@ -2010,6 +2051,36 @@ fn dispatch(
                     // 脏数据也不会把已下发的区块重发一遍
                     if view.awaiting_light.remove(&key) && !view.pending_chunks.contains(&key) {
                         view.pending_chunks.push_back(key);
+                    }
+                }
+            }
+            // 跨界代发的区块之前因没算光照被挂起 现在目标区块 lit 打开了才真正下发。
+            // owner 是任务目标必定已开 lit；keys 里可能只是邻居边界修正，不能单独据此发。
+            let mut ready = Vec::new();
+            if manager.is_lit(owner.0, owner.1) && io.foreign_lit_wait.contains_key(&owner) {
+                ready.push(owner);
+            }
+            for key in ready {
+                if let Some(waiters) = io.foreign_lit_wait.remove(&key) {
+                    let data = manager.payload(key.0, key.1);
+                    let body = FullChunkDataPacket {
+                        chunk_x: key.0,
+                        chunk_z: key.1,
+                        order: ORDER_COLUMNS,
+                        data,
+                    }
+                    .encode();
+                    for (addr, _ack) in waiters {
+                        let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
+                        buffer.push(RegionOutbound {
+                            to: Some(addr),
+                            skip: None,
+                            around: None,
+                            bodies: vec![body.clone()],
+                            events: Vec::new(),
+                            chunks_complete: false,
+                        });
+                        io.settle_foreign(addr, registry);
                     }
                 }
             }

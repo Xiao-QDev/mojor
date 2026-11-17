@@ -401,6 +401,15 @@ impl ChunkManager {
     pub fn prepare_for_light(&mut self, chunk_x: i32, chunk_z: i32) {
         self.ensure_generated(chunk_x, chunk_z);
         self.ensure_populated(chunk_x, chunk_z);
+        // 已 generated/populated 但还没 lit 的半成品（装饰顺手铺的邻居、
+        // 或回执被丢弃过的区块）ensure_* 会直接返回，这里兜底补排一次 Init。
+        // 否则下发方的等光照队列会永久挂起。
+        let key = (chunk_x, chunk_z);
+        if self.chunks.get(&key).is_some_and(|chunk| !chunk.lit)
+            && !self.light_init_in_flight.contains(&key)
+        {
+            self.pending_light_init.insert(key);
+        }
     }
 
     // IO 池把区块 load+decode 回来之后塞进缓存

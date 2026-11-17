@@ -66,3 +66,26 @@ cargo +1.95.0 test --lib
 - 除上述文件外，未改动地形生成、存档、命令等其它逻辑。
 - `CURRENT_PROTOCOL` 保持 70，StartGame 等下行包布局沿用现有实现（Genisys 中这四个版本的下行包结构一致）。
 - 互通的核心在于「入站解析按版本适配」+「握手协议号白名单」，本补丁完整覆盖了这两点。
+
+## 修复：跑图跨界后新区块不渲染（全黑）
+
+现象：客户端能挖、有碰撞，但地形空白不渲染；重新进服后恢复。
+
+根因：分片大小为 `REGION_CHUNKS=32`（512 格）。出生点附近区块由本片的 `tick_players`
+主路径下发，该路径检查 `is_lit()`，正常。玩家跑出分片边界后，新视野区块由属主分片
+经 `ForeignChunk` / `ChunkLoaded(Waiter::Foreign)` 代发，而这两条路径原样直接调用
+`payload()` 下发，**没有检查 `is_lit()`**。刚生成的区块 `sky_light` 全为 0，
+于是客户端拿到 blocks 正确、但天空光全黑的区块——能挖有碰撞、画面不渲染。
+重进服时区块已落盘（`blob::decode` 带出存档光照、`lit=true`），故恢复。
+
+修复（`src/level/actor.rs` + `src/level/chunk_manager.rs`）：
+- 两条 Foreign 下发路径增加 `is_lit()` 判断；未点亮的区块调用 `prepare_for_light()`
+  补排光照 Init，并登记到 `IoState.foreign_lit_wait`，暂不下发、也不结算 `ForeignDone`。
+- `RegionMsg::LightDone` 处理中，目标区块 `lit` 打开后，把等待该块的玩家逐个下发并
+  结算 `settle_foreign()`。
+- `prepare_for_light()` 兜底：对已 generated/populated 但仍 `lit=false` 的半成品区块，
+  只要不在 `light_init_in_flight` 就补排 `pending_light_init`，避免 Foreign 等待永久挂起。
+- 分片空闲判定已含 `light_in_flight` 与 `has_pending_light()`，延迟下发期间不会被回收。
+
+验证：新增回归测试 `border_chunks_are_delivered_lit`，断言 9 个跨界区块全部带非空天空光下发；
+`chunk_manager::tests` 27 项全通过。
