@@ -355,6 +355,13 @@ pub trait GenLayer: Send + Sync {
     fn get(&self, x: i32, z: i32, w: i32, h: i32) -> Vec<i32>;
     /// `initWorldGenSeed`：先父层、再本层
     fn init_world_seed(&mut self, world: i64);
+    /// 调试：子层（顺序与原版对象里的 shared_ptr 一致）
+    fn kids(&self) -> Vec<&dyn GenLayer> {
+        Vec::new()
+    }
+    fn label(&self) -> &'static str {
+        "?"
+    }
 }
 
 type Layer = Box<dyn GenLayer>;
@@ -423,6 +430,12 @@ macro_rules! single_parent_seed {
             self.parent.init_world_seed(world);
             self.seed.init(world);
         }
+        fn kids(&self) -> Vec<&dyn GenLayer> {
+            vec![self.parent.as_ref()]
+        }
+        fn label(&self) -> &'static str {
+            std::any::type_name::<Self>().rsplit("::").next().unwrap_or("?")
+        }
     };
 }
 
@@ -447,6 +460,9 @@ impl GenLayer for Island {
     }
     fn init_world_seed(&mut self, world: i64) {
         self.seed.init(world);
+    }
+    fn label(&self) -> &'static str {
+        "Island"
     }
 }
 
@@ -507,10 +523,12 @@ fn zoom(seed: i64, parent: Layer) -> Layer {
     })
 }
 
-/// `GenLayerZoom.magnify`
+/// `ZoomLayer::zoom(seed, parent, n)`：与 JE 的 `magnify` 不同，MCPE 每一层都用 **seed+1**
+///（JE 是 seed+i）。已从模拟运行的原版层对象读出各 Zoom 的层种子核对：主链、河流、丘陵河流支路
+/// 的 magnify 全部是 1001；尾部显式的 Zoom(1000+i) 循环不受影响。
 fn magnify(seed: i64, mut layer: Layer, n: i32) -> Layer {
-    for i in 0..n {
-        layer = zoom(seed + i as i64, layer);
+    for _ in 0..n {
+        layer = zoom(seed + 1, layer);
     }
     layer
 }
@@ -734,7 +752,8 @@ impl GenLayer for RiverInit {
 
 // --- GenLayerBiome（MCPE: BiomeInitLayer）---
 const WARM: [i32; 6] = [DESERT, DESERT, DESERT, SAVANNA, SAVANNA, PLAINS];
-const MEDIUM: [i32; 6] = [FOREST, ROOFED_FOREST, EXTREME_HILLS, PLAINS, BIRCH_FOREST, SWAMP];
+/// MCPE 0.14 的 MEDIUM 候选表与 JE 不同：平原重复 3 次、共 8 项（读自模拟运行的原版 BiomeInitLayer 对象）
+const MEDIUM: [i32; 8] = [FOREST, ROOFED_FOREST, EXTREME_HILLS, PLAINS, PLAINS, PLAINS, BIRCH_FOREST, SWAMP];
 const COLD: [i32; 4] = [FOREST, EXTREME_HILLS, TAIGA, PLAINS];
 const ICE: [i32; 4] = [ICE_PLAINS, ICE_PLAINS, ICE_PLAINS, COLD_TAIGA];
 
@@ -943,6 +962,12 @@ impl GenLayer for Hills {
         }
         self.seed.init(world);
     }
+    fn kids(&self) -> Vec<&dyn GenLayer> {
+        vec![self.parent.as_ref(), self.river.as_ref()]
+    }
+    fn label(&self) -> &'static str {
+        "Hills"
+    }
 }
 
 // --- GenLayerRiver ---
@@ -1137,6 +1162,12 @@ impl GenLayer for RiverMix {
         self.biome.init_world_seed(world);
         self.river.init_world_seed(world);
         self.seed.init(world);
+    }
+    fn kids(&self) -> Vec<&dyn GenLayer> {
+        vec![self.biome.as_ref(), self.river.as_ref()]
+    }
+    fn label(&self) -> &'static str {
+        "RiverMix"
     }
 }
 
@@ -1334,6 +1365,19 @@ impl BiomeGen {
     /// 1:4 分辨率原始 biome（`getInts`），`[dx + dz * w]`
     pub fn raw(&self, x4: i32, z4: i32, w: i32, h: i32) -> Vec<i32> {
         self.main.get(x4, z4, w, h)
+    }
+
+    /// 调试：深度优先导出 1:4 主层树上每个节点在同一窗口上的输出 (路径, 层名, 值)
+    pub fn debug_tree(&self, x: i32, z: i32, w: i32, h: i32) -> Vec<(String, &'static str, Vec<i32>)> {
+        fn walk(l: &dyn GenLayer, path: String, x: i32, z: i32, w: i32, h: i32, out: &mut Vec<(String, &'static str, Vec<i32>)>) {
+            out.push((path.clone(), l.label(), l.get(x, z, w, h)));
+            for (i, k) in l.kids().into_iter().enumerate() {
+                walk(k, format!("{path}{i}"), x, z, w, h, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.main.as_ref(), "r".into(), x, z, w, h, &mut out);
+        out
     }
 
     /// 1:1 分辨率（VoronoiZoom）`getInts`，`[dx + dz * w]`
