@@ -1,3 +1,4 @@
+pub mod add_entity;
 pub mod add_player;
 pub mod animate;
 pub mod adventure_settings;
@@ -5,6 +6,7 @@ pub mod chunk_radius;
 pub mod container;
 pub mod container_set_content;
 pub mod entity_data;
+pub mod entity_event;
 pub mod full_chunk_data;
 pub mod item;
 pub mod item_entity;

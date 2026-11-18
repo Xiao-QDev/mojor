@@ -3,9 +3,12 @@ pub const DATA_FLAGS: u8 = 0;
 pub const DATA_AIR: u8 = 1;
 pub const DATA_NAMETAG: u8 = 2;
 pub const DATA_SHOW_NAMETAG: u8 = 3;
+// 下落方块实体的方块信息 (block_id | data<<8) 与原版 FallingBlock 的 0x14 一致
+pub const DATA_VARIANT: u8 = 20;
 
 const TYPE_BYTE: u8 = 0;
 const TYPE_SHORT: u8 = 1;
+const TYPE_INT: u8 = 2;
 const TYPE_STRING: u8 = 4;
 
 const END: u8 = 0x7f;
@@ -62,6 +65,13 @@ impl Metadata {
 
     pub fn put_short(&mut self, id: u8, value: u16) -> &mut Self {
         self.header(TYPE_SHORT, id);
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    // i32 小端 下落方块的 DATA_VARIANT 用
+    pub fn put_int(&mut self, id: u8, value: i32) -> &mut Self {
+        self.header(TYPE_INT, id);
         self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }

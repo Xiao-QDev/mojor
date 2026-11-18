@@ -1,9 +1,11 @@
 // 游戏实体 与网络协议解耦 由 region 线程独占
 // 这里只放状态与物理 收发包一律走 network 层
+pub mod falling_block;
 pub mod item_drop;
 pub mod player;
 pub mod player_data;
 
+pub(crate) use falling_block::FallingBlock;
 pub(crate) use item_drop::ItemDrop;
 pub(crate) use player::{
     PlayerDirectory, PlayerSnapshot, PlayerState, RegionPlayer, assign_uuid,

@@ -13,10 +13,13 @@ use std::collections::HashMap;
 use super::chunk_manager::ChunkManager;
 use super::generator::blocks as b;
 
-// 流动层级上限 超过就枯竭 与 Nukkit 0.14 默认液体扩散距离一致
-pub const MAX_FLOW: u8 = 5;
-// 下落液体标志位 与 Nukkit 的 meta 8|level 一致
-const FALLING: u8 = 0x08;
+// 液体深度语义对齐 MCPE 0.14.1 原版 LiquidBlock:
+//   depth 0 = 源(静止方块)  1..7 = 水平流动(越大越远)  8..15 = 下落柱(低 3 位是层级)
+//   超过 7 的水平流会枯竭  meta 上限 15
+pub const MAX_FLOW: u8 = 7;
+// tick 间隔 原版 LiquidBlock::getTickDelay: 水 5 / 岩浆 30(主世界)
+pub const WATER_TICK_DELAY: u64 = 5;
+pub const LAVA_TICK_DELAY: u64 = 30;
 
 // 一格方块改动 供 actor 层广播 UpdateBlockPacket
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,21 +89,58 @@ pub fn is_liquid(id: u8) -> bool {
     is_water(id) || is_lava(id)
 }
 
+// 源 = 深度为 0 的液体(与 id 动态/静态无关) 对齐原版 getDepth==0
+// 原版 WATER/STILL_WATER 只是"是否在 tick 队列"的状态 真正区分源/流的是 data
 pub fn is_source(id: u8, meta: u8) -> bool {
-    (id == b::STILL_WATER || id == b::STILL_LAVA) && meta & 0x07 == 0
+    is_liquid(id) && depth_of(meta) == 0
 }
 
-fn flow_level(meta: u8) -> u8 {
-    meta & 0x07
+// 深度: 低 3 位为层级 0=源 1..7=水平 8..15=下落柱
+fn depth_of(meta: u8) -> u8 {
+    meta & 0x0f
 }
 
-fn falling(meta: u8) -> bool {
-    meta & FALLING != 0
+// 动态方块 id(8/10) <-> 静止方块 id(9/11) 原版 blockId+1/-1
+fn static_id(id: u8) -> u8 {
+    match id {
+        b::WATER => b::STILL_WATER,
+        b::LAVA => b::STILL_LAVA,
+        other => other,
+    }
 }
 
-// 重力方块 0.14 里只有沙子/砂砾会下落(铁砧行为另算 这里不涉及)
+// 液体 tick 间隔 水 5 岩浆 30
+pub fn liquid_tick_delay(id: u8) -> u64 {
+    if is_water(id) { WATER_TICK_DELAY } else { LAVA_TICK_DELAY }
+}
+
+// dropOff: 水 1 岩浆 2 与原版 tick() 的 dropOff
+fn drop_off(id: u8) -> u8 {
+    if is_water(id) { 1 } else { 2 }
+}
+
+// 重力方块 与实体模块共用同一判定(沙子/砂砾/铁砧)
 pub fn is_gravity(id: u8) -> bool {
-    id == b::SAND || id == b::GRAVEL
+    crate::entity::falling_block::is_fallable(id)
+}
+
+// 检测一格重力方块是否失去支撑 需要转成 FallingBlock 实体
+// 返回 (方块 id, meta) 由 actor 层发事件让 global 分配 eid 后回投生成实体
+// 与重心的方块逐格下移不同 这里只判定"该不该开始下落" 方块清除由 actor 做
+pub fn fall_check(manager: &mut ChunkManager, x: i32, y: i32, z: i32) -> Option<(u8, u8)> {
+    if y <= 0 || !manager.owns(x >> 4, z >> 4) {
+        return None;
+    }
+    let id = manager.block(x, y, z);
+    if !is_gravity(id) {
+        return None;
+    }
+    let below = manager.block(x, y - 1, z);
+    if below == b::AIR || is_liquid(below) || displaced_by_liquid(below) {
+        Some((id, manager.meta(x, y, z)))
+    } else {
+        None
+    }
 }
 
 // 这些植物必须种在合法基底上 不能叠在同类或其他植物上
@@ -193,58 +233,44 @@ fn write(manager: &mut ChunkManager, x: i32, y: i32, z: i32, id: u8, meta: u8, o
 const HORIZONTAL: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 // 处理一格到期更新 返回本次所有方块改动
+// 重力方块不再逐格下移(改由 actor 生成 FallingBlock 实体) 故这里只走液体
 pub fn step(manager: &mut ChunkManager, queue: &mut UpdateQueue, x: i32, y: i32, z: i32, now: u64) -> Vec<CellChange> {
     let mut out = Vec::new();
     if !manager.owns(x >> 4, z >> 4) {
         return out;
     }
     let id = manager.block(x, y, z);
-    if is_gravity(id) {
-        step_gravity(manager, queue, x, y, z, id, now, &mut out);
-    } else if is_liquid(id) {
+    if is_liquid(id) {
         step_liquid(manager, queue, x, y, z, now, &mut out);
+    } else if is_plant(id) {
+        // 原版 BushBlock::checkAlive: 基底被挖掉就枯死成空气
+        let base_ok = y > 0 && can_host_plant(id, manager.block(x, y - 1, z));
+        if !base_ok {
+            write(manager, x, y, z, b::AIR, 0, &mut out);
+        }
     }
     out
 }
 
-// 重力方块: 下方是空气/液体/可替换就往下挪一格 落到实体上方就停
-fn step_gravity(
-    manager: &mut ChunkManager,
-    queue: &mut UpdateQueue,
-    x: i32,
-    y: i32,
-    z: i32,
-    id: u8,
-    now: u64,
-    out: &mut Vec<CellChange>,
-) {
-    if y == 0 {
-        return;
+// 液体更新: 源与流都尝试向下/水平扩散, 流动液体失去供给则枯竭
+// 原版 LiquidBlockDynamic::_getHighest 取四邻中最浅的深度
+// 同种液体 meta 即深度(0=源, >7按0处理); 非同种或空返回 limit
+fn get_highest(manager: &mut ChunkManager, x: i32, y: i32, z: i32, id: u8, limit: i32) -> i32 {
+    if !same_liquid(manager.block(x, y, z), id) {
+        return limit;
     }
-    let below_y = y - 1;
-    let below = manager.block(x, below_y, z);
-    let can_fall = below == b::AIR || is_liquid(below) || displaced_by_liquid(below);
-    if !can_fall {
-        return;
+    let mut depth = manager.meta(x, y, z) as i32;
+    if depth > 7 {
+        depth = 0; // 下落柱按源级参与高度计算
     }
-    let meta = manager.meta(x, y, z);
-    // 落进液体: 液体与方块交换(液体被顶到上面那格) 否则原格变空气
-    let (replacement_id, replacement_meta) = if is_liquid(below) {
-        (below, manager.meta(x, below_y, z))
+    if depth < limit || limit < 0 {
+        depth
     } else {
-        (b::AIR, 0)
-    };
-    write(manager, x, y, z, replacement_id, replacement_meta, out);
-    write(manager, x, below_y, z, id, meta, out);
-    // 下一 tick 继续检查是否还要往下落
-    queue.schedule(x, below_y, z, now, 1);
-    // 被顶上去的液体也要重新流动
-    if is_liquid(replacement_id) {
-        queue.schedule(x, y, z, now, 1);
+        limit
     }
 }
 
-// 液体更新: 源与流都尝试向下/水平扩散, 流动液体失去供给则枯竭
+// 原版 LiquidBlockDynamic::tick 的严格移植
 fn step_liquid(
     manager: &mut ChunkManager,
     queue: &mut UpdateQueue,
@@ -256,90 +282,97 @@ fn step_liquid(
 ) {
     let id = manager.block(x, y, z);
     let meta = manager.meta(x, y, z);
-    let source = is_source(id, meta);
-    let level = flow_level(meta);
+    let depth = depth_of(meta) as i32;
+    let off = drop_off(id) as i32;
+    let flow_id = if is_water(id) { b::WATER } else { b::LAVA };
+    let delay = liquid_tick_delay(id);
 
-    // 0) 供给判定必须最先做 否则断供格先把空邻居灌满再判枯竭 会互相复活永不收敛
-    // 源永远有供给; 流动液体看同层四邻或正上方是否有 源/更近(级别更低)的同类液体
-    if !source && !has_feed(manager, x, y, z, id, level) {
-        if write(manager, x, y, z, b::AIR, 0, out) {
-            // 枯竭后唤醒周围 让更远的液体也逐级回缩
-            queue.schedule(x, y, z, now, 1);
-            for (dx, dz) in HORIZONTAL {
-                queue.schedule(x + dx, y, z + dz, now, 1);
-            }
-            queue.schedule(x, y + 1, z, now, 1);
+    // 1) 流动液体(depth>0): 取四邻最小深度 + dropOff 重算自身
+    if depth > 0 {
+        let mut highest = -100;
+        highest = get_highest(manager, x - 1, y, z, id, highest);
+        highest = get_highest(manager, x + 1, y, z, id, highest);
+        highest = get_highest(manager, x, y, z + 1, id, highest);
+        highest = get_highest(manager, x, y, z - 1, id, highest);
+
+        let mut new_depth = highest + off;
+        if new_depth > 7 || highest < 0 {
+            new_depth = -1; // 断供 枯竭
         }
-        return;
-    }
-
-    // 1) 垂直下落优先 下方是空气/可替换就流下去
-    if y > 0 {
-        let below = manager.block(x, y - 1, z);
-        if displaced_by_liquid(below) {
-            let down_id = if is_water(id) { b::WATER } else { b::LAVA };
-            // 源正下方给满级流动 流则递减; 下落柱用 falling 位标记
-            let down_level = if source { 1 } else { level.saturating_add(1).min(MAX_FLOW) };
-            if down_level <= MAX_FLOW {
-                let down_meta = down_level | FALLING;
-                if write(manager, x, y - 1, z, down_id, down_meta, out) {
-                    queue.schedule(x, y - 1, z, now, 1);
+        // 上方有同种液体 变成下落柱
+        if same_liquid(manager.block(x, y + 1, z), id) {
+            let above = manager.meta(x, y + 1, z) as i32;
+            new_depth = if above <= 7 { above + 8 } else { above };
+        }
+        // 岩浆特殊: 非源且下方是实心/源 也可能被原版的 updateCounter 逻辑归零 这里简化为水/岩浆统一
+        if new_depth != depth {
+            if new_depth < 0 {
+                if write(manager, x, y, z, b::AIR, 0, out) {
+                    // 枯竭后唤醒四周与上方 让更远的逐级回缩
+                    for (dx, dz) in HORIZONTAL {
+                        queue.schedule(x + dx, y, z + dz, now, delay);
+                    }
+                    queue.schedule(x, y + 1, z, now, delay);
+                }
+                return;
+            } else {
+                let new_meta = new_depth as u8;
+                if write(manager, x, y, z, flow_id, new_meta, out) {
+                    queue.schedule(x, y, z, now, delay);
+                    // 深度变化唤醒四邻与上方 让沉睡的静止液体重新评估(原版 neighborChanged)
+                    for (dx, dz) in HORIZONTAL {
+                        queue.schedule(x + dx, y, z + dz, now, delay);
+                    }
+                    queue.schedule(x, y + 1, z, now, delay);
                 }
             }
+        } else {
+            // 深度稳定 转成静止方块(原版 _setStatic) 保留 data
+            write(manager, x, y, z, static_id(id), meta, out);
         }
-    }
-
-    // 2) 水平扩散 源的邻居 1 级 流的邻居逐级 +1
-    let spread_level = if falling(meta) {
-        level // 下落柱每层不变级 横向照常铺开
-    } else if source {
-        1
     } else {
-        level.saturating_add(1)
-    };
-    if spread_level <= MAX_FLOW {
-        let flow_id = if is_water(id) { b::WATER } else { b::LAVA };
-        for (dx, dz) in HORIZONTAL {
+        // depth==0 是源 转成静止方块保留 data 保持源状态
+        write(manager, x, y, z, static_id(id), meta, out);
+    }
+
+    // 2) 下方能流就优先向下 否则水平扩散
+    let below = manager.block(x, y - 1, z);
+    if y > 0 && displaced_by_liquid(below) {
+        // 下落柱传当前深度 否则 depth+8
+        let down_depth = if depth >= 8 { depth } else { depth + 8 };
+        let down_meta = down_depth.min(15) as u8;
+        if write(manager, x, y - 1, z, flow_id, down_meta, out) {
+            queue.schedule(x, y - 1, z, now, delay);
+        }
+    } else if depth >= 0 && (depth == 0 || !displaced_by_liquid(below)) {
+        // 源(depth=0)或下方被堵住时水平铺开: 邻居深度 = depth+dropOff 下落柱从 1 起
+        let neighbor = if depth > 7 { 1 } else { (depth + off).min(7) } as u8;
+        // 优先流向"下方被堵住"的方向(水会优先往有底的地方铺) 简化为按四邻 cost 排序
+        let mut dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+        dirs.sort_by_key(|&(dx, dz)| {
             let (nx, nz) = (x + dx, z + dz);
-            let neighbor_block = manager.block(nx, y, nz);
-            let neighbor_meta = manager.meta(nx, y, nz);
-            // 只往空气/可替换处流 且不覆盖同源(避免同高度互相反复刷)
-            if displaced_by_liquid(neighbor_block) {
-                if write(manager, nx, y, nz, flow_id, spread_level, out) {
-                    queue.schedule(nx, y, nz, now, 1);
-                }
-            } else if is_liquid(neighbor_block)
-                && !is_source(neighbor_block, neighbor_meta)
-                && flow_level(neighbor_meta) > spread_level
-            {
-                // 邻居比当前更"远" 用更短的源头刷新它 加速收敛
-                if write(manager, nx, y, nz, flow_id, spread_level, out) {
-                    queue.schedule(nx, y, nz, now, 1);
-                }
+            if !displaced_by_liquid(manager.block(nx, y, nz)) {
+                2 // 不能流 最后
+            } else if y > 0 && !displaced_by_liquid(manager.block(nx, y - 1, nz)) {
+                0 // 下方有支撑 优先铺平
+            } else {
+                1 // 空地 也会往下掉 次之
+            }
+        });
+        for (dx, dz) in dirs {
+            let (nx, nz) = (x + dx, z + dz);
+            if !displaced_by_liquid(manager.block(nx, y, nz)) {
+                continue;
+            }
+            // 不覆盖源或更浅的同类 只覆盖空气/可替换/更深的流
+            let nb = manager.block(nx, y, nz);
+            let overwrite = displaced_by_liquid(nb)
+                && !(same_liquid(nb, id) && is_source(nb, manager.meta(nx, y, nz)));
+            if overwrite && write(manager, nx, y, nz, flow_id, neighbor, out) {
+                queue.schedule(nx, y, nz, now, delay);
             }
         }
     }
-}
-
-// 判断一格流动液体是否还有来源支撑
-fn has_feed(manager: &mut ChunkManager, x: i32, y: i32, z: i32, id: u8, level: u8) -> bool {
-    // 上方: 同种液体(源或更高级别的流)都能喂下来
-    if y + 1 < super::format::chunk::CHUNK_HEIGHT as i32 {
-        let up = manager.block(x, y + 1, z);
-        let up_meta = manager.meta(x, y + 1, z);
-        if same_liquid(up, id) && (is_source(up, up_meta) || flow_level(up_meta) < level || falling(up_meta)) {
-            return true;
-        }
-    }
-    // 同层四邻: 源或更低级别的同类液体
-    for (dx, dz) in HORIZONTAL {
-        let nb = manager.block(x + dx, y, z + dz);
-        let nb_meta = manager.meta(x + dx, y, z + dz);
-        if same_liquid(nb, id) && (is_source(nb, nb_meta) || flow_level(nb_meta) < level) {
-            return true;
-        }
-    }
-    false
 }
 
 fn same_liquid(a: u8, b: u8) -> bool {
@@ -404,8 +437,11 @@ mod tests {
     #[test]
     fn predicates_classify_blocks() {
         assert!(is_liquid(b::WATER) && is_liquid(b::STILL_LAVA));
+        // 原版: 源由 data=0 决定 与动态/静态 id 无关
         assert!(is_source(b::STILL_WATER, 0));
-        assert!(!is_source(b::WATER, 0));
+        assert!(is_source(b::WATER, 0));
+        assert!(!is_source(b::WATER, 1));
+        assert!(!is_source(b::STILL_WATER, 3));
         assert!(is_gravity(b::SAND) && is_gravity(b::GRAVEL));
         assert!(!is_gravity(b::STONE));
         assert!(is_plant(b::TALL_GRASS) && is_plant(b::WHEAT_BLOCK));
@@ -434,90 +470,116 @@ mod tests {
         assert!(!can_place(&mut m, 6, 5, 5, b::STONE));
     }
 
+    #[test]
+    fn plant_dies_when_base_removed() {
+        let mut m = flat_manager();
+        let mut q = UpdateQueue::default();
+        // y=4 草 上面 y=5 种高草 有基底不死
+        m.set_block(0, 5, 0, b::TALL_GRASS);
+        step(&mut m, &mut q, 0, 5, 0, 1);
+        assert_eq!(m.block(0, 5, 0), b::TALL_GRASS);
+        // 挖掉草基底 唤醒上方植物 再 tick 应枯死
+        m.set_block(0, 4, 0, b::AIR);
+        on_broken(&mut m, &mut q, 0, 4, 0, 1);
+        for (x, y, z) in q.take_due(100) {
+            step(&mut m, &mut q, x, y, z, 100);
+        }
+        assert_eq!(m.block(0, 5, 0), b::AIR, "失去基底的植物应枯死");
+    }
+
     // ---- 重力 ----
 
     #[test]
-    fn sand_falls_one_cell_per_tick_until_supported() {
+    fn unsupported_sand_requests_fall_entity() {
         let mut m = flat_manager();
-        let mut q = UpdateQueue::default();
-        // 沙子悬在 y=10 下方 y=4 是草 应落到 y=5
+        // 沙子悬在 y=10 下方 y=9 是空气 应触发下落实体
         m.set_block(0, 10, 0, b::SAND);
-        on_placed(&mut m, &mut q, 0, 10, 0, b::SAND, 0);
-        let mut guard = 0;
-        while !q.is_empty() && guard < 64 {
-            guard += 1;
-            let due = q.take_due(guard);
-            for (x, y, z) in due {
-                step(&mut m, &mut q, x, y, z, guard);
-            }
-        }
-        assert_eq!(m.block(0, 5, 0), b::SAND, "沙子应停在草上方 y=5");
-        assert_eq!(m.block(0, 10, 0), b::AIR);
-        assert!(guard < 64, "应当收敛 实际 {guard} 轮");
+        assert_eq!(fall_check(&mut m, 0, 10, 0), Some((b::SAND, 0)));
     }
 
     #[test]
-    fn supported_sand_does_not_move() {
+    fn supported_sand_does_not_fall() {
         let mut m = flat_manager();
-        let mut q = UpdateQueue::default();
         // y=4 是草(solid) 放在 y=5 的沙子有支撑
         m.set_block(0, 5, 0, b::SAND);
-        let changes = step(&mut m, &mut q, 0, 5, 0, 0);
-        assert!(changes.is_empty());
+        assert_eq!(fall_check(&mut m, 0, 5, 0), None);
         assert_eq!(m.block(0, 5, 0), b::SAND);
+    }
+
+    #[test]
+    fn sand_over_liquid_requests_fall() {
+        let mut m = flat_manager();
+        m.set_block(0, 4, 0, b::STILL_WATER);
+        m.set_block(0, 5, 0, b::SAND);
+        // 液体下方不算支撑 沙子应下落
+        assert_eq!(fall_check(&mut m, 0, 5, 0), Some((b::SAND, 0)));
     }
 
     // ---- 液体 ----
 
-    #[test]
-    fn water_source_spreads_and_falls() {
+    // 5x5 围墙(内圈 x,z ∈ [-1,1]) 让水铺满后能收敛 挖源后能回缩
+    fn walled_manager() -> ChunkManager {
         let mut m = flat_manager();
-        let mut q = UpdateQueue::default();
-        // 地板 y=4 是草 源在 y=5
-        m.set_block(0, 5, 0, b::STILL_WATER);
-        on_placed(&mut m, &mut q, 0, 5, 0, b::STILL_WATER, 0);
-        let mut guard = 0;
-        while !q.is_empty() && guard < 128 {
-            guard += 1;
-            for (x, y, z) in q.take_due(guard) {
-                step(&mut m, &mut q, x, y, z, guard);
+        for x in -2i32..=2 {
+            for z in -2i32..=2 {
+                if x == -2 || x == 2 || z == -2 || z == 2 {
+                    m.set_block(x, 5, z, b::STONE);
+                }
             }
         }
-        // 源本身不变
+        m
+    }
+
+    // 跑物理直到队列空 每轮步进跨过一个水 tick delay
+    fn settle(m: &mut ChunkManager, q: &mut UpdateQueue, limit: u64) -> u64 {
+        let mut guard = 0;
+        while !q.is_empty() && guard < limit {
+            guard += 6;
+            for (x, y, z) in q.take_due(guard) {
+                step(m, q, x, y, z, guard);
+            }
+        }
+        guard
+    }
+
+    #[test]
+    fn water_source_spreads_with_depth_gradient() {
+        let mut m = walled_manager();
+        let mut q = UpdateQueue::default();
+        // 源在中心 围墙限制在 3x3 内 铺满后必然收敛
+        m.set_block(0, 5, 0, b::STILL_WATER);
+        on_placed(&mut m, &mut q, 0, 5, 0, b::STILL_WATER, 0);
+        let guard = settle(&mut m, &mut q, 256);
+        // 源不变 四邻与角都有水
         assert_eq!(m.block(0, 5, 0), b::STILL_WATER);
-        // 同层四邻有流动水
-        assert!(is_water(m.block(1, 5, 0)), "东侧应有水");
-        assert!(is_water(m.block(0, 5, 1)), "南侧应有水");
-        assert!(guard < 128, "液体应收敛 实际 {guard} 轮");
+        assert_eq!(m.meta(0, 5, 0), 0, "源深度 0");
+        assert!(is_water(m.block(1, 5, 0)), "东邻应有水");
+        assert!(is_water(m.block(0, 5, 1)), "南邻应有水");
+        assert!(is_water(m.block(1, 5, 1)), "对角应有水");
+        // 原版 depth 语义: 源0 < 邻1 < 角2
+        assert_eq!(depth_of(m.meta(1, 5, 0)), 1, "邻格深度 1");
+        assert_eq!(depth_of(m.meta(1, 5, 1)), 2, "对角深度 2");
+        assert!(guard < 256, "围墙内液体应收敛 实际 {guard}");
     }
 
     #[test]
     fn source_removal_dries_flowing_water() {
-        let mut m = flat_manager();
+        let mut m = walled_manager();
         let mut q = UpdateQueue::default();
         m.set_block(0, 5, 0, b::STILL_WATER);
         on_placed(&mut m, &mut q, 0, 5, 0, b::STILL_WATER, 0);
-        // 先让它铺开
-        let mut guard = 0;
-        while !q.is_empty() && guard < 128 {
-            guard += 1;
-            for (x, y, z) in q.take_due(guard) {
-                step(&mut m, &mut q, x, y, z, guard);
-            }
-        }
+        settle(&mut m, &mut q, 256);
         assert!(is_water(m.block(1, 5, 0)));
         // 挖掉源 唤醒邻居
         m.set_block(0, 5, 0, b::AIR);
-        on_broken(&mut m, &mut q, 0, 5, 0, guard);
-        guard = 0;
-        while !q.is_empty() && guard < 256 {
-            guard += 1;
-            for (x, y, z) in q.take_due(guard) {
-                step(&mut m, &mut q, x, y, z, guard);
+        on_broken(&mut m, &mut q, 0, 5, 0, 1000);
+        settle(&mut m, &mut q, 2000);
+        // 源没了 围墙内所有流动水应逐级枯竭成空气
+        for x in -1..=1 {
+            for z in -1..=1 {
+                assert!(!is_water(m.block(x, 5, z)), "({x},{z}) 应回缩 实际 {}", m.block(x, 5, z));
             }
         }
-        // 源没了 流动水应枯竭
-        assert_eq!(m.block(1, 5, 0), b::AIR, "流动水应回缩");
     }
 
     #[test]
@@ -530,4 +592,7 @@ mod tests {
         let _out = step(&mut m, &mut q, 0, 5, 0, 0);
         assert_eq!(m.block(1, 5, 0), b::STONE, "水不能替换石头");
     }
+
+
+
 }

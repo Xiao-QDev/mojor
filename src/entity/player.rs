@@ -36,6 +36,8 @@ pub struct PlayerState {
     pub(crate) hotbar: Vec<i32>,
     pub(crate) sneaking: bool,
     pub(crate) sprinting: bool,
+    // 玩家生命值 0-20 下落方块砸落伤害用 默认满血
+    pub(crate) health: i32,
 }
 
 impl Default for PlayerState {
@@ -62,6 +64,7 @@ impl Default for PlayerState {
             hotbar: (0..9).map(|slot| slot + 9).collect(),
             sneaking: false,
             sprinting: false,
+            health: 20,
         }
     }
 }

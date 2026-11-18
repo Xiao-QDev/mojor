@@ -7,6 +7,9 @@ use crate::level::actor::RegionEvent;
 use crate::level::region::RegionId;
 use crate::network::protocol::container::ContainerOpenPacket;
 use crate::network::protocol::container_set_content::ContainerSetContentPacket;
+use crate::network::protocol::entity_event::{
+    ENTITY_EVENT_HURT, EntityEventPacket, SetHealthPacket,
+};
 use crate::network::protocol::item::ItemStack;
 use crate::network::protocol::level_event::LevelEventPacket;
 use crate::network::protocol::login::LoginPacket;
@@ -167,6 +170,31 @@ impl NetworkState {
             RegionEvent::BlockChanged { cells } => {
                 for cell in cells {
                     out.extend(self.broadcast_block(cell.x, cell.y, cell.z, cell.id, cell.meta));
+                }
+            }
+            RegionEvent::FallRequested { x, y, z, id, meta } => {
+                // 重力方块失去支撑 global 这里分配 eid 再回投给属主分片生成实体
+                let eid = self.next_eid;
+                self.next_eid += 1;
+                let creative = self.gamemode & GAMEMODE_CREATIVE != 0;
+                self.level.add_falling_block(x, y, z, eid, id, meta, creative);
+            }
+            RegionEvent::DamagePlayer { addr, damage } => {
+                // 下落方块砸中 扣血并下发 SetHealth 受击动画给附近所有玩家
+                let victim = self.players.get_mut(&addr).map(|state| {
+                    state.health = (state.health - damage).max(0);
+                    (state.health, state.eid, state.position)
+                });
+                if let Some((health, eid, position)) = victim {
+                    out.push(reply(addr, vec![SetHealthPacket { health }.encode()]));
+                    let hurt = EntityEventPacket { eid, event: ENTITY_EVENT_HURT }.encode();
+                    out.extend(self.broadcast_at(
+                        position.0.floor() as i32,
+                        position.1.floor() as i32,
+                        position.2.floor() as i32,
+                        vec![hurt],
+                        None,
+                    ));
                 }
             }
             RegionEvent::Pickup { addr, item } => {

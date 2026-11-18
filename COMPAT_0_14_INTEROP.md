@@ -302,3 +302,41 @@ Update）都排在一个 `light-engine` 线程上串行计算。多核机器上�
 
 验证：`physics::` 8 项全通过；完整 lib 测试 527 通过 / 28 失败 / 19 忽略，28 个失败与历史
 基线逐条一致、无新增，均为既有 `network::tests` 异步时序 artifact，与本次改动无关。
+
+## 按 MCPE 0.14.1 原版源码重写方块物理（实体重力 + 原版液体算法）
+
+依据用户提供的 MCPE 0.14.1 `libminecraftpe.so` 重建源码（BlockLauncher 源码包），
+并用 ITX PHP 核心 + 0.14.3 协议逆向文档交叉验证包线序，把上一版的简化物理按原版重写：
+
+**液体（严格原版 LiquidBlockDynamic）**
+- meta 就是 depth：`0=源 / 1..7=水平流 / 8..15=下落柱`，源与流用同一个 id 判断，
+  `WATER(8)/STILL_WATER(9)` 只是动态/静态 tick 状态（原版 blockId±1）。
+- `tick()`：`getHighest` 取四邻最浅深度 + dropOff（水 1 / 岩浆 2）重算自身；
+  上方有液体则变下落柱（above+8）；断供(+1 超过 7)枯竭成空气；稳定转静止方块。
+- 下方优先垂直流（depth+8），否则按"下方是否有支撑"选水平方向铺开（depth+dropOff）。
+- tick 间隔按原版：水 5 tick、岩浆 30 tick。
+- 关键修复：源由 `data==0` 决定而非方块 id，否则每个稳定流动水都会变成假源导致不收敛；
+  深度变化要唤醒邻格（原版 neighborChanged），否则断源后加深链中断、水永不枯竭。
+
+**重力（原版 FallingBlock 实体，替换旧的方块逐格下移）**
+- 沙子(12)/砂砾(13)/铁砧(166/167)失去支撑时 `fall_check` 触发 → `RegionEvent::FallRequested`
+  → global 分配 eid → `RegionMsg::AddFallingBlock` 回投属主分片 → 清除方块并生成实体。
+- 实体物理按原版 `FallingBlock::normalTick`：重力 0.04、阻尼 0.98、落地 `tryToPlace` 固化；
+  落空超时(fallTime>100)移除；每 tick 发 `MoveEntityPacket` 让客户端看到平滑下落。
+- 砸落伤害：下落中砸中玩家 → `RegionEvent::DamagePlayer` → global 扣血 + `SetHealthPacket`
+  + `EntityEventPacket`(HURT=2) 受击动画。为此给 `PlayerState` 增加 health 字段(默认 20)。
+- 新增 3 个协议包并交叉验证线序：`AddEntityPacket`(0x98, type=66, metadata DATA_VARIANT=0x14)、
+  `SetHealthPacket`(0xb0, i32 BE)、`EntityEventPacket`(0xa4, eid i64 + event u8)。
+  metadata 条目 `(type<<5)|id` + 小端数值 + 0x7f 结尾，无长度前缀。
+
+**放置判定（原版 BushBlock::mayPlaceOn）**
+- 植物基底只认草/泥土/耕地/灰化土(+菌丝/草径)，不能叠在植物上；
+  新增 `checkAlive`：基底被挖掉后植物 tick 时枯死成空气（对齐原版 `BushBlock::checkAlive`）。
+
+改动文件：新增 `src/entity/falling_block.rs`、`src/network/protocol/add_entity.rs`、
+`src/network/protocol/entity_event.rs`；改 `src/network/protocol/{pid,entity_data,mod}.rs`、
+`src/level/{physics,actor,level}.rs`、`src/network/handlers.rs`、`src/network/broadcast.rs`、
+`src/entity/{mod,player}.rs`。
+
+验证：协议包 3 项、实体 3 项、物理 10 项、重力实体端到端 1 项全通过；
+完整 lib 测试 536 通过 / 28 失败 / 19 忽略，28 个失败与历史基线逐条一致、无新增。
