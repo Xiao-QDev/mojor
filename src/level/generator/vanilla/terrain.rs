@@ -4,8 +4,7 @@ use crate::level::generator::biome;
 use crate::level::generator::genlayer::BiomeGen;
 use crate::level::generator::blocks::{AIR, STILL_WATER, STONE};
 use crate::level::generator::mcpe_noise::NoiseStack;
-use crate::level::generator::noise::{Noise, NoiseKind};
-use crate::level::generator::populator::{self, caves, ore};
+use crate::level::generator::populator::{self, ore};
 use crate::level::generator::vanilla::surface::SurfaceBuilder;
 use crate::level::generator::random::NukkitRandom;
 use crate::level::generator::world::GenWorld;
@@ -108,7 +107,6 @@ pub struct TerrainGenerator {
     seed: u32,
     stack: NoiseStack,
     biomes: BiomeGen,
-    caves: Noise,
     surface: SurfaceBuilder,
     random: NukkitRandom,
 }
@@ -120,7 +118,6 @@ impl Clone for TerrainGenerator {
             seed: self.seed,
             stack: self.stack.clone(),
             biomes: BiomeGen::new(self.seed as i64),
-            caves: self.caves.clone(),
             surface: self.surface.clone(),
             random: self.random.clone(),
         }
@@ -130,15 +127,13 @@ impl Clone for TerrainGenerator {
 impl TerrainGenerator {
     pub fn new(seed: u32) -> Self {
         let stack = NoiseStack::new(seed);
-        let mut random = NukkitRandom::new(seed as i64);
+        let random = NukkitRandom::new(seed as i64);
         // biome 改由 GenLayer 链生成（对齐 MCPE 0.14.3），不再用 Nukkit 噪声选择器
         let biomes = BiomeGen::new(seed as i64);
-        let caves = Noise::new(NoiseKind::Simplex, &mut random, 4.1, 15.0, 1.0 / 200.0);
         Self {
             seed,
             stack,
             biomes,
-            caves,
             surface: SurfaceBuilder::new(),
             random,
         }
@@ -159,9 +154,9 @@ impl TerrainGenerator {
         self.build_chunk(world, chunk_x, chunk_z, &bio);
     }
 
-    /// 调试/对拍用：返回 (地表前方块, 地表后方块, 地表后 meta, 每方块 biome, 地表噪声)，
+    /// 调试/对拍用：返回 (地表前方块, 地表后方块, 地表后 meta, 每方块 biome, 地表噪声, 洞穴后方块)，
     /// 方块按原版布局 `x<<11 | z<<7 | y`
-    pub fn surface_stages(&mut self, chunk_x: i32, chunk_z: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 256], Vec<f32>) {
+    pub fn surface_stages(&mut self, chunk_x: i32, chunk_z: i32) -> (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 256], Vec<f32>, Vec<u8>) {
         use crate::level::format::chunk::Chunk;
         let dump = |c: &Chunk| -> (Vec<u8>, Vec<u8>) {
             let mut b = vec![0u8; 32768];
@@ -181,18 +176,25 @@ impl TerrainGenerator {
         let bio = self.biomes.raw_chunk(chunk_x, chunk_z);
         {
             let mut world = GenWorld::new(&mut chunks);
-            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, false);
+            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, 0);
         }
         let (pre, _) = dump(&chunks[&(chunk_x, chunk_z)]);
         let mut chunks2 = std::collections::HashMap::new();
         chunks2.insert((chunk_x, chunk_z), Chunk::empty(chunk_x, chunk_z));
         {
             let mut world = GenWorld::new(&mut chunks2);
-            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, true);
+            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, 1);
         }
         let (post, meta) = dump(&chunks2[&(chunk_x, chunk_z)]);
+        let mut chunks3 = std::collections::HashMap::new();
+        chunks3.insert((chunk_x, chunk_z), Chunk::empty(chunk_x, chunk_z));
+        {
+            let mut world = GenWorld::new(&mut chunks3);
+            self.build_chunk_inner(&mut world, chunk_x, chunk_z, &bio, 2);
+        }
+        let (cave, _) = dump(&chunks3[&(chunk_x, chunk_z)]);
         let biomes = *self.biomes.chunk_biomes(chunk_x, chunk_z);
-        (pre, post, meta, biomes, self.surface_noise(chunk_x, chunk_z))
+        (pre, post, meta, biomes, self.surface_noise(chunk_x, chunk_z), cave)
     }
 
     /// `buildSurfaces` 的地表噪声：PerlinSimplexNoise(+0x2c)，`[z*16 + x]`
@@ -288,7 +290,7 @@ impl TerrainGenerator {
         chunk_z: i32,
         bio: &[[u8; 10]; 10],
     ) {
-        self.build_chunk_inner(world, chunk_x, chunk_z, bio, true);
+        self.build_chunk_inner(world, chunk_x, chunk_z, bio, 2);
     }
 
     fn build_chunk_inner(
@@ -297,7 +299,7 @@ impl TerrainGenerator {
         chunk_x: i32,
         chunk_z: i32,
         bio: &[[u8; 10]; 10],
-        with_surface: bool,
+        stage: u8,
     ) {
         self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
         let base_x = chunk_x * 16;
@@ -369,7 +371,7 @@ impl TerrainGenerator {
             }
         }
 
-        if !with_surface {
+        if stage == 0 {
             return;
         }
         // buildSurfaces：MCPE 区块随机数 + 各 biome 的 buildSurfaceAt（含基岩）
@@ -379,12 +381,15 @@ impl TerrainGenerator {
             return;
         };
         self.surface.build(chunk, chunk_x, chunk_z, &biomes, &surf, &mut rnd);
+        // loadChunk：无限世界（RandomLevelSource ctor 的 bool = 0）在地表之后挖洞穴
+        if stage >= 2 {
+            crate::level::generator::vanilla::caves::apply(chunk, chunk_x, chunk_z, self.seed);
+        }
     }
 
     pub fn populate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
         self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
 
-        caves::populate(world, chunk_x, chunk_z, &self.caves);
         ore::populate(world, chunk_x, chunk_z, &mut self.random);
 
         let biome_id = world

@@ -11,6 +11,7 @@
 | `heights.py <seed> <cx> <cz>`（stdin 100 个 biome） | `RandomLevelSource::getHeights` 5×5×17 密度 | `dens_dump` |
 | `surf.py <seed> <cx> <cz>` | `PerlinSimplexNoise::getRegion` 地表噪声 | `surf_dump` |
 | `surfcheck.py <seed> <cx> <cz> <dir>` | 各 biome 的 `buildSurfaceAt`（地表/基岩） | `surface_dump` |
+| `cavecheck.py <seed> <cx> <cz> <dir>` | `LargeFeature::apply`（LargeCaveFeature 洞穴） | `surface_dump`（cave.bin） |
 | `layers2.py <seed> <0\|1> <cx0> <cz0> <n>` | `Layer::getDefaultLayers` 主层 10×10 / voronoi 16×16 | `gl_chunks` |
 | `tree2.py <seed> <x> <z> <w> <h>` | 整棵 biome 层树逐节点输出 | `gl_tree` |
 | `btab.py` / `biome_table.py` | 导出 biome 参数表（surface.rs / terrain.rs 里的表） | — |
