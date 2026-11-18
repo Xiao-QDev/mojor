@@ -3,6 +3,7 @@ use crate::network::protocol::pid::PLAYER_ACTION;
 use crate::utils::binary::BinaryReader;
 
 // 与 Nukkit PlayerActionPacket 的动作编号一致
+pub const ACTION_RELEASE_ITEM: i32 = 5;
 pub const ACTION_START_SPRINT: i32 = 9;
 pub const ACTION_STOP_SPRINT: i32 = 10;
 pub const ACTION_START_SNEAK: i32 = 11;

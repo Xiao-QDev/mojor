@@ -20,6 +20,7 @@ use crate::network::protocol::item_entity::TakeItemEntityPacket;
 use crate::network::protocol::move_entity::{MoveEntityEntry, MoveEntityPacket};
 use crate::network::protocol::move_player::{EYE_HEIGHT, MovePlayerPacket};
 use crate::network::protocol::remove_entity::RemoveEntityPacket;
+use crate::network::protocol::update_block::UpdateBlockPacket;
 use crate::level::chunk_loader::ChunkLoader;
 use crate::level::chunk_io::ChunkIoPool;
 use crate::block::placement::Placement;
@@ -119,6 +120,24 @@ pub enum RegionEvent {
         z: i32,
         id: u8,
         meta: u8,
+    },
+    // 下落方块落地时目标格被占 原版 spawnAtLocation 掉落物品
+    // region 线程没有 eid 分配器 交给 global 分配后回投 AddDrop
+    FallingBlockDropped {
+        x: i32,
+        y: i32,
+        z: i32,
+        id: u8,
+        meta: u8,
+        creative: bool,
+    },
+    // 玩家投掷/发射投射物 region 线程没有 eid 分配器
+    // 交给 global 分配后回投 LaunchProjectile 让属主分片生成实体
+    LaunchProjectile {
+        kind: crate::entity::projectile::ProjectileKind,
+        position: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        speed: f32,
     },
     // 下落方块砸中玩家 让 global 扣血并下发 SetHealth/受击动画
     DamagePlayer {
@@ -334,6 +353,24 @@ pub(crate) enum RegionMsg {
         cells: Placement,
         // 手持物品 id 放置失败要原样退回
         item: i16,
+    },
+    // 发射投射物(弓箭/雪球/蛋/末影珍珠) global 分配 eid 后回投属主分片生成
+    LaunchProjectile {
+        eid: i64,
+        kind: crate::entity::projectile::ProjectileKind,
+        position: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        speed: f32,
+    },
+    // 功能物品(桶/打火石/锄头/骨粉)对方块使用
+    // 分片读世界方块后用纯函数判定 原子应用改动 + 回写背包物品
+    UseItemOn {
+        addr: SocketAddr,
+        item: crate::network::protocol::item::ItemStack,
+        // 被点方块坐标 和 点击面相邻格(放置位置)
+        click: (i32, i32, i32),
+        target: (i32, i32, i32),
+        slot: usize,
     },
     // 方块被挖掉 属主分片就地生成掉落物
     AddDrop {
@@ -559,6 +596,20 @@ impl RegionHandle {
     ) {
         let _ = self.tx.send(RegionMsg::AddFallingBlock {
             eid, x, y, z, id, meta, creative,
+        });
+    }
+
+    // global 分配好 eid 后让抛出点分片生成投射物实体
+    pub(crate) fn launch_projectile(
+        &self,
+        eid: i64,
+        kind: crate::entity::projectile::ProjectileKind,
+        position: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        speed: f32,
+    ) {
+        let _ = self.tx.send(RegionMsg::LaunchProjectile {
+            eid, kind, position, direction, speed,
         });
     }
 
@@ -849,6 +900,8 @@ fn run(
     let mut drops: Vec<ItemDrop> = Vec::new();
     // 下落方块实体(沙子/砂砾/铁砧) 失去支撑时由 global 分配 eid 后在此生成
     let mut falling_blocks: Vec<FallingBlock> = Vec::new();
+    // 投射物实体(箭/雪球/蛋/末影珍珠) 由玩家使用物品触发
+    let mut projectiles: Vec<crate::entity::projectile::Projectile> = Vec::new();
     // 已请求下落但还没回投生成实体的格子 避免重复请求
     let mut falls_pending: HashSet<(i32, i32, i32)> = HashSet::new();
     let mut next_tick = Instant::now() + REGION_TICK;
@@ -882,6 +935,7 @@ fn run(
                         &mut physics_queue,
                         &mut falling_blocks,
                         &mut falls_pending,
+                        &mut projectiles,
                     ) {
                         stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                         return;
@@ -961,6 +1015,8 @@ fn run(
                     }
                 }
             }
+            // 饥饿系统: 冷却递减 + 回血/饿死 + 疲劳衰减
+            tick_hunger(&mut players, &outbound, ticks);
             tick_players(&mut manager, &mut players, &outbound, &registry, id, &mut io, &tx);
             // 上一拍排队没来得及挖的 按节流节奏补上
             drain_digs(&mut manager, &mut physics_queue, &mut players, &outbound, ticks);
@@ -982,6 +1038,7 @@ fn run(
                 view_distance,
                 ticks,
             );
+            tick_projectiles(&mut manager, &mut projectiles, &outbound, view_distance);
 
             // 没玩家也没实体就累计空闲 到点上报一次让 global region 撤线程
             // 线程自己不停 生命周期统一由 Level 管 免得留下悬空句柄
@@ -991,6 +1048,7 @@ fn run(
                 && players.is_empty()
                 && drops.is_empty()
                 && falling_blocks.is_empty()
+                && projectiles.is_empty()
                 && falls_pending.is_empty()
                 && light_in_flight == 0
                 && !manager.has_pending_light()
@@ -1077,8 +1135,9 @@ fn run(
                         &mut physics_queue,
                         &mut falling_blocks,
                         &mut falls_pending,
+                        &mut projectiles,
                     ) {
-                    stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
+                        stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                     return;
                 }
             }
@@ -1496,6 +1555,7 @@ fn tick_falling_blocks(
     let mut moves: Vec<Bytes> = Vec::new();
     let mut damages: Vec<RegionEvent> = Vec::new();
     let mut changes: Vec<CellChange> = Vec::new();
+    let mut drop_events: Vec<RegionEvent> = Vec::new();
 
     for (index, block) in falling.iter_mut().enumerate() {
         let below = blocks[index * 2];
@@ -1518,6 +1578,18 @@ fn tick_falling_blocks(
                 changes.push(CellChange { x: bx, y: by, z: bz, id: block.block_id, meta: block.block_data });
                 // 落地唤醒四邻 液体被替换后要重新流动
                 physics::on_placed(manager, physics_queue, bx, by, bz, block.block_id, now);
+            } else if !block.creative && block.block_id != crate::level::generator::blocks::AIR {
+                // 原版 FallingBlock::normalTick: tryToPlace 失败且非创造 -> spawnAtLocation(id, 1)
+                // 目标格被占(如落到另一块重力方块上)时 方块变成掉落物 而不是凭空消失
+                // region 线程不能自己分配 eid 交给 global 回投 AddDrop
+                drop_events.push(RegionEvent::FallingBlockDropped {
+                    x: bx,
+                    y: by,
+                    z: bz,
+                    id: block.block_id,
+                    meta: block.block_data,
+                    creative: block.creative,
+                });
             }
             // 砸落伤害: 下落中撞到玩家 或玩家正好站在落点格
             if was_falling {
@@ -1593,7 +1665,160 @@ fn tick_falling_blocks(
             },
         );
     }
+    if !drop_events.is_empty() {
+        push_outbound(
+            outbound,
+            RegionOutbound {
+                to: None, skip: None, around: None,
+                bodies: Vec::new(),
+                events: drop_events,
+                chunks_complete: false,
+            },
+        );
+    }
     let _ = id;
+}
+
+// 投射物每拍物理: 推进 + 撞地移除 + MoveEntity 同步
+fn tick_projectiles(
+    manager: &mut ChunkManager,
+    projectiles: &mut Vec<crate::entity::projectile::Projectile>,
+    outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
+    view_distance: i32,
+) {
+    if projectiles.is_empty() {
+        return;
+    }
+    let mut bodies = Vec::new();
+    let mut done = Vec::new();
+    for p in projectiles.iter_mut() {
+        // 查脚下地面顶面: 从当前位置向下找第一个非 free 方块
+        let bx = p.position.0.floor() as i32;
+        let bz = p.position.2.floor() as i32;
+        let feet = p.position.1 - 0.1;
+        let mut ground_top: Option<f32> = None;
+        let start_y = feet.floor() as i32;
+        for y in (0..=start_y.min(255)).rev() {
+            if manager.owns(bx >> 4, bz >> 4) && !crate::entity::falling_block::is_free(manager.block(bx, y, bz)) {
+                ground_top = Some((y + 1) as f32);
+                break;
+            }
+        }
+        if p.step(ground_top) {
+            done.push(p.eid);
+            bodies.push(p.remove_packet());
+        } else {
+            bodies.push(p.move_packet());
+        }
+    }
+    for eid in done {
+        projectiles.retain(|p| p.eid != eid);
+    }
+    if !bodies.is_empty() {
+        let center = projectiles.first().map(|p| p.position).unwrap_or((0.0, 5.0, 0.0));
+        push_outbound(outbound, RegionOutbound {
+            to: None, skip: None,
+            around: Some((center, view_radius_blocks(view_distance))),
+            bodies, events: Vec::new(), chunks_complete: false,
+        });
+    }
+}
+
+// 饥饿系统每拍推进: 吃冷却递减 + 每 80 tick 回血/饿死 + 疲劳衰减
+// 与 ITX Player::onUpdate / 原版 HungerAttributeDelegate 对齐 玩家状态在本线程是权威
+fn tick_hunger(
+    players: &mut HashMap<SocketAddr, crate::entity::RegionPlayer>,
+    outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
+    ticks: u64,
+) {
+    for (addr, player) in players.iter_mut() {
+        let state = &mut player.state;
+        if !state.spawned {
+            continue;
+        }
+        if state.eat_cooldown > 0 {
+            state.eat_cooldown -= 1;
+        }
+
+        // 药水效果结算: 再生/中毒/饱和/饥饿 每 tick 推进 到期发移除包
+        let mut changed = false;
+        if !state.effects.is_empty() {
+            state.effect_tick = state.effect_tick.wrapping_add(1);
+            let (hp, hunger, effect_packets) = crate::entity::effect::tick_effects(
+                &mut state.effects,
+                state.health,
+                state.hunger,
+                state.effect_tick,
+            );
+            if hp != state.health || (hunger - state.hunger).abs() > f32::EPSILON {
+                changed = true;
+                state.health = hp;
+                state.hunger = hunger;
+            }
+            if !effect_packets.is_empty() {
+                let mut bodies: Vec<bytes::Bytes> = vec![crate::item::behavior::hunger_attributes(state)];
+                for (id, duration, remove) in effect_packets {
+                    let pkt = if remove {
+                        crate::network::protocol::mob_effect::MobEffectPacket::remove(state.eid, id)
+                    } else {
+                        crate::network::protocol::mob_effect::MobEffectPacket::add(
+                            state.eid, id, 0, duration,
+                        )
+                    };
+                    bodies.push(pkt.encode());
+                }
+                push_outbound(outbound, RegionOutbound {
+                    to: Some(*addr), skip: None, around: None,
+                    bodies, events: Vec::new(), chunks_complete: false,
+                });
+            }
+        }
+
+        // 创造模式不饿不回血
+        if state.gamemode & crate::network::GAMEMODE_CREATIVE != 0 {
+            continue;
+        }
+
+        // 每 80 tick 触发一次回血/饿死 (原版 HEALTH_TICK_COUNT=80)
+        if ticks % crate::item::food::HEALTH_TICK_COUNT as u64 == 0 {
+            let (hunger, saturation, health, exhaustion) = crate::item::behavior::food_tick(
+                state.hunger,
+                state.saturation,
+                state.health,
+                state.exhaustion,
+                state.difficulty,
+            );
+            if (hunger - state.hunger).abs() > f32::EPSILON
+                || (saturation - state.saturation).abs() > f32::EPSILON
+                || health != state.health
+            {
+                changed = true;
+                state.hunger = hunger;
+                state.saturation = saturation;
+                state.exhaustion = exhaustion;
+                state.health = health;
+            }
+        }
+
+        if changed {
+            // 血量变化下发 SetHealth 饥饿条下发属性包
+            let mut bodies = vec![crate::item::behavior::hunger_attributes(state)];
+            bodies.push(
+                crate::network::protocol::entity_event::SetHealthPacket { health: state.health }.encode(),
+            );
+            push_outbound(
+                outbound,
+                RegionOutbound {
+                    to: Some(*addr),
+                    skip: None,
+                    around: None,
+                    bodies,
+                    events: Vec::new(),
+                    chunks_complete: false,
+                },
+            );
+        }
+    }
 }
 
 // 视距换算成可见半径 视野是按区块给的 广播按区块换算成格
@@ -1755,6 +1980,7 @@ fn dispatch(
     physics_queue: &mut UpdateQueue,
     falling_blocks: &mut Vec<FallingBlock>,
     falls_pending: &mut HashSet<(i32, i32, i32)>,
+    projectiles: &mut Vec<crate::entity::projectile::Projectile>,
 ) -> bool {
     match msg {
         RegionMsg::GetBlock { x, y, z, reply } => {
@@ -2040,7 +2266,21 @@ fn dispatch(
             };
             match admit {
                 DigAdmit::Now => {
+                    let before = manager.block(x, y, z);
                     dig_block(manager, physics_queue, &outbound, addr, x, y, z, ticks);
+                    // 生存模式挖掉方块后消耗手持工具 1 点耐久 损坏同步背包
+                    if let Some(player) = players.get_mut(&addr)
+                        && before != 0 && manager.block(x, y, z) == 0
+                        && player.state.gamemode & crate::network::GAMEMODE_CREATIVE == 0
+                        && player.state.held_item().is_some_and(|it| crate::item::tools::max_durability(it.id).is_some())
+                    {
+                        player.state.damage_held_tool();
+                        push_outbound(&outbound, RegionOutbound {
+                            to: Some(addr), skip: None, around: None,
+                            bodies: vec![player.state.inventory_packet().encode()],
+                            events: Vec::new(), chunks_complete: false,
+                        });
+                    }
                 }
                 DigAdmit::Queued => {}
                 // 队列都满了 判定异常流量 回执带上原方块让客户端补回去
@@ -2106,6 +2346,84 @@ fn dispatch(
                 chunks_complete: false,
             });
         }
+        // 投射物: 生成实体并广播 AddEntity
+        RegionMsg::LaunchProjectile { eid, kind, position, direction, speed } => {
+            let p = crate::entity::projectile::Projectile::new(eid, kind, position, direction, speed);
+            let center = p.position;
+            push_outbound(&outbound, RegionOutbound {
+                to: None,
+                skip: None,
+                around: Some((center, view_radius_blocks(view_distance))),
+                bodies: vec![p.add_packet()],
+                events: Vec::new(),
+                chunks_complete: false,
+            });
+            projectiles.push(p);
+        }
+        // 功能物品对方块使用 原子应用方块改动并唤醒物理
+        RegionMsg::UseItemOn { addr, item, click, target, slot } => {
+            let target_id = manager.block(click.0, click.1, click.2);
+            let target_meta = manager.meta(click.0, click.1, click.2);
+            let place_block = manager.block(target.0, target.1, target.2);
+            let below_solid = target.1 > 0 && !crate::level::generator::blocks::is_transparent(
+                manager.block(target.0, target.1 - 1, target.2)
+            );
+            let result = crate::item::functional::use_item_on(
+                item, click, target_id, target_meta, target, place_block, below_solid,
+            );
+            if let Some(result) = result {
+                let mut changes: Vec<crate::level::physics::CellChange> = Vec::new();
+                for set in &result.sets {
+                    if manager.owns(set.x >> 4, set.z >> 4) {
+                        manager.set_block_meta(set.x, set.y, set.z, set.id, set.meta);
+                        changes.push(crate::level::physics::CellChange {
+                            x: set.x, y: set.y, z: set.z, id: set.id, meta: set.meta,
+                        });
+                        physics::on_placed(manager, physics_queue, set.x, set.y, set.z, set.id, ticks);
+                        // 装液体把源挖空了 唤醒邻居让流动液体回缩
+                        if set.id == 0 {
+                            physics::on_broken(manager, physics_queue, set.x, set.y, set.z, ticks);
+                        }
+                    }
+                }
+                if !changes.is_empty() {
+                    push_outbound(&outbound, RegionOutbound {
+                        to: None, skip: None, around: None, bodies: Vec::new(),
+                        events: vec![RegionEvent::BlockChanged { cells: changes }],
+                        chunks_complete: false,
+                    });
+                }
+                // 回写手持物品(满桶/空桶/消耗)与耐久 并同步背包给该玩家
+                if let Some(player) = players.get_mut(&addr) {
+                    let mut sync = false;
+                    match result.replace {
+                        Some(Some(new_item)) => {
+                            if slot < player.state.inventory.len() {
+                                player.state.inventory[slot] = Some(new_item);
+                            }
+                            sync = true;
+                        }
+                        Some(None) => {
+                            if slot < player.state.inventory.len() {
+                                player.state.inventory[slot] = None;
+                            }
+                            sync = true;
+                        }
+                        None => {}
+                    }
+                    if result.damage_tool && player.state.damage_held_tool() {
+                        sync = true;
+                    }
+                    if sync {
+                        push_outbound(&outbound, RegionOutbound {
+                            to: Some(addr), skip: None, around: None,
+                            bodies: vec![player.state.inventory_packet().encode()],
+                            events: Vec::new(), chunks_complete: false,
+                        });
+                    }
+                }
+            }
+        }
         // 方块被挖掉 掉落物由属主分片自己生成并广播
         RegionMsg::AddDrop { eid, item, block } => {
             let drop = ItemDrop::new(eid, item, block);
@@ -2128,16 +2446,22 @@ fn dispatch(
             let still_fallable = manager.block(x, y, z) == bid
                 && physics::fall_check(manager, x, y, z).is_some();
             if still_fallable {
-                manager.set_block_meta(x, y, z, crate::level::generator::blocks::AIR, 0);
+                let air = crate::level::generator::blocks::AIR;
+                manager.set_block_meta(x, y, z, air, 0);
                 let block = FallingBlock::new(eid, bid, meta, (x, y, z), creative);
-                let bodies = vec![block.add_packet()];
+                let add_packet = block.add_packet();
                 let center = block.position;
+                // 原版 HeavyBlock::startFalling 里 setBlockAndData(pos, AIR, 3) 的 flags=3
+                // 就是 FLAG_ALL: 客户端必须同时收到"原格变空气"才会删掉本地那块方块.
+                // 之前只发 AddEntity 导致客户端原地留一块"假沙子" + 下落实体并存.
+                // 两条包放同一 bodies 按序下发: 先清方块 再生成实体.
+                let clear_packet = UpdateBlockPacket::single(x, y, z, air, 0).encode();
                 falling_blocks.push(block);
                 push_outbound(outbound, RegionOutbound {
                     to: None,
                     skip: None,
                     around: Some((center, view_radius_blocks(view_distance))),
-                    bodies,
+                    bodies: vec![clear_packet, add_packet],
                     events: Vec::new(),
                     chunks_complete: false,
                 });
@@ -2504,9 +2828,10 @@ mod tests {
     }
 
     // global 分配 eid 后回投 属主分片应清除该格方块并广播 AddEntity(type=66)
+    // 关键: 必须先发 UpdateBlock(AIR) 再发 AddEntity 否则客户端原位置留"假沙子"
     #[test]
     fn falling_block_spawns_entity_and_clears_block() {
-        use crate::network::protocol::pid::ADD_ENTITY;
+        use crate::network::protocol::pid::{ADD_ENTITY, UPDATE_BLOCK};
         let region = spawn_flat(0, 0);
         // 先在悬空处放一个沙子(下方是空气) y=10
         region.join(
@@ -2519,6 +2844,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_add_entity = false;
+        let mut saw_clear_air = false;
         loop {
             for item in region.drain_outbound() {
                 for body in item.bodies {
@@ -2527,12 +2853,20 @@ mod tests {
                         // 校验实体类型是 66
                         assert_eq!(&body[9..13], &66i32.to_be_bytes());
                     }
+                    if body.first() == Some(&UPDATE_BLOCK) {
+                        // 清方块包: x=0,y=10,z=0,id=0(AIR)
+                        assert_eq!(&body[5..9], &0i32.to_be_bytes()); // x
+                        assert_eq!(&body[9..13], &0i32.to_be_bytes()); // z
+                        assert_eq!(body[13], 10); // y
+                        assert_eq!(body[14], 0); // block id AIR
+                        saw_clear_air = true;
+                    }
                 }
             }
-            if saw_add_entity {
+            if saw_add_entity && saw_clear_air {
                 break;
             }
-            assert!(Instant::now() < deadline, "下落实体没有生成 AddEntity 包");
+            assert!(Instant::now() < deadline, "下落实体/清方块包没有生成");
             std::thread::sleep(Duration::from_millis(10));
         }
         // 原格应被清空

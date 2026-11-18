@@ -67,6 +67,8 @@ impl NetworkState {
         state.username = login.username;
         state.skin = login.skin;
         state.protocol = client_protocol;
+        state.gamemode = self.gamemode;
+        state.difficulty = self.difficulty;
         state.position = spawn_position;
         if let Some(data) = saved {
             data.apply_to(state);
@@ -178,6 +180,23 @@ impl NetworkState {
                 self.next_eid += 1;
                 let creative = self.gamemode & GAMEMODE_CREATIVE != 0;
                 self.level.add_falling_block(x, y, z, eid, id, meta, creative);
+            }
+            RegionEvent::FallingBlockDropped { x, y, z, id, meta, creative } => {
+                // 原版 FallingBlock 落地失败时 spawnAtLocation: 变回掉落物
+                // 创造模式不出掉落 与挖掘掉落逻辑一致
+                if !creative {
+                    for drop in crate::item::drops::drops_for(id, meta, x, y, z) {
+                        let eid = self.next_eid;
+                        self.next_eid += 1;
+                        self.level.add_drop(x, z, eid, drop, (x, y, z));
+                    }
+                }
+            }
+            RegionEvent::LaunchProjectile { kind, position, direction, speed } => {
+                // 投掷物实体由抛出点分片生成 global 这里分配全局唯一 eid
+                let eid = self.next_eid;
+                self.next_eid += 1;
+                self.level.launch_projectile(eid, kind, position, direction, speed);
             }
             RegionEvent::DamagePlayer { addr, damage } => {
                 // 下落方块砸中 扣血并下发 SetHealth 受击动画给附近所有玩家

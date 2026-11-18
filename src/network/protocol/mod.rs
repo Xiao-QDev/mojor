@@ -14,6 +14,7 @@ pub mod level_event;
 pub mod login;
 pub mod move_entity;
 pub mod move_player;
+pub mod mob_effect;
 pub mod pid;
 pub mod player_action;
 pub mod play_status;

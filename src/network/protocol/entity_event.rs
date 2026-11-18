@@ -3,10 +3,13 @@
 // event=2 是 HURT_ANIMATION 砸落伤害用
 use bytes::Bytes;
 
+use crate::error::{Error, Result};
 use crate::network::protocol::pid::{ENTITY_EVENT, SET_HEALTH};
-use crate::utils::binary::BinaryWriter;
+use crate::utils::binary::{BinaryReader, BinaryWriter};
 
 pub const ENTITY_EVENT_HURT: u8 = 2;
+// 客户端吃完食物后上报 event=9 (EntityEventPacket::USE_ITEM) ITX/原版一致
+pub const ENTITY_EVENT_USE_ITEM: u8 = 9;
 
 pub struct SetHealthPacket {
     pub health: i32,
@@ -33,6 +36,19 @@ impl EntityEventPacket {
         w.put_i64(self.eid);
         w.put_u8(self.event);
         Bytes::from(w.freeze())
+    }
+
+    // 入站吃食物事件 0xa4 | eid(i64 BE) | event(u8)
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = BinaryReader::new(buf);
+        let pid = r.get_u8()?;
+        if pid != ENTITY_EVENT {
+            return Err(Error::BadPacketId(pid));
+        }
+        Ok(Self {
+            eid: r.get_i64()?,
+            event: r.get_u8()?,
+        })
     }
 }
 

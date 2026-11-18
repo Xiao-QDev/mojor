@@ -34,10 +34,27 @@ pub struct PlayerState {
     pub(crate) inventory: Vec<Option<ItemStack>>,
     // 快捷栏 9 项 值是槽位索引 +9 与 Nukkit PlayerInventory.sendContents 一致
     pub(crate) hotbar: Vec<i32>,
+    // 当前选中的背包槽位(0-26) 手持物品 由 UseItem 的 slot 字段上报
+    pub(crate) held_slot: usize,
     pub(crate) sneaking: bool,
     pub(crate) sprinting: bool,
     // 玩家生命值 0-20 下落方块砸落伤害用 默认满血
     pub(crate) health: i32,
+    // 饥饿系统 对齐 MCPE 0.14.1 Player::HUNGER/SATURATION/EXHAUSTION
+    // hunger/saturation 0..20 exhaustion 0..4 超过 4 扣一格饥饿
+    pub(crate) hunger: f32,
+    pub(crate) saturation: f32,
+    pub(crate) exhaustion: f32,
+    // 当前游戏模式 0 生存 1 创造 用于饥饿/耐久只在生存生效
+    pub(crate) gamemode: u8,
+    // 世界难度 0 和平 1 简单 2 普通 3 困难 饿死判定用
+    pub(crate) difficulty: i32,
+    // 吃完食物后的冷却 tick 防止一次 USE_ITEM 动画重复触发
+    pub(crate) eat_cooldown: u32,
+    // 活跃药水效果
+    pub(crate) effects: crate::entity::effect::Effects,
+    // 效果结算用的 tick 计数
+    pub(crate) effect_tick: u32,
 }
 
 impl Default for PlayerState {
@@ -62,9 +79,19 @@ impl Default for PlayerState {
             inventory: vec![None; 27],
             // 0.14 快捷栏映射固定 9 项 值是槽位索引 +9 与 Nukkit/Genisys 一致
             hotbar: (0..9).map(|slot| slot + 9).collect(),
+            held_slot: 9, // 默认选中快捷栏第一格
             sneaking: false,
             sprinting: false,
             health: 20,
+            // 原版初始满饥饿 饱和 5 疲劳 0
+            hunger: crate::item::food::MAX_FOOD,
+            saturation: crate::item::food::START_SATURATION,
+            exhaustion: 0.0,
+            gamemode: 0,
+            difficulty: 2,
+            eat_cooldown: 0,
+            effects: crate::entity::effect::Effects::new(),
+            effect_tick: 0,
         }
     }
 }
@@ -182,6 +209,31 @@ pub const FLAG_SNEAKING: u8 = 0x02;
 pub const FLAG_SPRINTING: u8 = 0x08;
 
 impl PlayerState {
+    // 手持物品(选中槽) 的拷贝
+    pub(crate) fn held_item(&self) -> Option<ItemStack> {
+        self.inventory.get(self.held_slot).copied().flatten()
+    }
+
+    // 对选中槽的工具施加 1 点耐久 返回 true 表示工具损坏需要同步背包
+    pub(crate) fn damage_held_tool(&mut self) -> bool {
+        let Some(item) = self.held_item() else {
+            return false;
+        };
+        let Some(next) = crate::item::tools::damage_one(item.damage, item.id) else {
+            // 耐久耗尽 损坏消失
+            if self.held_slot < self.inventory.len() {
+                self.inventory[self.held_slot] = None;
+            }
+            return true;
+        };
+        if self.held_slot < self.inventory.len() {
+            if let Some(slot) = self.inventory[self.held_slot].as_mut() {
+                slot.damage = next;
+            }
+        }
+        true
+    }
+
     // 姿态标志 客户端据此渲染下蹲与疾跑
     pub(crate) fn entity_flags(&self) -> u8 {
         let mut flags = 0;

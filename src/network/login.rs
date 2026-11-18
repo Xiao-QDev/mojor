@@ -92,8 +92,8 @@ pub(crate) fn login_sequence(
         }
         .encode(),
     );
-    // eid 0 固定代表客户端自己的实体
-    packets.push(UpdateAttributesPacket::survival(0).encode());
+    // eid 0 固定代表客户端自己的实体 含饥饿条属性
+    packets.push(UpdateAttributesPacket::survival_full(0, 20.0).encode());
     packets.push(SetDifficultyPacket { difficulty }.encode());
     packets.push(
         SetPlayerGameTypePacket {

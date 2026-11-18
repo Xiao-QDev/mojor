@@ -21,6 +21,7 @@ pub const UPDATE_BLOCK: u8 = 0x9f;
 pub const LEVEL_EVENT: u8 = 0xa2;
 // 实体事件 原版 getId()=22 线上 0xa4 砸落伤害动画(event=2)用
 pub const ENTITY_EVENT: u8 = 0xa4;
+pub const MOB_EFFECT: u8 = 0xa5;
 pub const UPDATE_ATTRIBUTES: u8 = 0xa6;
 pub const USE_ITEM: u8 = 0xaa;
 pub const PLAYER_ACTION: u8 = 0xab;

@@ -340,3 +340,85 @@ Update）都排在一个 `light-engine` 线程上串行计算。多核机器上�
 
 验证：协议包 3 项、实体 3 项、物理 10 项、重力实体端到端 1 项全通过；
 完整 lib 测试 536 通过 / 28 失败 / 19 忽略，28 个失败与历史基线逐条一致、无新增。
+
+---
+
+## 补丁：假沙子（原格方块不刷新）
+
+**现象**：重力方块（沙子/砂砾/铁砧）失去支撑开始下落时，客户端在**原位置残留一块方块**，
+要在旁边挖/放一格触发邻格更新后那块才消失。
+
+**根因**：原版 `HeavyBlock::startFalling` 用 `setBlockAndData(pos, AIR, 3)`，
+其中 flags=3 = FLAG_ALL，会把"原格变空气"广播给客户端。
+我们的 `RegionMsg::AddFallingBlock` 只 `set_block_meta(AIR)` 改了服务端世界，
+`bodies` 里只放了 `AddEntityPacket`，漏发 `UpdateBlockPacket(AIR)`，
+客户端因此一直缓存着那块方块，直到邻格更新顺带刷新。
+
+**修复**（`src/level/actor.rs`）：生成实体时在同一批 `bodies` 里按序下发两条包——
+先 `UpdateBlockPacket::single(x,y,z,AIR,0)` 清掉原格，再 `add_packet()` 生成实体，
+与客户端处理顺序一致。测试 `falling_block_spawns_entity_and_clears_block` 增加对 AIR 清方块包的断言。
+
+**顺带补齐原版落地掉落**：原版 `FallingBlock::normalTick` 里 `tryToPlace` 失败（落点被占）
+且非创造模式时会 `spawnAtLocation(id,1)` 变回掉落物，此前是方块凭空消失。
+新增 `RegionEvent::FallingBlockDropped`，region 落地失败时发出，
+global 分配 eid 后回投 `AddDrop` 生成掉落物。
+
+验证：`cargo +1.95.0 test --lib falling_block` 4 项全过；
+完整 lib 测试 536 通过 / 28 失败 / 19 忽略，与基线一致、无新增失败。
+
+---
+
+## 原版物品全量移植（food / tools / functional / potion / projectile）
+
+按 MCPE 0.14.1 原版 `items.json` 与 PTX/PHP 核心行为，把原版物品的使用行为整体移植到服务端。
+沿用现有 legacy item id（APPLE=260、DIAMOND=264、BUCKET=325 等），不改协议、创造栏、配方与背包。
+全部为新增模块，不改动已有放置/挖掘主链路。
+
+### 食物与饥饿（`src/item/food.rs`、`src/item/behavior.rs`）
+
+- 按原版 food 表建立 legacy id → 营养/饱和映射；常量对齐原版：
+  `MAX_FOOD=20`、`START_SATURATION=5`、`MAX_EXHAUSTION=4`、`HEAL_LEVEL=18`、
+  `STARVE_LEVEL=0`、`HEALTH_TICK_COUNT=80`。
+- 吃下食物：`hunger += nutrition`，`saturation += 2*saturation*nutrition`，饱和不超过饥饿值。
+- 消耗疲劳：每积累 4 点 exhaustion 先扣饱和再扣饥饿。
+- 饥饿 ≥18 且饱和 >0 时每 80 tick 回 1 点血；饥饿为 0 时每 80 tick 掉血（难度非和平）。
+- 客户端吃完上报 `EntityEventPacket(event=9)`，在 `on_entity_event` 消费并应用；
+  2 秒 `eat_cooldown` 防止一次动画重复触发。蘑菇汤/甜菜汤吃完返还碗，药水返还玻璃瓶。
+- 只下发 `player.hunger` 属性（客户端饥饿条只认它），不下发 saturation/exhaustion。
+
+### 工具耐久（`src/item/tools.rs`）
+
+- 耐久表对齐原版：金 33 / 木 60 / 石 132 / 铁 251 / 钻石 1562 /
+  打火石 65 / 剪刀 239 / 弓 385。耐久存于 `ItemStack.damage`。
+- 生存模式成功挖掘一格后对选中的工具扣 1 点耐久，耗尽即损坏并同步背包。
+
+### 功能物品（`src/item/functional.rs`）
+
+- 空桶点水/岩浆 → 装成水桶/岩浆桶；水桶/岩浆桶点地面 → 放置源方块并返还空桶。
+- 打火石点火、锄头耕地成 `FARMLAND`、骨粉催熟作物。
+- 通过 `UseItemPacket` 分流，发 `RegionMsg::UseItemOn` 给属主分片读世界后原子判定，
+  写回世界 + 唤醒物理 + 回写物品/耐久并同步背包。
+- 修复协议 45/46/60 无 `slot` 字段（-1）时误落到槽 0：统一用服务端 `held_slot`。
+
+### 药水效果（`src/entity/effect.rs`、`src/network/protocol/mob_effect.rs`）
+
+- 新增 `MobEffectPacket`（pid `0xa5`），线序：
+  `eid(i64 BE) | event(u8) | effectId(u8) | amplifier(u8) | particles(u8) | duration(i32 BE)`。
+- 支持再生、中毒、凋零、力量、速度、夜视、饱和、饥饿等效果；每 tick 结算回血/掉血/饥饿变化，
+  到期移除并广播。瞬间治疗/瞬间伤害在饮用时立即结算。
+
+### 投射物（`src/entity/projectile.rs`）
+
+- 服务端权威抛体物理：箭/雪球/蛋重力 0.04、末影珍珠 0.03、阻尼 0.99，
+  每 tick `MoveEntityPacket` 同步，撞地/超时发 `RemoveEntityPacket`。
+- 雪球/鸡蛋/末影珍珠右键使用即投掷；弓靠 `PlayerAction(ACTION_RELEASE_ITEM=5)` 发射箭，
+  生存模式消耗箭/投掷物，创造不扣。
+- 方向由玩家 yaw/pitch 算出（`direction_from_rotation`），起点抬到眼睛高度并前推一格。
+- region 线程无 eid 分配器，走 `RegionEvent::LaunchProjectile` → global 分配 eid →
+  `Level::launch_projectile` 回投 `RegionMsg::LaunchProjectile` → 属主分片生成实体。
+- 空闲检测计入 `projectiles`，投射物在飞时不会被误判为空闲撤线程。
+
+### 验证
+
+`cargo +1.95.0 check` 通过；`cargo +1.95.0 test --lib` 563 通过 / 28 失败 / 19 忽略，
+28 项失败均为历史 `network::tests` 异步时序 artifact，与基线一致、无新增失败。

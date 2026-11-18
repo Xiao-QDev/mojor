@@ -25,13 +25,14 @@ use crate::network::protocol::move_entity::{MoveEntityEntry, MoveEntityPacket};
 use crate::network::protocol::move_player::{EYE_HEIGHT, MovePlayerPacket};
 use crate::network::protocol::chunk_radius::{ChunkRadiusUpdatePacket, RequestChunkRadiusPacket};
 use crate::network::protocol::entity_data::Metadata;
+use crate::network::protocol::item::ItemStack;
 use crate::network::protocol::pid::{
-    ANIMATE, CONTAINER_CLOSE, CONTAINER_SET_SLOT, CRAFTING_EVENT, MOVE_PLAYER, PLAYER_ACTION,
-    REMOVE_BLOCK, REQUEST_CHUNK_RADIUS, TEXT, USE_ITEM,
+    ANIMATE, CONTAINER_CLOSE, CONTAINER_SET_SLOT, CRAFTING_EVENT, ENTITY_EVENT, MOVE_PLAYER,
+    PLAYER_ACTION, REMOVE_BLOCK, REQUEST_CHUNK_RADIUS, TEXT, USE_ITEM,
 };
 use crate::network::protocol::player_action::{
-    ACTION_START_SNEAK, ACTION_START_SPRINT, ACTION_STOP_SNEAK, ACTION_STOP_SPRINT,
-    PlayerActionPacket,
+    ACTION_RELEASE_ITEM, ACTION_START_SNEAK, ACTION_START_SPRINT, ACTION_STOP_SNEAK,
+    ACTION_STOP_SPRINT, PlayerActionPacket,
 };
 use crate::network::protocol::remove_block::RemoveBlockPacket;
 use crate::network::protocol::set_entity_data::SetEntityDataPacket;
@@ -132,6 +133,7 @@ pub(crate) fn handle_packet(
             packet,
             gamemode,
             &mut commands,
+            &mut events,
         ),
         CRAFTING_EVENT => on_crafting_event(players, addr, packet, &mut commands),
         CONTAINER_SET_SLOT => {
@@ -140,7 +142,12 @@ pub(crate) fn handle_packet(
         CONTAINER_CLOSE => on_container_close(addr, packet, &mut commands, &mut events),
         TEXT => on_text(players, directory, addr, packet, view_distance, &mut commands),
         PLAYER_ACTION => {
-            on_player_action(players, directory, addr, packet, view_distance, &mut commands);
+            on_player_action(
+                players, directory, addr, packet, view_distance, &mut commands, &mut events,
+            );
+        }
+        ENTITY_EVENT => {
+            on_entity_event(players, directory, addr, packet, view_distance, &mut commands);
         }
         ANIMATE => on_animate(players, directory, addr, packet, view_distance, &mut commands),
         REQUEST_CHUNK_RADIUS => {
@@ -460,9 +467,14 @@ fn on_use_item(
     packet: &[u8],
     gamemode: u8,
     commands: &mut Vec<SendCmd>,
+    events: &mut Vec<crate::level::actor::RegionEvent>,
 ) {
-    let (position, yaw) = match players.get(&addr) {
-        Some(player) if player.state.spawned => (player.state.position, player.state.yaw),
+    let (position, yaw, pitch) = match players.get(&addr) {
+        Some(player) if player.state.spawned => (
+            player.state.position,
+            player.state.yaw,
+            player.state.pitch,
+        ),
         _ => return,
     };
 
@@ -476,6 +488,12 @@ fn on_use_item(
             return;
         }
     };
+    // 协议 70 的 slot 字段是绝对背包槽位 更新手持槽供耐久/功能物品使用
+    if use_item.slot >= 0 && (use_item.slot as usize) < 36 {
+        if let Some(player) = players.get_mut(&addr) {
+            player.state.held_slot = use_item.slot as usize;
+        }
+    }
     // 空手/手持点方块都先交给属主分片做交互判定: 门开关 + 容器 UI
     // Nukkit Level::useItemOn 里 target.onActivate 优先于放置
     // 交互目标是被点的那一格本身(可能点门上半) 不是放置用的 target_block
@@ -506,10 +524,93 @@ fn on_use_item(
         return;
     }
 
+    // 投掷类物品(雪球/鸡蛋/末影珍珠)使用即抛出 不放置方块也不需要目标格
+    // 方向取玩家朝向 起点抬到眼睛高度并前推一格 免得生成在玩家身体里
+    // 箭要靠弓发射(见 ACTION_RELEASE_ITEM) 直接使用无效
+    let thrown = if matches!(
+        use_item.item_id,
+        id if id == crate::item::ids::SNOWBALL
+            || id == crate::item::ids::EGG
+            || id == crate::item::ids::ENDER_PEARL
+    ) {
+        crate::entity::projectile::kind_from_item(use_item.item_id)
+    } else {
+        None
+    };
+    if let Some(kind) = thrown {
+        // 末影珍珠不用点击方块也能扔 这里只接受合法朝向的玩家
+        let direction = crate::entity::projectile::direction_from_rotation(yaw, pitch);
+        let origin = (
+            position.0,
+            position.1 + EYE_HEIGHT,
+            position.2,
+        );
+        let start = (
+            origin.0 + direction.0 * 0.6,
+            origin.1 + direction.1 * 0.6,
+            origin.2 + direction.2 * 0.6,
+        );
+        // 原版初速: 箭由蓄力决定这里取满蓄力 雪球/蛋/珍珠固定 1.5
+        let speed = match kind {
+            crate::entity::projectile::ProjectileKind::Arrow => 2.5,
+            _ => 1.5,
+        };
+        // 生存扣一件 创造不扣
+        if gamemode & GAMEMODE_CREATIVE == 0 {
+            let Some(player) = players.get_mut(&addr) else {
+                return;
+            };
+            if !player.state.consume_item(use_item.item_id) {
+                return;
+            }
+            commands.push(reply(
+                addr,
+                vec![player.state.inventory_packet().encode()],
+            ));
+        }
+        events.push(crate::level::actor::RegionEvent::LaunchProjectile {
+            kind,
+            position: start,
+            direction,
+            speed,
+        });
+        return;
+    }
+
     let Some((x, y, z)) = use_item.target_block() else {
         return;
     };
     if !within_reach(position, x, y, z) {
+        return;
+    }
+
+    // 功能物品(桶/打火石/锄头/骨粉)走单独分支 由属主分片读世界后判定并应用
+    // click 是被点方块 use_item 的 x/y/z target 是点击面相邻格 (x,y,z)
+    // 物品实例从背包取(带 damage) 保证桶的 damage 状态正确
+    if crate::item::functional::is_functional(use_item.item_id, use_item.item_damage) {
+        let held = players
+            .get(&addr)
+            .and_then(|p| p.state.held_item())
+            .unwrap_or(ItemStack {
+                id: use_item.item_id,
+                count: 1,
+                damage: use_item.item_damage,
+            });
+        let click = (use_item.x, use_item.y, use_item.z);
+        // 协议 45/46/60 没有 slot 字段(-1) 一律用服务端记录的 held_slot
+        // 协议 70 上面已按 slot 更新过 held_slot 这里统一取它 免得落到槽 0
+        let slot = players
+            .get(&addr)
+            .map(|p| p.state.held_slot)
+            .unwrap_or(use_item.slot.max(0) as usize);
+        let owner = RegionId::of_block(click.0, click.2);
+        post_to(registry, tx, id, owner, RegionMsg::UseItemOn {
+            addr,
+            item: held,
+            click,
+            target: (x, y, z),
+            slot,
+        });
         return;
     }
 
@@ -638,6 +739,7 @@ fn on_player_action(
     packet: &[u8],
     view_distance: i32,
     commands: &mut Vec<SendCmd>,
+    events: &mut Vec<crate::level::actor::RegionEvent>,
 ) {
     let action = match PlayerActionPacket::decode(&packet[1..]) {
         Ok(action) => action,
@@ -649,6 +751,48 @@ fn on_player_action(
         return;
     };
     if !player.state.spawned {
+        return;
+    }
+    // 松开弓弦: 手持弓且背包里还有箭才算一次发射 方向取玩家朝向
+    if action.action == ACTION_RELEASE_ITEM {
+        if player
+            .state
+            .held_item()
+            .is_some_and(|item| item.id == crate::item::ids::BOW)
+        {
+            let direction =
+                crate::entity::projectile::direction_from_rotation(player.state.yaw, player.state.pitch);
+            let origin = (
+                player.state.position.0,
+                player.state.position.1 + EYE_HEIGHT,
+                player.state.position.2,
+            );
+            let start = (
+                origin.0 + direction.0 * 0.6,
+                origin.1 + direction.1 * 0.6,
+                origin.2 + direction.2 * 0.6,
+            );
+            // 生存消耗一支箭 创造不扣
+            let can_shoot = if player.state.gamemode & GAMEMODE_CREATIVE != 0 {
+                true
+            } else {
+                player.state.consume_item(crate::item::ids::ARROW)
+            };
+            if can_shoot {
+                events.push(crate::level::actor::RegionEvent::LaunchProjectile {
+                    kind: crate::entity::projectile::ProjectileKind::Arrow,
+                    position: start,
+                    direction,
+                    speed: 2.5,
+                });
+                if player.state.gamemode & GAMEMODE_CREATIVE == 0 {
+                    commands.push(reply(
+                        addr,
+                        vec![player.state.inventory_packet().encode()],
+                    ));
+                }
+            }
+        }
         return;
     }
     // 客户端上报的 eid 不可信 一律用服务端分配的值
@@ -684,6 +828,42 @@ fn on_player_action(
     .encode();
     let center = player.state.position;
     commands.extend(broadcast(directory, center, view_distance, &[body], Some(addr)));
+}
+
+// 客户端吃完食物后上报 EntityEvent(USE_ITEM=9) 这里消耗手中食物并应用营养
+// 与 ITX Player::handleDataPacket 的 EntityEventPacket case 9 -> eatFoodInHand 对齐
+fn on_entity_event(
+    players: &mut HashMap<SocketAddr, RegionPlayer>,
+    directory: &Arc<PlayerDirectory>,
+    addr: SocketAddr,
+    packet: &[u8],
+    view_distance: i32,
+    commands: &mut Vec<SendCmd>,
+) {
+    let event = match crate::network::protocol::entity_event::EntityEventPacket::decode(&packet[1..]) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if event.event != crate::network::protocol::entity_event::ENTITY_EVENT_USE_ITEM {
+        return;
+    }
+    let Some(player) = players.get_mut(&addr) else {
+        return;
+    };
+    if !player.state.spawned || player.state.gamemode & GAMEMODE_CREATIVE != 0 {
+        return;
+    }
+    if player.state.eat_cooldown > 0 {
+        return;
+    }
+
+    if let Some((own, broad)) = crate::item::behavior::eat(&mut player.state, 0) {
+        // ITX eatCoolDown 2 秒 = 40 tick
+        player.state.eat_cooldown = 40;
+        commands.push(reply(addr, own));
+        let center = player.state.position;
+        commands.extend(broadcast(directory, center, view_distance, &broad, Some(addr)));
+    }
 }
 
 // 挥手动画转发给视野内的其他玩家

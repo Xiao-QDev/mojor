@@ -1,6 +1,8 @@
 // 游戏实体 与网络协议解耦 由 region 线程独占
 // 这里只放状态与物理 收发包一律走 network 层
+pub mod effect;
 pub mod falling_block;
+pub mod projectile;
 pub mod item_drop;
 pub mod player;
 pub mod player_data;
