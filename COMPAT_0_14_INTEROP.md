@@ -89,3 +89,57 @@ cargo +1.95.0 test --lib
 
 验证：新增回归测试 `border_chunks_are_delivered_lit`，断言 9 个跨界区块全部带非空天空光下发；
 `chunk_manager::tests` 27 项全通过。
+
+## 修复：region 线程 panic「目标区块的地形已经准备好」（挖方块无粒子 / 跑图停摆）
+
+现象：跑一会儿后新地形不渲染，挖方块客户端能挖（本地预测）但服务端不发粒子、无回应；
+指令仍正常。服务端日志出现：
+
+```
+thread 'region-2-3' panicked at src\level\chunk_manager.rs:333:22:
+目标区块的地形已经准备好
+```
+
+（旧版 mojor 在 328 行同一处也崩过，属上游长期存在的偶发 bug。）
+
+分析：指令（斜杠命令）在 global 层直接消费，不投分片；而挖方块的粒子由方块属主分片
+执行 `break_block` 后经 `BlockBroken` 事件发出。指令正常、粒子不发，说明对应 region
+线程已停止工作。日志确认该线程是被 panic 杀死的，panic 点在 `ensure_populated()` 的
+`terrain.get(&key).expect("目标区块的地形已经准备好")`。
+
+`terrain` 是容量 `TERRAIN_CACHE=256` 的 FIFO 缓存，`ensure_terrain()` 命中已有 key 时
+不刷新队列顺序，只在新插入时从队首淘汰。装饰一个目标区块前，`ensure_populated()` 会
+先为它周围最多 8×8=64 个区块调用 `ensure_terrain()`，这些插入会持续淘汰 FIFO 队首。
+当目标区块的地形恰好处于队首（跑图反复访问同一批区块时完全可能）时，它会在装饰阶段
+开始前被挤出 `terrain`，随后那句 `expect` 拿到 `None` → panic → region 线程死亡 →
+该分片不再下发区块、不再处理挖方块，表现即"不渲染 + 无粒子"。
+
+修复（`src/level/chunk_manager.rs`）：把"装饰时才回头读缓存里的目标地形"改为"装饰开始前
+主动 `ensure_terrain()` 保证目标地形存在，并立即抓取快照"：
+
+```rust
+self.ensure_terrain(chunk_x, chunk_z);
+let base_terrain = self
+    .terrain
+    .get(&key)
+    .expect("目标区块地形刚 ensure 过，必然存在")
+    .clone();
+let completed = {
+    let mut chunk = if matches!(self.generator, Generator::Realistic(_)) {
+        let mut center = base_terrain;   // 只读快照，与缓存淘汰解耦
+        ...
+    } else {
+        working.remove(&key).unwrap_or(base_terrain);
+        ...
+    }
+    ...
+};
+```
+
+这样装饰阶段只读提前抓好的快照，不再依赖 `terrain` 在装饰中途是否仍保留目标区块——
+脆弱的 `expect("目标区块的地形已经准备好")` 被彻底移除，无论淘汰如何交错都不会再 panic。
+非 Realistic 分支原先的 `self.terrain[&key]` 索引同样改用快照，消除同类隐患。
+
+验证：新增回归测试 `populate_survives_target_terrain_eviction`，断言在缓存被填满、
+目标处于淘汰压力下 populate 不 panic 且装饰结果与无干扰时逐字节一致；
+`chunk_manager::tests` 28 项全通过（含跨区块装饰一致性、RTG 村庄顺序无关性）。

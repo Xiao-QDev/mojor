@@ -322,16 +322,26 @@ impl ChunkManager {
             }
         }
 
+        // 关键修复：在下面 81/25 次 ensure_terrain 之前，先把目标区块的纯地形
+        // 抓成快照。那些 ensure 会填满 terrain 缓存并淘汰 FIFO 队首；当 target
+        // 恰好是"最老"的地形（跑图时反复访问同一批区块很常见）时，它会在装饰
+        // 中途被淘汰出 terrain。原实现到这里才 terrain.get(&key).expect(...)，
+        // 一旦 target 被淘汰就 panic（用户日志 chunk_manager.rs:333
+        // "目标区块的地形已经准备好"，旧版 328 行同处）。
+        // 提前克隆后装饰只读这份快照，彻底与缓存淘汰解耦，绝不 panic。
+        self.ensure_terrain(chunk_x, chunk_z);
+        let base_terrain = self
+            .terrain
+            .get(&key)
+            .expect("目标区块地形刚 ensure 过，必然存在")
+            .clone();
+
         let completed = {
             let mut chunk = if matches!(self.generator, Generator::Realistic(_)) {
                 // 树和村庄会跨区块写入。每个起源区块只装饰一次并缓存差异，
                 // 目标区块按 dx/dz 顺序合并 16 份落在自己身上的写入；同一区块
                 // 无论从哪个窗口加载，结果都完全一致，跨界的树不会被砍半。
-                let mut center = self
-                    .terrain
-                    .get(&key)
-                    .expect("目标区块的地形已经准备好")
-                    .clone();
+                let mut center = base_terrain;
                 for dx in -2..=1 {
                     for dz in -2..=1 {
                         let decoration = self.decoration_writes(chunk_x + dx, chunk_z + dz);
@@ -361,9 +371,7 @@ impl ChunkManager {
                         }
                     }
                 }
-                working
-                    .remove(&key)
-                    .unwrap_or_else(|| self.terrain[&key].clone())
+                working.remove(&key).unwrap_or(base_terrain)
             };
 
             chunk.generated = true;
@@ -1447,6 +1455,33 @@ mod tests {
         assert!(manager.is_lit(0, 0));
         assert!(manager.light_init_in_flight.is_empty());
     }
+
+    // 回归：populate 中途 target 地形被 FIFO 淘汰也不得 panic，且结果与传统路径一致。
+    // 用户日志 chunk_manager.rs:333 "目标区块的地形已经准备好" panic 就是这条
+    // 缓存踩踏；修复后装饰读提前抓取的快照，与缓存状态解耦。
+    #[test]
+    fn populate_survives_target_terrain_eviction() {
+        let seed = 20241115;
+        // 参考组：正常 populate 一个 Realistic 区块
+        let expected = {
+            let mut m = realistic_manager(seed);
+            normalized_chunk(&mut m, (0, 0))
+        };
+        // 实验组：先把 terrain 缓存填满并让 target 处于队首，
+        // 再 populate——中途 target 会被淘汰，修复后不应 panic 且结果一致。
+        let mut m = realistic_manager(seed);
+        for i in 0..TERRAIN_CACHE + 32 {
+            m.ensure_terrain(9000 + i as i32, 9000);
+        }
+        m.ensure_terrain(0, 0);
+        m.terrain_order.push_front((0, 0));
+        m.ensure_populated(0, 0);
+        assert!(m.chunks.contains_key(&(0, 0)));
+        // 装饰结果必须与缓存未受干扰时一致（地形快照解耦的正确性）
+        let got = normalized_chunk(&mut m, (0, 0));
+        assert_eq!(got, expected, "缓存淘汰不应改变装饰结果");
+    }
+
 }
 
 
