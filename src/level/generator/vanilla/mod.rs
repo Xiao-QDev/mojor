@@ -9,6 +9,7 @@
 //! 留在上一层 `super`，不属于任何单一生成器。
 
 pub mod caves;
+pub mod decorate;
 pub mod genlayer;
 pub mod mcpe_noise;
 pub mod populator;

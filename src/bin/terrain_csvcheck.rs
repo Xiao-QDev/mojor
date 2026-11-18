@@ -24,12 +24,36 @@ fn main() {
     let ground = |b: i32| matches!(b, 1 | 2 | 3 | 12 | 13 | 24 | 8 | 9 | 79 | 80 | 82 | 110 | 172 | 159 | 179);
     let (mut n, mut eq, mut le1, mut le2, mut le4, mut se, mut sb) = (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, 0f64);
     let (mut wn, mut wagree) = (0u64, 0u64);
+    // POPULATE=1：先生成全部区块（含一圈边距）的地形，再逐区块跑原版装饰（已移植部分）
+    let populate = std::env::var("POPULATE").is_ok();
+    let mut all: HashMap<(i32, i32), Chunk> = HashMap::new();
+    if populate {
+        let mut keys: Vec<(i32, i32)> = chunk_keys
+            .iter()
+            .flat_map(|&(cx, cz)| (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for &(cx, cz) in &keys {
+            all.insert((cx, cz), Chunk::empty(cx, cz));
+            let mut world = GenWorld::new(&mut all);
+            g.generate_chunk(&mut world, cx, cz);
+        }
+        let mut world = GenWorld::new(&mut all);
+        for &(cx, cz) in &chunk_keys {
+            mojor::level::generator::vanilla::decorate::post_process(&mut world, cx, cz, seed, false);
+        }
+    }
     for &(cx, cz) in &chunk_keys {
         let mut chunks = HashMap::new();
+        if populate {
+            chunks.insert((cx, cz), all[&(cx, cz)].clone());
+        } else {
         chunks.insert((cx, cz), Chunk::empty(cx, cz));
         {
             let mut world = GenWorld::new(&mut chunks);
             g.generate_chunk(&mut world, cx, cz);
+        }
         }
         let c = &chunks[&(cx, cz)];
         for x in 0..16usize {

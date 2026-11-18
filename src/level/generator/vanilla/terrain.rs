@@ -388,6 +388,10 @@ impl TerrainGenerator {
     }
 
     pub fn populate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
+        // RandomLevelSource::postProcess（已移植部分：湖、岩浆湖、结冰）
+        crate::level::generator::vanilla::decorate::post_process(world, chunk_x, chunk_z, self.seed, false);
+
+        // TODO: 以下仍是旧的 Nukkit 风格装饰，待换成原版 biome 装饰器
         self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
 
         ore::populate(world, chunk_x, chunk_z, &mut self.random);
