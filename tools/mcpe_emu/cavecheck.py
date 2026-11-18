@@ -3,7 +3,10 @@
 import emu, fakeblocks, sys, os, collections
 seed, cx, cz, d = int(sys.argv[1]) & 0xffffffff, int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 pre = open(d + '/post.bin', 'rb').read()
-e = emu.Emu(); e.run_init_array(); fakeblocks.install(e)
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
+fakeblocks.install(e)
 e.patch_ret(e.sym('_ZN10LevelChunk17deferLightEmitterERK8BlockPos'))
 chunk = e.alloc(0x10000)
 e.uc.mem_write(chunk + 0xa3c, pre)

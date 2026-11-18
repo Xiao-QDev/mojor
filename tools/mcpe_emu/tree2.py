@@ -1,7 +1,10 @@
 """深度优先遍历原版 layer 树，每个节点在同一小窗口上取 getInts。用法: tree2.py <seed> <x> <z> <w> <h>"""
 import emu, fakeblocks, subprocess, sys
 seed, X, Z, W, H = [int(a) for a in sys.argv[1:6]]
-e = emu.Emu(); e.run_init_array(); fakeblocks.install(e)
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
+fakeblocks.install(e)
 e.patch_ret_this(e.sym('_ZN5Biome7setNameERKSs')); e.call(e.sym('_ZN5Biome10initBiomesEv'))
 sp_main = e.alloc(16); sp_zoom = e.alloc(16)
 e.call(e.sym('_ZN5Layer16getDefaultLayersExRSt10shared_ptrIS_ES2_13GeneratorType'), seed & 0xffffffff, 0, sp_main, sp_zoom, 1)

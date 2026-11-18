@@ -11,6 +11,9 @@ STUB = 0x20000000
 HEAP = 0x30000000
 STACK = 0x40000000
 RET_MAGIC = 0x50000000
+# 返回值在 x87 ST0 的导入函数；其余（含 malloc 等）按整型/void 处理
+FLOAT_RET = {'floor', 'ceil', 'sqrt', 'sin', 'cos', 'exp', 'log', 'fabs',
+             'floorf', 'ceilf', 'sqrtf', 'sinf', 'cosf', 'fabsf', 'pow'}
 
 class Emu:
     def __init__(self, path=SO):
@@ -65,8 +68,12 @@ class Emu:
         if name in self.stub_by_name:
             return self.stub_by_name[name]
         a = STUB + self.nstub * 32; self.nstub += 1
-        # 每个桩：fld qword [a+16]; ret   （浮点返回值放 ST0；其余函数忽略 ST0）
-        code = b'\xdd\x05' + struct.pack('<I', a + 16) + b'\xc3'
+        # 浮点返回值：fld qword [a+16]; ret（值由 hook 写入）
+        # 整型/void：直接 ret，避免无谓的 fld 污染 x87 栈
+        if name in FLOAT_RET:
+            code = b'\xdd\x05' + struct.pack('<I', a + 16) + b'\xc3'
+        else:
+            code = b'\xc3'
         self.uc.mem_write(a, code)
         self.stubs[a] = name; self.stub_by_name[name] = a
         return a
@@ -133,6 +140,10 @@ class Emu:
             self.w32(esp + 4 * i, w)
         self.uc.reg_write(UC_X86_REG_ESP, esp)
         self.uc.emu_start(addr, RET_MAGIC, count=count)
+        eip = self.uc.reg_read(UC_X86_REG_EIP)
+        if eip != RET_MAGIC:
+            raise RuntimeError('call %#x 未返回到 %#x（停在 %#x，count=%d）'
+                               % (addr, RET_MAGIC, eip, count))
         return self.uc.reg_read(UC_X86_REG_EAX)
 
     def run_init_array(self, verbose=False):

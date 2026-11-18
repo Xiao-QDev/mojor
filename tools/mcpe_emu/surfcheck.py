@@ -4,7 +4,10 @@ import emu, fakeblocks, sys, struct, collections
 seed, cx, cz, d = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 pre = open(d+'/pre.bin','rb').read(); post = open(d+'/post.bin','rb').read(); meta = open(d+'/meta.bin','rb').read()
 bio = open(d+'/bio.bin','rb').read(); noise = struct.unpack('<256f', open(d+'/noise.bin','rb').read())
-e = emu.Emu(); e.run_init_array(); fakeblocks.install(e)
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
+fakeblocks.install(e)
 e.patch_ret_this(e.sym('_ZN5Biome7setNameERKSs'))
 e.call(e.sym('_ZN5Biome10initBiomesEv'))
 # Block::mBlocks[256]：带材质的假方块（材质类型 0 = 空气）

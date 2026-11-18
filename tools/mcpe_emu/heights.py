@@ -3,7 +3,9 @@
 import emu, sys, struct, os
 seed, cx, cz = int(sys.argv[1]) & 0xffffffff, int(sys.argv[2]), int(sys.argv[3])
 ids = list(map(int, sys.stdin.read().split()))
-e = emu.Emu(); e.run_init_array()
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
 e.patch_ret_this(e.sym('_ZN5Biome7setNameERKSs'))
 e.call(e.sym('_ZN5Biome10initBiomesEv'))
 # Random（与 ctor 内联初始化一致）

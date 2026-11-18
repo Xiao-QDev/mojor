@@ -1,6 +1,8 @@
 import emu, sys
 seed, cx, cz = int(sys.argv[1]) & 0xffffffff, int(sys.argv[2]), int(sys.argv[3])
-e = emu.Emu(); e.run_init_array()
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
 rnd = e.alloc(0xa00); e.w32(rnd, seed); mt=[seed]
 for i in range(1,624): mt.append((0x6c078965*(mt[-1]^(mt[-1]>>30))+i)&0xffffffff)
 for i,v in enumerate(mt): e.w32(rnd+4+4*i, v)

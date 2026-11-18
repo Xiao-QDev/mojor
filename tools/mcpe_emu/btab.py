@@ -1,5 +1,8 @@
 import emu, fakeblocks, subprocess, struct
-e = emu.Emu(); e.run_init_array(); fakeblocks.install(e)
+e = emu.Emu()
+ok, bad = e.run_init_array(verbose=True)
+if bad: raise SystemExit(f'init_array 失败：{bad}/{ok + bad} 个构造函数未完成')
+fakeblocks.install(e)
 e.patch_ret_this(e.sym('_ZN5Biome7setNameERKSs'))
 e.call(e.sym('_ZN5Biome10initBiomesEv'))
 inv={v:k for k,v in e.syms.items()}
