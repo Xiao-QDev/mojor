@@ -7,12 +7,20 @@ bio = open(d+'/bio.bin','rb').read(); noise = struct.unpack('<256f', open(d+'/no
 e = emu.Emu(); e.run_init_array(); fakeblocks.install(e)
 e.patch_ret_this(e.sym('_ZN5Biome7setNameERKSs'))
 e.call(e.sym('_ZN5Biome10initBiomesEv'))
+for _b in (37,38,39,165,166,167):
+    _p=e.call(e.sym('_ZN5Biome8getBiomeEiPS_'),_b,0)
+    if _p: e.call(e.sym('_ZN9MesaBiome12refreshBiomeEj'), _p, seed & 0xffffffff)
 # Block::mBlocks[256]：带材质的假方块（材质类型 0 = 空气）
 mb = e.sym('_ZN5Block7mBlocksE')
-mat_air = e.alloc(16); e.w32(mat_air, 0)
-mat_solid = e.alloc(16); e.w32(mat_solid, 7)
+mats = {}
+def mat(t):
+    if t not in mats:
+        m = e.alloc(16); e.w32(m, t); mats[t] = m
+    return mats[t]
 for i in range(256):
-    b = e.alloc(0x80); e.uc.mem_write(b+4, bytes([i])); e.w32(b+0x54, mat_air if i == 0 else mat_solid)
+    # MaterialType：Air=0、Water=5、Lava=6，其余按石头（3）
+    t = 0 if i == 0 else 5 if i in (8, 9) else 6 if i in (10, 11) else 3
+    b = e.alloc(0x80); e.uc.mem_write(b+4, bytes([i])); e.w32(b+0x54, mat(t))
     e.w32(mb+4*i, b)
 chunk = e.alloc(0x10000)
 e.uc.mem_write(chunk+0xa3c, pre)
@@ -30,6 +38,7 @@ for x in range(16):
         e.w32(pos, cx*16+x); e.w32(pos+4, 0); e.w32(pos+8, cz*16+z)
         e.call(e.r32(e.r32(b)+0x3c), b, rnd, chunk, pos, fb(noise[z*16+x]))
 got = bytes(e.uc.mem_read(chunk+0xa3c, 32768))
+open(d+'/orig_surf.bin','wb').write(got)
 nib = bytes(e.uc.mem_read(chunk+0x8a3c, 16384))
 gm = bytes((nib[i>>1] >> (4*(i&1))) & 15 for i in range(32768))
 diff = [i for i in range(32768) if got[i] != post[i]]

@@ -134,7 +134,7 @@ impl TerrainGenerator {
             seed,
             stack,
             biomes,
-            surface: SurfaceBuilder::new(),
+            surface: SurfaceBuilder::new(seed),
             random,
         }
     }

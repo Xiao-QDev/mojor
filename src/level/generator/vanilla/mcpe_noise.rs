@@ -57,6 +57,11 @@ impl McpeRandom {
         (self.genrand() as f64 * (1.0 / 4_294_967_296.0)) as f32
     }
 
+    /// `nextBoolean()`：genrand 的 0x08000000 位
+    pub fn next_boolean(&mut self) -> bool {
+        self.genrand() & 0x0800_0000 != 0
+    }
+
     pub fn next_int(&mut self, n: u32) -> u32 {
         if n == 0 {
             0
