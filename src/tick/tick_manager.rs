@@ -53,6 +53,8 @@ pub async fn run(
         world_name,
     );
     network.set_max_players(max_players);
+    // OP 名单与 server.toml 同级 用相对路径 控制台无条件 OP 可作引导
+    network.load_ops("op.txt");
 
     // 控制台命令 照搬 Nukkit CommandReader: 独立线程读 stdin 不阻塞 tokio
     // TTY 下支持 Tab 自动补全与行编辑(见 crate::console)

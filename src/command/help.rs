@@ -13,6 +13,11 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("stop", "A Mojang provided command."),
     ("seed", "A Mojang provided command."),
     ("version", "Gets the version of this server including any plugins in use."),
+    ("gamemode", "Changes the game mode (survival/creative)."),
+    ("difficulty", "Sets the world difficulty (peaceful/easy/normal/hard)."),
+    ("op", "Adds a player to the operator list."),
+    ("deop", "Removes a player from the operator list."),
+    ("ops", "Lists the operators."),
 ];
 
 #[derive(Eq, PartialEq, Debug)]

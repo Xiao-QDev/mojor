@@ -37,6 +37,7 @@ impl NetworkState {
         let bodies = login_sequence(
             &login,
             self.gamemode,
+            self.difficulty,
             self.seed,
             spawn_block,
             spawn_position,

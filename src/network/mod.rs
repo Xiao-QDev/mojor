@@ -65,6 +65,8 @@ pub struct NetworkState {
     // 实体 id 从 1 开始 0 留给客户端自己的实体
     next_eid: i64,
     gamemode: u8,
+    // 全服难度 /difficulty 可改 登录时下发给新玩家 默认值与 login 原硬编码一致
+    difficulty: i32,
     level: Level,
     // 传给客户端的世界种子
     seed: u32,
@@ -105,6 +107,8 @@ pub struct NetworkState {
     region_health: HashMap<RegionId, RegionHealth>,
     // 系统与进程性能采样 /top 只读
     os: OsMeter,
+    // OP 名单 按用户名判定(大小写不敏感) 由 op.txt 载入 /op /deop 维护
+    ops: crate::permission::OpList,
 }
 
 impl NetworkState {
@@ -146,6 +150,7 @@ impl NetworkState {
             players: HashMap::new(),
             next_eid: 1,
             gamemode,
+            difficulty: crate::network::protocol::set_difficulty::NORMAL,
             level,
             seed,
             view_distance,
@@ -167,7 +172,14 @@ impl NetworkState {
             metrics: TickMeter::new(),
             region_health: HashMap::new(),
             os: OsMeter::new(),
+            ops: crate::permission::OpList::new(),
         }
+    }
+
+    // 从 op.txt 载入 OP 名单 启动时调用一次 控制台可无条件添加第一个 OP
+    pub(crate) fn load_ops(&mut self, path: &str) {
+        self.ops = crate::permission::OpList::load(path);
+        tracing::info!("Loaded {} op(s) from {path}", self.ops.len());
     }
 
     // /top 读的快照 拷贝 cost 很小
@@ -784,6 +796,24 @@ impl NetworkState {
                 sync: Vec::new(),
             };
         };
+        // 统一鉴权: OP 专属命令仅控制台或名单内玩家可用
+        // 控制台 sender=None 永远放行 保证空名单时也能用 op 加人
+        if command::permission_of(&parsed) == command::Permission::Op {
+            let allowed = match sender {
+                None => true,
+                Some(addr) => self
+                    .players
+                    .get(&addr)
+                    .map(|state| self.ops.is_op(&state.username))
+                    .unwrap_or(false),
+            };
+            if !allowed {
+                return CommandOutput {
+                    messages: vec!["§cYou are not allowed to use this command".to_string()],
+                    sync: Vec::new(),
+                };
+            }
+        }
         let mut messages = Vec::new();
         let mut sync = Vec::new();
         match parsed {
@@ -848,6 +878,61 @@ impl NetworkState {
                 let sample = self.os_sample();
                 messages.extend(command::TopCommand::Top.execute(&sample, self.tick_stats()));
             }
+            Command::GameMode(cmd) => match cmd {
+                crate::command::CommandGameMode::Usage => {
+                    messages.push(command::gamemode::GAMEMODE_USAGE.to_string());
+                }
+                crate::command::CommandGameMode::Set { mode } => {
+                    // 全局模式切换: 更新服务端状态 后续句柄据此判断能否破坏/飞行
+                    self.gamemode = mode;
+                    let bodies = vec![
+                        crate::network::protocol::set_player_gametype::SetPlayerGameTypePacket {
+                            gamemode: (mode & GAMEMODE_CREATIVE) as i32,
+                        }
+                        .encode(),
+                        // 创造放开飞行 生存收回 与登录时的权限一致
+                        crate::network::login::adventure_settings(mode).encode(),
+                    ];
+                    for peer in self.players.keys() {
+                        sync.push(SendCmd::GamePackets {
+                            addr: *peer,
+                            bodies: bodies.clone(),
+                        });
+                    }
+                    messages.push(command::CommandGameMode::success_message(mode));
+                }
+            },
+            Command::Difficulty(cmd) => match cmd {
+                crate::command::CommandDifficulty::Usage => {
+                    messages.push(command::difficulty::DIFFICULTY_USAGE.to_string());
+                }
+                crate::command::CommandDifficulty::Set { difficulty } => {
+                    self.difficulty = difficulty;
+                    let body =
+                        crate::network::protocol::set_difficulty::SetDifficultyPacket { difficulty }
+                            .encode();
+                    for peer in self.players.keys() {
+                        sync.push(SendCmd::GamePackets {
+                            addr: *peer,
+                            bodies: vec![body.clone()],
+                        });
+                    }
+                    messages.push(command::CommandDifficulty::success_message(difficulty));
+                }
+            },
+            Command::Op(managed) => match managed {
+                crate::command::CommandOp::Set { name, op } => {
+                    let changed = self.ops.set(&name, op);
+                    messages.push(crate::command::CommandOp::set_message(&name, op, changed));
+                }
+                crate::command::CommandOp::List => {
+                    let names: Vec<&str> = self.ops.names_sorted();
+                    messages.extend(crate::command::CommandOp::list_message(&names));
+                }
+                crate::command::CommandOp::Usage(cmd) => {
+                    messages.push(crate::command::CommandOp::usage(cmd));
+                }
+            },
             Command::Version(op) => messages.extend(op.lines().map(str::to_string)),
             Command::Stop(_) => {
                 self.shutdown_requested = true;

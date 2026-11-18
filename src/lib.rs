@@ -7,6 +7,7 @@ pub mod entity;
 pub mod error;
 pub mod level;
 pub mod network;
+pub mod permission;
 pub mod raknet;
 pub mod tick;
 pub mod utils;

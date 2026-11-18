@@ -200,3 +200,75 @@ Update）都排在一个 `light-engine` 线程上串行计算。多核机器上�
 - 若 `慢帧诊断(后台 sync/fsync)` 出现且 sync_ms≈900 → 确认 fsync，可进一步降频/增大 try_lock 跳过；
 - 若主循环 `net_tick_ms` 高但 `network.tick` 不高 → 卡在别处，看 packets_ms；
 - 若都低但 gap 高 → 卡在 tokio 调度/其他线程，需再查。
+
+## 新增指令：/gamemode 与 /difficulty
+
+照搬 Nukkit 0.14 语义新增两条指令，命令表驱动解析/补全/help 自动生效。
+
+### /gamemode <survival|creative>
+- 语法：`/gamemode 0|1` 或 `survival` / `creative`（含缩写 `s` / `c`）。
+- 0.14 客户端只有生存/创造两档，冒险(2)/旁观(3)未实现，按 Nukkit 用法提示处理。
+- 执行：切换全服模式（本核心 gamemode 是全局单一 u8 位标志，与 `VIOLIN_GAMEMODE`
+  配置语义一致），给全体在线玩家广播 `SetPlayerGameTypePacket` + `AdventureSettings`
+  （创造放开飞行、生存收回），回执 `Game mode is now {Survival|Creative}`。
+- 用法错误不改状态、不广播。
+
+### /difficulty <peaceful|easy|normal|hard>
+- 语法：`/difficulty 0|1|2|3` 或 `peaceful` / `easy` / `normal` / `hard`（含首字母缩写）。
+- 执行：更新全服难度并广播 `SetDifficultyPacket`，回执 `Difficulty is now {name}`。
+- NetworkState 新增 `difficulty: i32` 字段（默认 NORMAL=2），`login_sequence` 增加
+  difficulty 参数——新玩家登录时拿到的是**当前**难度，不再是硬编码 NORMAL。
+
+改动文件：`src/command/gamemode.rs`、`src/command/difficulty.rs`（新增），
+`src/command/mod.rs`、`src/command/help.rs`（命令表/help 登记），
+`src/network/mod.rs`（执行分发 + 状态字段）、`src/network/login.rs`（登录读难度）、
+`src/network/handlers.rs`、`src/network/tests.rs`（调用点/测试）。
+
+验证：`command::` 39 项、`command::gamemode` 3 项、`command::difficulty` 3 项、
+`network::login` 4+1 项全通过；新增端到端测试 `gamemode_command_updates_state_and_broadcasts`
+与 `difficulty_command_updates_state_and_broadcasts` 验证状态更新 + 全员广播 + 用法错误不生效；
+`login_uses_current_difficulty_not_hardcoded` 验证传入难度写进登录包。
+完整 lib 测试 508 通过 / 28 失败，28 个均为既有 `network::tests` 异步时序 artifact
+（比上一轮的 29 个还少一个），与本次改动无关。
+
+## 指令别名：/gm、/diff、/ver
+
+命令表统一支持别名：`CommandDef` 新增 `aliases: &'static [&'static str]`，别名与主名
+共用同一个解析入口，在聊天和控制台都能执行，且一并进入 Tab 补全；但**不进 `/help`
+主列表**，避免同一条命令重复出现。控制台高亮走同一张命令表，别名同样正常着色。
+
+- `/gamemode` → `/gm`
+- `/difficulty` → `/diff`
+- `/version` → `/ver`（原先是独立表项并靠测试特判排除 help，现并入 `version.aliases`，行为不变）
+- 之前按要求移除的 `/?` 别名保持移除，未恢复。
+
+改动文件：`src/command/mod.rs`（结构体字段、`find_command` 命中别名、`candidates_for`
+展开别名、命令表登记、测试）。
+验证：`command::` 40 项、`console::` 4 项、两个端到端命令测试全通过。
+
+## 权限组：OP 与玩家
+
+按 Nukkit 的两档权限模型接入，仅分 OP / 玩家两级。
+
+- **身份标识**：仅用**用户名**判定（大小写不敏感，ASCII 折叠），与 0.14 登录包 username 对应。
+- **名单来源**：工作目录 `op.txt`，每行一个用户名，`#` 开头是注释；启动时 `NetworkState::load_ops`
+  载入，缺失则按模板创建。由 `/op` `/deop` 运行时维护并**即时写回**文件，无需重启。
+- **三条新指令**（均 OP 专属）：`/op <玩家>` 加名、`/deop <玩家>` 除名、`/ops` 列名单；
+  文案照搬 Nukkit（Made ... an operator / Took ... out of the operator list）。
+- **控制台永远 OP**：`sender=None` 无条件放行，空名单时也能用 `op <名>` 加出第一个 OP。
+- **命令权限**：除 `/help` `/say` `/tell` 外全部 OP 专属（含 list/stop/seed/time/tp/tps/top/
+  gamemode/difficulty/version 及三条 op 指令）。鉴权在 `run_command_from` 统一做：
+  OP 专属命令若发起玩家不在名单，回 `§cYou are not allowed to use this command`，
+  不改状态、不下发任何包；未知命令按公开处理照常回 Unknown 提示。
+- 权限标记写进命令表 `CommandDef.permission`，`permission_of(&Command)` 供网络层查表。
+
+改动文件：`src/permission.rs`（新增，`OpList` 名单管理）、`src/command/op.rs`（新增，指令解析
+与文案）、`src/command/mod.rs`（Permission 枚举、命令表标记、三条命令登记、help、测试）、
+`src/command/help.rs`、`src/network/mod.rs`（OpList 字段、load_ops、统一鉴权、op 指令分发）、
+`src/tick/tick_manager.rs`（启动加载 op.txt）、`src/lib.rs`（模块声明）、`src/network/tests.rs`
+（既有命令测试加 OP 适配 + 4 个权限端到端测试）。
+
+验证：`command::` 43 项、`permission::` 3 项、`console::` 4 项全通过；新增 4 个网络端到端测试
+（普通玩家被拒且零副作用 / 控制台引导加人 / 名单玩家可用 / 缺参回用法）全通过。完整 lib 测试
+519 通过 / 28 失败 / 19 忽略，28 个失败与历史基线逐条一致、无新增，均为既有 `network::tests`
+异步时序 artifact，与本次改动无关。
