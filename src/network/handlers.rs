@@ -163,6 +163,12 @@ impl NetworkState {
                     }
                 }
             }
+            // 液体流动/重力方块下落等服务端自发改动 只广播给所有人 不碰背包/掉落
+            RegionEvent::BlockChanged { cells } => {
+                for cell in cells {
+                    out.extend(self.broadcast_block(cell.x, cell.y, cell.z, cell.id, cell.meta));
+                }
+            }
             RegionEvent::Pickup { addr, item } => {
                 // 分片已经把掉落物移除了 这里把物品加进背包并刷新
                 let updated = if let Some(state) = self.players.get_mut(&addr) {

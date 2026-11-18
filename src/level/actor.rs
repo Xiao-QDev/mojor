@@ -25,6 +25,7 @@ use crate::level::chunk_io::ChunkIoPool;
 use crate::block::placement::Placement;
 use crate::level::chunk_manager::ChunkManager;
 use crate::level::format::chunk::Chunk;
+use crate::level::physics::{self, CellChange, UpdateQueue};
 use crate::level::light::{LightReceipt, LightService};
 use crate::level::generator::Generator;
 use crate::level::region::RegionId;
@@ -104,6 +105,11 @@ pub enum RegionEvent {
         // 手持物品 id 失败时要按物品退回去 不是方块 id
         item: i16,
         ok: bool,
+    },
+    // 服务端自发的方块改动(液体流动/重力方块下落) 只让 global 广播 不碰背包
+    BlockChanged {
+        // (x, y, z, 新 id, 新 meta) 每格一条 UpdateBlockPacket
+        cells: Vec<CellChange>,
     },
     // 点门开关的结果 翻转的是下半格 meta 的 0x04
     // 只有真的翻了门才会发这条 非门/没配对下半一律静默
@@ -773,6 +779,8 @@ fn run(
         foreign_lit_wait: HashMap::new(),
     };
     let mut ticks: u64 = 0;
+    // 方块物理更新队列 液体/重力方块按到期 tick 逐格处理 只含本分片坐标
+    let mut physics_queue: UpdateQueue = UpdateQueue::default();
     // 连续空闲的 tick 数
     let mut idle_for: u64 = 0;
     // 已提交给光照引擎、还没收到回执的任务数
@@ -813,6 +821,7 @@ fn run(
                         &mut io,
                         &mut flush_pending,
                         &mut light_in_flight,
+                        &mut physics_queue,
                     ) {
                         stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                         return;
@@ -833,6 +842,27 @@ fn run(
             // 本拍开工时间 MSPT 统计到这个 tick 分支末尾
             let tick_start = Instant::now();
             manager.tick(&gc_chunks);
+            // 方块物理: 处理到期的液体流动/重力下落 本线程独占读写 结果交给 global 广播
+            let due = physics_queue.take_due(ticks);
+            if !due.is_empty() {
+                let mut changed: Vec<CellChange> = Vec::new();
+                for (x, y, z) in due {
+                    changed.extend(physics::step(&mut manager, &mut physics_queue, x, y, z, ticks));
+                }
+                if !changed.is_empty() {
+                    push_outbound(
+                        &outbound,
+                        RegionOutbound {
+                            to: None,
+                            skip: None,
+                            around: None,
+                            bodies: Vec::new(),
+                            events: vec![RegionEvent::BlockChanged { cells: changed }],
+                            chunks_complete: false,
+                        },
+                    );
+                }
+            }
             // 攒下的光照任务交给异步引擎 快照已在 region 线程抓好
             let jobs = manager.take_light_jobs(&tx);
             light_in_flight += jobs.len();
@@ -851,7 +881,7 @@ fn run(
             }
             tick_players(&mut manager, &mut players, &outbound, &registry, id, &mut io, &tx);
             // 上一拍排队没来得及挖的 按节流节奏补上
-            drain_digs(&mut manager, &mut players, &outbound, ticks);
+            drain_digs(&mut manager, &mut physics_queue, &mut players, &outbound, ticks);
             tick_drops(
                 &mut manager,
                 &mut drops,
@@ -870,6 +900,7 @@ fn run(
                 && drops.is_empty()
                 && light_in_flight == 0
                 && !manager.has_pending_light()
+                && physics_queue.is_empty()
             {
                 idle_for += 1;
                 if idle_for >= idle_ticks {
@@ -949,6 +980,7 @@ fn run(
                         &mut io,
                         &mut flush_pending,
                         &mut light_in_flight,
+                        &mut physics_queue,
                     ) {
                     stop_drain(&mut manager, &light, &tx, &rx, &mut light_in_flight);
                     return;
@@ -1372,16 +1404,22 @@ enum DigAdmit {
 // 真正挖一格 连带拆门并推回执给 global
 fn dig_block(
     manager: &mut ChunkManager,
+    physics_queue: &mut UpdateQueue,
     outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
     addr: SocketAddr,
     x: i32,
     y: i32,
     z: i32,
+    now: u64,
 ) {
     // id/meta 要在挖之前读 挖掉之后就是空气了
     let id = manager.block(x, y, z);
     let meta = manager.meta(x, y, z);
     let broken = manager.break_block(x, y, z);
+    // 挖掉后唤醒邻居 让重力方块下落/液体回缩
+    if broken.is_some() {
+        physics::on_broken(manager, physics_queue, x, y, z, now);
+    }
     // 门是两格 拆一半另一半也要拆 不然会留下悬空门
     let paired = if broken.is_some() && crate::level::generator::blocks::is_door(id) {
         paired_door(manager, x, y, z, id, meta)
@@ -1426,6 +1464,7 @@ fn push_block_broken(
 // 一次最多补一格 保持和"当场受理"完全一样的速度上限
 fn drain_digs(
     manager: &mut ChunkManager,
+    physics_queue: &mut UpdateQueue,
     players: &mut HashMap<SocketAddr, RegionPlayer>,
     outbound: &Arc<Mutex<Vec<RegionOutbound>>>,
     ticks: u64,
@@ -1436,7 +1475,7 @@ fn drain_digs(
                 break;
             };
             player.next_dig_tick = ticks + MIN_DIG_TICKS;
-            dig_block(manager, outbound, *addr, x, y, z);
+            dig_block(manager, physics_queue, outbound, *addr, x, y, z, ticks);
         }
     }
 }
@@ -1460,15 +1499,10 @@ fn paired_door(
     Some((x, other_y, z, id, other_meta))
 }
 
-fn placeable(manager: &mut ChunkManager, x: i32, y: i32, z: i32) -> bool {
-    if !(0..crate::level::format::chunk::CHUNK_HEIGHT as i32).contains(&y) {
-        return false;
-    }
-    if !manager.owns(x >> 4, z >> 4) {
-        return false;
-    }
-    let id = manager.block(x, y, z);
-    id == 0 || crate::level::generator::blocks::is_overridable(id)
+// 放置合法性统一走方块物理模块: 普通方块看目标格是否被占 植物还要看基底
+// 这样"高草上叠高草"这类不可能的放置会被拒绝
+fn placeable(manager: &mut ChunkManager, x: i32, y: i32, z: i32, placing_id: u8) -> bool {
+    physics::can_place(manager, x, y, z, placing_id)
 }
 
 fn push_outbound(buffer: &Arc<Mutex<Vec<RegionOutbound>>>, item: RegionOutbound) {
@@ -1493,6 +1527,7 @@ fn dispatch(
     io: &mut IoState,
     flush_pending: &mut bool,
     light_in_flight: &mut usize,
+    physics_queue: &mut UpdateQueue,
 ) -> bool {
     match msg {
         RegionMsg::GetBlock { x, y, z, reply } => {
@@ -1777,7 +1812,9 @@ fn dispatch(
                 }
             };
             match admit {
-                DigAdmit::Now => dig_block(manager, &outbound, addr, x, y, z),
+                DigAdmit::Now => {
+                    dig_block(manager, physics_queue, &outbound, addr, x, y, z, ticks);
+                }
                 DigAdmit::Queued => {}
                 // 队列都满了 判定异常流量 回执带上原方块让客户端补回去
                 DigAdmit::Reject => {
@@ -1798,11 +1835,13 @@ fn dispatch(
             let (cx, cy, cz) = click;
             let (tx, ty, tz) = target;
             let mut cells = cells;
-            let mut ok = manager.block(cx, cy, cz) != 0 && placeable(manager, tx, ty, tz);
+            // 按要放的方块判定合法性 植物必须有基底(杜绝草上叠草)
+            let mut ok = manager.block(cx, cy, cz) != 0
+                && placeable(manager, tx, ty, tz, cells.first.id);
             if ok {
                 if let Some(second) = cells.second {
                     let (sx, sy, sz) = (tx + second.dx, ty + second.dy, tz + second.dz);
-                    ok = placeable(manager, sx, sy, sz);
+                    ok = placeable(manager, sx, sy, sz, second.id);
                 }
             }
             // 铰链位要读放置前的邻居 所以放在写入之前算
@@ -1817,9 +1856,11 @@ fn dispatch(
             }
             if ok {
                 manager.set_block_meta(tx, ty, tz, cells.first.id, cells.first.meta);
+                physics::on_placed(manager, physics_queue, tx, ty, tz, cells.first.id, ticks);
                 if let Some(second) = cells.second {
                     let (sx, sy, sz) = (tx + second.dx, ty + second.dy, tz + second.dz);
                     manager.set_block_meta(sx, sy, sz, second.id, second.meta);
+                    physics::on_placed(manager, physics_queue, sx, sy, sz, second.id, ticks);
                 }
             }
             let mut buffer = outbound.lock().unwrap_or_else(|e| e.into_inner());
