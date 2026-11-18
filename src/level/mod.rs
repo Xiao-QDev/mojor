@@ -8,6 +8,7 @@ pub mod distance;
 pub mod format;
 pub mod generator;
 pub mod light;
+pub mod physics;
 pub mod region;
 pub mod region_handler;
 // 与 Nukkit 一致 Level 放在 level 包下 模块名与父模块同名

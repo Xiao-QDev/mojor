@@ -19,6 +19,9 @@ pub(crate) mod clear;
 pub(crate) mod teleport;
 pub(crate) mod tps;
 pub(crate) mod top;
+pub(crate) mod gamemode;
+pub(crate) mod difficulty;
+pub(crate) mod op;
 
 pub use version::CommandVersion;
 pub(crate) use stop::CommandStop;
@@ -31,6 +34,9 @@ pub(crate) use time::CommandTime;
 pub(crate) use teleport::TeleportCommand;
 pub(crate) use tps::CommandTps;
 pub(crate) use top::TopCommand;
+pub(crate) use gamemode::CommandGameMode;
+pub(crate) use difficulty::CommandDifficulty;
+pub(crate) use op::CommandOp;
 
 // 主循环发给 RakNet 层的下行命令
 // 只带游戏包包体 0x8e 前缀由 RakNet 层封装时补 避免多一次整包拷贝
@@ -98,6 +104,9 @@ pub enum Command {
     Teleport(TeleportCommand),
     Tps(CommandTps),
     Top(TopCommand),
+    GameMode(CommandGameMode),
+    Difficulty(CommandDifficulty),
+    Op(CommandOp),
     // 参数不对时里面是用法提示 未知命令时是命令名
     Version(CommandVersion),
     Stop(CommandStop),
@@ -116,18 +125,34 @@ pub enum Args {
     Free,
 }
 
+// 权限等级 与 Nukkit 的 setPermission 对应 本版只做 OP/玩家两档
+// 控制台始终是 OP 不受此限制
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Permission {
+    // 所有玩家可执行
+    Any,
+    // 仅 OP 可执行
+    Op,
+}
+
 pub struct CommandDef {
     pub name: &'static str,
+    // 等价别名 与 name 共用同一解析入口 但不进 /help 主列表
+    // 例如 gamemode 的 gm difficulty 的 diff version 的 ver
+    pub aliases: &'static [&'static str],
     pub description: &'static str,
     pub args: Args,
     pub children: &'static [CommandDef],
+    // 该命令所需权限 子命令沿用父命令的即可
+    pub permission: Permission,
     // 只有顶层命令需要解析入口 子命令为 None
     pub parse: Option<fn(&[&str]) -> Command>,
 }
 
-// 在表里按名字查一条命令 表是 static 所以引用可以直接存进高亮状态机
+// 在表里按名字查一条命令 别名同样命中 表是 static 所以引用可以直接存进高亮状态机
 pub fn find_command(defs: &'static [CommandDef], name: &str) -> Option<&'static CommandDef> {
-    defs.iter().find(|def| def.name == name)
+    defs.iter()
+        .find(|def| def.name == name || def.aliases.iter().any(|alias| *alias == name))
 }
 
 fn build_help(_args: &[&str]) -> Command {
@@ -163,35 +188,64 @@ fn build_version(_args: &[&str]) -> Command {
 fn build_stop(_args: &[&str]) -> Command {
     Command::Stop(CommandStop::Stop)
 }
+fn build_gamemode(args: &[&str]) -> Command {
+    CommandGameMode::parse(args)
+}
+fn build_difficulty(args: &[&str]) -> Command {
+    CommandDifficulty::parse(args)
+}
+fn build_op(args: &[&str]) -> Command {
+    Command::Op(CommandOp::parse_set(args, true))
+}
+fn build_deop(args: &[&str]) -> Command {
+    Command::Op(CommandOp::parse_set(args, false))
+}
+fn build_ops(_args: &[&str]) -> Command {
+    Command::Op(CommandOp::List)
+}
 
 static NO_ARGS: &[CommandDef] = &[];
 static TIME_VALUES: &[CommandDef] = &[
-    CommandDef { name: "day", description: "", args: Args::None, children: NO_ARGS, parse: None },
-    CommandDef { name: "night", description: "", args: Args::None, children: NO_ARGS, parse: None },
+    CommandDef { name: "day", aliases: &[], description: "", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: None },
+    CommandDef { name: "night", aliases: &[], description: "", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: None },
 ];
 static TIME_SUBS: &[CommandDef] = &[
-    CommandDef { name: "start", description: "", args: Args::None, children: NO_ARGS, parse: None },
-    CommandDef { name: "stop", description: "", args: Args::None, children: NO_ARGS, parse: None },
-    CommandDef { name: "query", description: "", args: Args::None, children: NO_ARGS, parse: None },
-    CommandDef { name: "set", description: "", args: Args::Free, children: TIME_VALUES, parse: None },
-    CommandDef { name: "add", description: "", args: Args::Free, children: TIME_VALUES, parse: None },
+    CommandDef { name: "start", aliases: &[], description: "", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: None },
+    CommandDef { name: "stop", aliases: &[], description: "", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: None },
+    CommandDef { name: "query", aliases: &[], description: "", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: None },
+    CommandDef { name: "set", aliases: &[], description: "", args: Args::Free, children: TIME_VALUES, permission: Permission::Any, parse: None },
+    CommandDef { name: "add", aliases: &[], description: "", args: Args::Free, children: TIME_VALUES, permission: Permission::Any, parse: None },
 ];
 
+// 别名与 name 共用 parse 解析入口 并出现在 Tab 补全里 但不进 /help 主列表
+// 权限: 仅 help/say/tell 玩家可用 其余全部 OP 专属(控制台始终 OP)
 pub static COMMANDS: &[CommandDef] = &[
-    CommandDef { name: "help", description: "Shows the help menu", args: Args::None, children: NO_ARGS, parse: Some(build_help) },
-    CommandDef { name: "list", description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, parse: Some(build_list) },
-    CommandDef { name: "say", description: "Broadcasts the given message as the sender", args: Args::Free, children: NO_ARGS, parse: Some(build_say) },
-    CommandDef { name: "tell", description: "A Mojang provided command.", args: Args::Free, children: NO_ARGS, parse: Some(build_tell) },
-    CommandDef { name: "stop", description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, parse: Some(build_stop) },
-    CommandDef { name: "seed", description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, parse: Some(build_seed) },
-    CommandDef { name: "time", description: "A Mojang provided command.", args: Args::Subcommands, children: TIME_SUBS, parse: Some(build_time) },
-    CommandDef { name: "tp", description: "Teleports the given player (or yourself) to another player or coordinates", args: Args::Free, children: NO_ARGS, parse: Some(build_tp) },
-    CommandDef { name: "tps", description: "Shows the server TPS and MSPT", args: Args::None, children: NO_ARGS, parse: Some(build_tps) },
-    CommandDef { name: "top", description: "Shows CPU, memory and tick statistics", args: Args::None, children: NO_ARGS, parse: Some(build_top) },
-    CommandDef { name: "version", description: "Gets the version of this server including any plugins in use", args: Args::None, children: NO_ARGS, parse: Some(build_version) },
-    // ver 是 version 的别名 命令/补全仍可用 但不进 /help 列表
-    CommandDef { name: "ver", description: "Gets the version of this server including any plugins in use", args: Args::None, children: NO_ARGS, parse: Some(build_version) },
+    CommandDef { name: "help", aliases: &[], description: "Shows the help menu", args: Args::None, children: NO_ARGS, permission: Permission::Any, parse: Some(build_help) },
+    CommandDef { name: "say", aliases: &[], description: "Broadcasts the given message as the sender", args: Args::Free, children: NO_ARGS, permission: Permission::Any, parse: Some(build_say) },
+    CommandDef { name: "tell", aliases: &[], description: "A Mojang provided command.", args: Args::Free, children: NO_ARGS, permission: Permission::Any, parse: Some(build_tell) },
+    CommandDef { name: "list", aliases: &[], description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_list) },
+    CommandDef { name: "stop", aliases: &[], description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_stop) },
+    CommandDef { name: "seed", aliases: &[], description: "A Mojang provided command.", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_seed) },
+    CommandDef { name: "time", aliases: &[], description: "A Mojang provided command.", args: Args::Subcommands, children: TIME_SUBS, permission: Permission::Op, parse: Some(build_time) },
+    CommandDef { name: "tp", aliases: &[], description: "Teleports the given player (or yourself) to another player or coordinates", args: Args::Free, children: NO_ARGS, permission: Permission::Op, parse: Some(build_tp) },
+    CommandDef { name: "tps", aliases: &[], description: "Shows the server TPS and MSPT", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_tps) },
+    CommandDef { name: "top", aliases: &[], description: "Shows CPU, memory and tick statistics", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_top) },
+    CommandDef { name: "difficulty", aliases: &["diff"], description: "Sets the difficulty of the world", args: Args::Free, children: NO_ARGS, permission: Permission::Op, parse: Some(build_difficulty) },
+    CommandDef { name: "gamemode", aliases: &["gm"], description: "Changes the player's game mode", args: Args::Free, children: NO_ARGS, permission: Permission::Op, parse: Some(build_gamemode) },
+    CommandDef { name: "op", aliases: &[], description: "Adds a player to the operator list", args: Args::Free, children: NO_ARGS, permission: Permission::Op, parse: Some(build_op) },
+    CommandDef { name: "deop", aliases: &[], description: "Removes a player from the operator list", args: Args::Free, children: NO_ARGS, permission: Permission::Op, parse: Some(build_deop) },
+    CommandDef { name: "ops", aliases: &[], description: "Lists the operators", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_ops) },
+    CommandDef { name: "version", aliases: &["ver"], description: "Gets the version of this server including any plugins in use", args: Args::None, children: NO_ARGS, permission: Permission::Op, parse: Some(build_version) },
 ];
+
+// 给 parse 出的命令查它所需权限 供网络层统一鉴权
+// 未知命令按 Any 处理(照常回 Unknown 提示 不额外报无权限)
+pub fn permission_of(cmd: &Command) -> Permission {
+    match cmd {
+        Command::Help(_) | Command::Say(_) | Command::Tell(_) | Command::Unknown(_) => Permission::Any,
+        _ => Permission::Op,
+    }
+}
 
 // 转发到 help 模块 保留公共 API
 pub fn help_lines() -> Vec<String> {
@@ -291,9 +345,10 @@ fn candidates_for(before: &[&str], prefix: &str) -> Vec<String> {
         };
         defs = def.children;
     }
+    // 主名与别名都作为候选 前缀短的(ver/gm/diff)排在长的(version/gamemode/difficulty)前
     let mut candidates: Vec<String> = defs
         .iter()
-        .map(|def| def.name)
+        .flat_map(|def| std::iter::once(def.name).chain(def.aliases.iter().copied()))
         .filter(|name| name.starts_with(prefix))
         .map(|name| name.to_string())
         .collect();
@@ -398,8 +453,15 @@ mod tests {
         assert_eq!(
             complete(""),
             vec![
+                "deop".to_string(),
+                "diff".to_string(),
+                "difficulty".to_string(),
+                "gamemode".to_string(),
+                "gm".to_string(),
                 "help".to_string(),
                 "list".to_string(),
+                "op".to_string(),
+                "ops".to_string(),
                 "say".to_string(),
                 "seed".to_string(),
                 "stop".to_string(),
@@ -412,8 +474,13 @@ mod tests {
                 "version".to_string(),
             ]
         );
-        // ver 是 version 的别名 补全仍列出 排序 ver 在 version 前
+        // 别名一并补全 前缀短的排在长的命令名前
         assert_eq!(complete("v"), vec!["ver".to_string(), "version".to_string()]);
+        assert_eq!(complete("g"), vec!["gamemode".to_string(), "gm".to_string()]);
+        assert_eq!(
+            complete("d"),
+            vec!["deop".to_string(), "diff".to_string(), "difficulty".to_string()]
+        );
         // 已经打完整的唯一候选不再返回 再按 Tab 只响铃不动行
         assert!(complete("list").is_empty());
         assert!(complete("/list").is_empty());
@@ -422,9 +489,13 @@ mod tests {
 
     #[test]
     fn command_table_drives_parse_completion_and_help() {
-        let mut names: Vec<String> = COMMANDS.iter().map(|def| def.name.to_string()).collect();
+        let mut names: Vec<String> = COMMANDS
+            .iter()
+            .flat_map(|def| std::iter::once(def.name).chain(def.aliases.iter().copied()))
+            .map(|name| name.to_string())
+            .collect();
         names.sort();
-        assert_eq!(complete(""), names, "顶层候选直接来自命令表");
+        assert_eq!(complete(""), names, "顶层候选来自命令表主名与别名");
         let time = find_command(COMMANDS, "time").unwrap();
         let mut subs: Vec<String> = time
             .children
@@ -436,11 +507,6 @@ mod tests {
         let lines = help_lines();
         for def in COMMANDS {
             assert!(def.parse.is_some(), "{} 缺解析入口", def.name);
-            if def.name == "ver" {
-                // ver 是 version 的别名 命令可用但不进 /help 列表
-                assert!(!lines.iter().any(|line| plain(line).starts_with("/ver:")));
-                continue;
-            }
             assert!(
                 lines
                     .iter()
@@ -448,6 +514,15 @@ mod tests {
                 "{} 不在 /help 列表里",
                 def.name
             );
+            // 别名可用可补全 但不进 /help 主列表
+            for alias in def.aliases {
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|line| plain(line).starts_with(&format!("/{alias}:"))),
+                    "{alias} 别名不应出现在 /help 列表里"
+                );
+            }
         }
         assert!(!lines.iter().any(|line| line.starts_with("/?:")));
     }
@@ -571,6 +646,97 @@ mod tests {
         // 不接受参数 多打的词直接忽略 与其它 Args::None 命令一致
         assert_eq!(parse("/tps now"), Some(Command::Tps(CommandTps::Tps)));
         assert!(complete("tps").is_empty());
+    }
+
+    #[test]
+    fn parses_op_commands_and_permission_map() {
+        assert_eq!(
+            parse("/op alice"),
+            Some(Command::Op(CommandOp::Set { name: "alice".into(), op: true }))
+        );
+        assert_eq!(
+            parse("/deop alice"),
+            Some(Command::Op(CommandOp::Set { name: "alice".into(), op: false }))
+        );
+        assert_eq!(parse("/ops"), Some(Command::Op(CommandOp::List)));
+        assert_eq!(parse("/op"), Some(Command::Op(CommandOp::Usage("op"))));
+        // 玩家可用: help/say/tell 与未知命令
+        for input in ["/help", "/say hi", "/tell bob hi", "/nope"] {
+            assert_eq!(permission_of(&parse(input).unwrap()), Permission::Any, "{input}");
+        }
+        // 其余全部 OP 专属
+        for input in [
+            "/list", "/stop", "/seed", "/time set day", "/tp 1 2 3", "/tps", "/top",
+            "/gamemode 1", "/difficulty 2", "/op x", "/deop x", "/ops", "/version", "/ver",
+        ] {
+            assert_eq!(permission_of(&parse(input).unwrap()), Permission::Op, "{input}");
+        }
+    }
+
+    #[test]
+    fn parses_gamemode_and_difficulty() {
+        // gamemode: 数字与别名都进同一枚举 非法值回用法
+        assert_eq!(
+            parse("/gamemode creative"),
+            Some(Command::GameMode(CommandGameMode::Set { mode: 1 }))
+        );
+        assert_eq!(
+            parse("/gamemode 0"),
+            Some(Command::GameMode(CommandGameMode::Set { mode: 0 }))
+        );
+        assert_eq!(
+            parse("/gamemode"),
+            Some(Command::GameMode(CommandGameMode::Usage))
+        );
+        assert_eq!(
+            parse("/gamemode 3"),
+            Some(Command::GameMode(CommandGameMode::Usage))
+        );
+        // difficulty: 0-3 与别名
+        assert_eq!(
+            parse("/difficulty hard"),
+            Some(Command::Difficulty(CommandDifficulty::Set { difficulty: 3 }))
+        );
+        assert_eq!(
+            parse("/difficulty 2"),
+            Some(Command::Difficulty(CommandDifficulty::Set { difficulty: 2 }))
+        );
+        assert_eq!(
+            parse("/difficulty"),
+            Some(Command::Difficulty(CommandDifficulty::Usage))
+        );
+        assert_eq!(
+            parse("/difficulty 9"),
+            Some(Command::Difficulty(CommandDifficulty::Usage))
+        );
+        // 别名 gm / diff 走同一解析入口 结果必须与主命令完全一致
+        assert_eq!(parse("/gm creative"), parse("/gamemode creative"));
+        assert_eq!(parse("/gm"), parse("/gamemode"));
+        assert_eq!(parse("/gm 3"), parse("/gamemode 3"));
+        assert_eq!(parse("/diff hard"), parse("/difficulty hard"));
+        assert_eq!(parse("/diff"), parse("/difficulty"));
+        assert_eq!(parse("/diff 9"), parse("/difficulty 9"));
+    }
+
+    #[test]
+    fn aliases_resolve_and_complete() {
+        // 三个别名都能解析 且与原命令产生同一条 Command
+        assert_eq!(parse("/ver"), parse("/version"));
+        assert_eq!(parse("/gm 1"), parse("/gamemode 1"));
+        assert_eq!(parse("/diff 2"), parse("/difficulty 2"));
+        // 控制台高亮查表同样命中别名
+        assert!(find_command(COMMANDS, "gm").is_some());
+        assert!(find_command(COMMANDS, "diff").is_some());
+        assert!(find_command(COMMANDS, "ver").is_some());
+        // 未知别名仍是 Unknown
+        assert_eq!(parse("/gms"), Some(Command::Unknown("gms".to_string())));
+        // 别名进补全 排序稳定
+        assert_eq!(complete("v"), vec!["ver".to_string(), "version".to_string()]);
+        assert_eq!(complete("g"), vec!["gamemode".to_string(), "gm".to_string()]);
+        assert_eq!(
+            complete("d"),
+            vec!["deop".to_string(), "diff".to_string(), "difficulty".to_string()]
+        );
     }
 
     #[test]

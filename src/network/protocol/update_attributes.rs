@@ -6,6 +6,8 @@ use crate::utils::binary::BinaryWriter;
 // 0.14 的属性名不是新版那种 minecraft:xxx
 pub const MAX_HEALTH: &str = "generic.health";
 pub const MOVEMENT_SPEED: &str = "generic.movementSpeed";
+// 0.14 饥饿系统属性名 原版 Player::HUNGER (客户端属性表只有这一条)
+pub const HUNGER: &str = "player.hunger";
 
 #[derive(Debug, Clone)]
 pub struct Attribute {
@@ -38,6 +40,35 @@ impl UpdateAttributesPacket {
                     max: 24791.0,
                     value: 0.1,
                     name: MOVEMENT_SPEED.to_string(),
+                },
+            ],
+        }
+    }
+
+    // 0.14 生存属性 + 饥饿条 登录时下发让客户端渲染饥饿
+    // 与 ITX 属性表一致: generic.health / generic.movementSpeed / player.hunger
+    // 饱和/疲劳是服务端内部值 0.14 客户端属性表不认 不下发
+    pub fn survival_full(eid: i64, hunger: f32) -> Self {
+        Self {
+            eid,
+            entries: vec![
+                Attribute {
+                    min: 0.0,
+                    max: 20.0,
+                    value: 20.0,
+                    name: MAX_HEALTH.to_string(),
+                },
+                Attribute {
+                    min: 0.0,
+                    max: 24791.0,
+                    value: 0.1,
+                    name: MOVEMENT_SPEED.to_string(),
+                },
+                Attribute {
+                    min: 0.0,
+                    max: 20.0,
+                    value: hunger,
+                    name: HUNGER.to_string(),
                 },
             ],
         }

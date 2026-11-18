@@ -1322,6 +1322,7 @@ async fn console_style_command_without_slash() {
 async fn slash_command_is_not_broadcast_as_chat() {
     let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
     state.handle_game_packet(addr(), &login_packet());
+    state.ops.set("Xiao_QDev", true); // /time 是 OP 专属
 
     let commands = state.handle_game_packet(addr(), &chat_packet("/time query"));
     let bodies = bodies_of(&commands, addr());
@@ -1457,6 +1458,7 @@ async fn player_chat_is_broadcast_and_logged_to_server() {
 async fn time_set_changes_world_time_and_syncs() {
     let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
     state.handle_game_packet(addr(), &login_packet());
+    state.ops.set("Xiao_QDev", true); // /time 是 OP 专属
 
     let commands = state.handle_game_packet(addr(), &chat_packet("/time set day"));
     assert_eq!(state.world_time.time(), 0);
@@ -1623,6 +1625,7 @@ async fn spawn_point_lands_on_land_rtg() {
     let packets = crate::network::login::login_sequence(
         &login,
         GAMEMODE_SURVIVAL,
+        2,
         1337,
         block,
         (x as f32 + 0.5, y as f32, z as f32 + 0.5),
@@ -2030,4 +2033,123 @@ async fn tps_command_reads_tick_meter() {
         "lag 统计不对: {}",
         out.messages[3]
     );
+}
+
+// /gamemode 切换全服模式: 更新状态 + 给全体下发 SetPlayerGameType 与飞行权限
+#[tokio::test]
+async fn gamemode_command_updates_state_and_broadcasts() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    state.ops.set("alice", true); // /gamemode 是 OP 专属
+    let out = state.run_command_from("/gamemode creative", Some(alice));
+    // 服务端全局状态已切到创造
+    assert_eq!(state.gamemode, GAMEMODE_CREATIVE);
+    assert_eq!(out.messages, vec!["Game mode is now Creative".to_string()]);
+    // 两个在线玩家都收到模式包 + 飞行权限包
+    for peer in [alice, bob] {
+        let ids = packet_ids_of(&out.sync, peer);
+        assert!(ids.contains(&SET_PLAYER_GAMETYPE), "模式包未发给 {peer}");
+        assert!(ids.contains(&ADVENTURE_SETTINGS), "飞行权限包未发给 {peer}");
+    }
+    // 切回生存
+    let out = state.run_command_from("/gamemode 0", Some(alice));
+    assert_eq!(state.gamemode, GAMEMODE_SURVIVAL);
+    assert_eq!(out.messages, vec!["Game mode is now Survival".to_string()]);
+    // 用法错误不改变状态也不广播
+    let out = state.run_command_from("/gamemode 3", Some(alice));
+    assert_eq!(state.gamemode, GAMEMODE_SURVIVAL);
+    assert!(out.sync.is_empty());
+    assert_eq!(out.messages, vec!["Usage: /gamemode <survival|creative>".to_string()]);
+}
+
+// /difficulty 切换全服难度: 更新状态 + 广播 SetDifficulty + 新玩家登录读当前难度
+#[tokio::test]
+async fn difficulty_command_updates_state_and_broadcasts() {
+    let (mut state, alice, bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    state.ops.set("alice", true); // /difficulty 是 OP 专属
+    let out = state.run_command_from("/difficulty hard", Some(alice));
+    assert_eq!(state.difficulty, 3);
+    assert_eq!(out.messages, vec!["Difficulty is now Hard".to_string()]);
+    for peer in [alice, bob] {
+        assert!(
+            packet_ids_of(&out.sync, peer).contains(&SET_DIFFICULTY),
+            "难度包未发给 {peer}"
+        );
+    }
+    // 用法错误不改变状态也不广播
+    let out = state.run_command_from("/difficulty nope", Some(alice));
+    assert_eq!(state.difficulty, 3);
+    assert!(out.sync.is_empty());
+}
+
+// 权限: 普通玩家用 OP 专属命令被拒 且不产生任何状态改动或下行包
+#[tokio::test]
+async fn non_op_player_is_denied_op_only_commands() {
+    let (mut state, alice, _bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    // alice 不在名单里
+    let out = state.run_command_from("/gamemode creative", Some(alice));
+    assert_eq!(out.messages, vec!["§cYou are not allowed to use this command".to_string()]);
+    assert!(out.sync.is_empty());
+    assert_eq!(state.gamemode, GAMEMODE_SURVIVAL, "被拒命令不能改全局状态");
+    // 多个 OP 专属命令都拦
+    for cmd in ["/difficulty hard", "/time set night", "/tp alice bob", "/stop"] {
+        let out = state.run_command_from(cmd, Some(alice));
+        assert_eq!(
+            out.messages,
+            vec!["§cYou are not allowed to use this command".to_string()],
+            "{cmd} 应当被拒"
+        );
+    }
+    assert!(!state.shutdown_requested, "/stop 被拒后不能停机");
+    // 玩家可用的命令不受影响
+    let out = state.run_command_from("/say hi", Some(alice));
+    assert!(!out.messages.iter().any(|m| m.contains("not allowed")));
+}
+
+// 权限: 控制台不受名单限制 空名单也能用 op 加人 加完立即可用
+#[tokio::test]
+async fn console_is_always_op_and_manages_roster() {
+    let (mut state, _alice, _bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    assert!(state.ops.is_empty());
+    // 控制台 /op 无需自己是名单成员
+    let out = state.run_command("op alice");
+    assert_eq!(out.messages, vec!["Made alice an operator".to_string()]);
+    assert!(state.ops.is_op("alice"));
+    assert!(state.ops.is_op("ALICE"), "用户名大小写不敏感");
+    // 重复添加给提示
+    let out = state.run_command("op Alice");
+    assert_eq!(out.messages, vec!["Alice is already an operator".to_string()]);
+    // /ops 列出名单
+    let out = state.run_command("ops");
+    assert!(out.messages.iter().any(|m| m.contains("There are 1 ops")));
+    assert!(out.messages.iter().any(|m| m.contains("alice")));
+    // /deop 移除 之后该玩家立刻失去权限
+    let out = state.run_command("deop alice");
+    assert_eq!(out.messages, vec!["Took alice out of the operator list".to_string()]);
+    assert!(!state.ops.is_op("alice"));
+    let alice_addr = peer(50001);
+    let out = state.run_command_from("/gamemode creative", Some(alice_addr));
+    assert_eq!(out.messages, vec!["§cYou are not allowed to use this command".to_string()]);
+}
+
+// 权限: 名单内玩家可执行 OP 命令
+#[tokio::test]
+async fn op_player_can_run_op_commands() {
+    let (mut state, alice, _bob) = spawn_two(GAMEMODE_SURVIVAL).await;
+    state.ops.set("alice", true);
+    let out = state.run_command_from("/gamemode creative", Some(alice));
+    assert_eq!(out.messages, vec!["Game mode is now Creative".to_string()]);
+    assert_eq!(state.gamemode, GAMEMODE_CREATIVE);
+    // OP 玩家也能管理名单
+    let out = state.run_command_from("/ops", Some(alice));
+    assert!(out.messages.iter().any(|m| m.contains("alice")));
+}
+
+// 权限: /op /deop 参数不全给用法
+#[tokio::test]
+async fn op_commands_need_a_player_name() {
+    let mut state = NetworkState::new(GAMEMODE_SURVIVAL);
+    let out = state.run_command("op");
+    assert_eq!(out.messages, vec!["Usage: /op <player>".to_string()]);
+    let out = state.run_command("deop");
+    assert_eq!(out.messages, vec!["Usage: /deop <player>".to_string()]);
 }

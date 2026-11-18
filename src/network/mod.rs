@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tracing::{info, warn};
@@ -65,6 +65,8 @@ pub struct NetworkState {
     // 实体 id 从 1 开始 0 留给客户端自己的实体
     next_eid: i64,
     gamemode: u8,
+    // 全服难度 /difficulty 可改 登录时下发给新玩家 默认值与 login 原硬编码一致
+    difficulty: i32,
     level: Level,
     // 传给客户端的世界种子
     seed: u32,
@@ -105,6 +107,8 @@ pub struct NetworkState {
     region_health: HashMap<RegionId, RegionHealth>,
     // 系统与进程性能采样 /top 只读
     os: OsMeter,
+    // OP 名单 按用户名判定(大小写不敏感) 由 op.txt 载入 /op /deop 维护
+    ops: crate::permission::OpList,
 }
 
 impl NetworkState {
@@ -146,6 +150,7 @@ impl NetworkState {
             players: HashMap::new(),
             next_eid: 1,
             gamemode,
+            difficulty: crate::network::protocol::set_difficulty::NORMAL,
             level,
             seed,
             view_distance,
@@ -167,7 +172,14 @@ impl NetworkState {
             metrics: TickMeter::new(),
             region_health: HashMap::new(),
             os: OsMeter::new(),
+            ops: crate::permission::OpList::new(),
         }
+    }
+
+    // 从 op.txt 载入 OP 名单 启动时调用一次 控制台可无条件添加第一个 OP
+    pub(crate) fn load_ops(&mut self, path: &str) {
+        self.ops = crate::permission::OpList::load(path);
+        tracing::info!("Loaded {} op(s) from {path}", self.ops.len());
     }
 
     // /top 读的快照 拷贝 cost 很小
@@ -414,6 +426,7 @@ impl NetworkState {
     // global region 一帧一次 刷新玩家目录 收各分片产出并展开下行
     // 世界 tick 都在分片线程里 这里不再算掉落物 也不再碰区块数据
     pub async fn tick(&mut self) -> Vec<SendCmd> {
+        let tick_start = Instant::now();
         let mut out = Vec::new();
 
         // 服务端世界时间照搬 Nukkit Level.checkTime 与 200 tick 一次 sendTime
@@ -434,6 +447,7 @@ impl NetworkState {
 
         // 距离场增量传播 照搬 DistanceManager.runAllUpdates 的每 tick 驱动
         self.chunk_tracker.run_updates(MAX_DISTANCE_UPDATES);
+        let after_updates = tick_start.elapsed();
         // 根变化就立刻重新标记 另外每秒无条件补一次
         // 补的这一次是给刚按需重建的分片 否则它收不到第一次标记
         self.gc_ticks += 1;
@@ -445,6 +459,7 @@ impl NetworkState {
             self.level.gc_files(&live);
             self.last_gc_roots = roots;
         }
+        let after_gc = tick_start.elapsed();
 
         let outbounds = self.level.drain_outbound();
         for item in outbounds {
@@ -469,8 +484,22 @@ impl NetworkState {
             }
         }
 
+        let after_drain = tick_start.elapsed();
         // 熔炉每 tick 烧制 槽位变化立即同步 进度条定期推给正在看这个容器的人
         out.extend(self.tick_containers());
+        let total = tick_start.elapsed();
+
+        // 慢帧诊断：仅在 network.tick 本身明显超时时打印，定位是哪一段拖慢。
+        if total.as_millis() > 100 {
+            warn!(
+                total_ms = total.as_millis() as u64,
+                updates_ms = after_updates.as_millis() as u64,
+                gc_ms = after_gc.saturating_sub(after_updates).as_millis() as u64,
+                drain_ms = after_drain.saturating_sub(after_gc).as_millis() as u64,
+                containers_ms = total.saturating_sub(after_drain).as_millis() as u64,
+                "慢帧诊断(network.tick)"
+            );
+        }
 
         out
     }
@@ -767,6 +796,24 @@ impl NetworkState {
                 sync: Vec::new(),
             };
         };
+        // 统一鉴权: OP 专属命令仅控制台或名单内玩家可用
+        // 控制台 sender=None 永远放行 保证空名单时也能用 op 加人
+        if command::permission_of(&parsed) == command::Permission::Op {
+            let allowed = match sender {
+                None => true,
+                Some(addr) => self
+                    .players
+                    .get(&addr)
+                    .map(|state| self.ops.is_op(&state.username))
+                    .unwrap_or(false),
+            };
+            if !allowed {
+                return CommandOutput {
+                    messages: vec!["§cYou are not allowed to use this command".to_string()],
+                    sync: Vec::new(),
+                };
+            }
+        }
         let mut messages = Vec::new();
         let mut sync = Vec::new();
         match parsed {
@@ -831,6 +878,61 @@ impl NetworkState {
                 let sample = self.os_sample();
                 messages.extend(command::TopCommand::Top.execute(&sample, self.tick_stats()));
             }
+            Command::GameMode(cmd) => match cmd {
+                crate::command::CommandGameMode::Usage => {
+                    messages.push(command::gamemode::GAMEMODE_USAGE.to_string());
+                }
+                crate::command::CommandGameMode::Set { mode } => {
+                    // 全局模式切换: 更新服务端状态 后续句柄据此判断能否破坏/飞行
+                    self.gamemode = mode;
+                    let bodies = vec![
+                        crate::network::protocol::set_player_gametype::SetPlayerGameTypePacket {
+                            gamemode: (mode & GAMEMODE_CREATIVE) as i32,
+                        }
+                        .encode(),
+                        // 创造放开飞行 生存收回 与登录时的权限一致
+                        crate::network::login::adventure_settings(mode).encode(),
+                    ];
+                    for peer in self.players.keys() {
+                        sync.push(SendCmd::GamePackets {
+                            addr: *peer,
+                            bodies: bodies.clone(),
+                        });
+                    }
+                    messages.push(command::CommandGameMode::success_message(mode));
+                }
+            },
+            Command::Difficulty(cmd) => match cmd {
+                crate::command::CommandDifficulty::Usage => {
+                    messages.push(command::difficulty::DIFFICULTY_USAGE.to_string());
+                }
+                crate::command::CommandDifficulty::Set { difficulty } => {
+                    self.difficulty = difficulty;
+                    let body =
+                        crate::network::protocol::set_difficulty::SetDifficultyPacket { difficulty }
+                            .encode();
+                    for peer in self.players.keys() {
+                        sync.push(SendCmd::GamePackets {
+                            addr: *peer,
+                            bodies: vec![body.clone()],
+                        });
+                    }
+                    messages.push(command::CommandDifficulty::success_message(difficulty));
+                }
+            },
+            Command::Op(managed) => match managed {
+                crate::command::CommandOp::Set { name, op } => {
+                    let changed = self.ops.set(&name, op);
+                    messages.push(crate::command::CommandOp::set_message(&name, op, changed));
+                }
+                crate::command::CommandOp::List => {
+                    let names: Vec<&str> = self.ops.names_sorted();
+                    messages.extend(crate::command::CommandOp::list_message(&names));
+                }
+                crate::command::CommandOp::Usage(cmd) => {
+                    messages.push(crate::command::CommandOp::usage(cmd));
+                }
+            },
             Command::Version(op) => messages.extend(op.lines().map(str::to_string)),
             Command::Stop(_) => {
                 self.shutdown_requested = true;

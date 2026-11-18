@@ -14,7 +14,7 @@ use crate::network::protocol::play_status::{
     LOGIN_FAILED_CLIENT, LOGIN_FAILED_SERVER, LOGIN_SUCCESS, PLAYER_SPAWN, PlayStatusPacket,
 };
 use crate::network::protocol::respawn::RespawnPacket;
-use crate::network::protocol::set_difficulty::{NORMAL, SetDifficultyPacket};
+use crate::network::protocol::set_difficulty::SetDifficultyPacket;
 use crate::network::protocol::set_player_gametype::SetPlayerGameTypePacket;
 use crate::network::protocol::set_spawn_position::SetSpawnPositionPacket;
 use crate::network::protocol::start_game::StartGamePacket;
@@ -38,6 +38,7 @@ pub(crate) fn client_protocol(login: &LoginPacket) -> i32 {
 pub(crate) fn login_sequence(
     login: &LoginPacket,
     gamemode: u8,
+    difficulty: i32,
     seed: u32,
     spawn_block: (i32, i32, i32),
     spawn_position: (f32, f32, f32),
@@ -91,14 +92,9 @@ pub(crate) fn login_sequence(
         }
         .encode(),
     );
-    // eid 0 固定代表客户端自己的实体
-    packets.push(UpdateAttributesPacket::survival(0).encode());
-    packets.push(
-        SetDifficultyPacket {
-            difficulty: NORMAL,
-        }
-        .encode(),
-    );
+    // eid 0 固定代表客户端自己的实体 含饥饿条属性
+    packets.push(UpdateAttributesPacket::survival_full(0, 20.0).encode());
+    packets.push(SetDifficultyPacket { difficulty }.encode());
     packets.push(
         SetPlayerGameTypePacket {
             gamemode: (gamemode & 0x01) as i32,
@@ -164,6 +160,25 @@ mod tests {
     }
 
     #[test]
+    fn login_uses_current_difficulty_not_hardcoded() {
+        // /difficulty 改过的难度要写进新玩家的登录包(索引 5 是 SetDifficulty)
+        for value in [0i32, 1, 2, 3] {
+            let packets = login_sequence(
+                &login_with(70),
+                0,
+                value,
+                0,
+                (0, 0, 0),
+                (0.0, 0.0, 0.0),
+                &WorldTime::default(),
+            );
+            let body = &packets[5];
+            assert_eq!(body[0], crate::network::protocol::pid::SET_DIFFICULTY);
+            assert_eq!(&body[1..5], &value.to_be_bytes(), "难度未写入登录包");
+        }
+    }
+
+    #[test]
     fn protocol2_can_satisfy_acceptance() {
         // 有些客户端只把协议号写进 protocol2
         let mut login = login_with(0);
@@ -175,11 +190,11 @@ mod tests {
     fn rejected_client_gets_status_following_version() {
         use crate::network::protocol::play_status::LOGIN_FAILED_SERVER;
         // 过旧客户端 -> LOGIN_FAILED_CLIENT
-        let old = login_sequence(&login_with(44), 1, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
+        let old = login_sequence(&login_with(44), 1, 2, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
         assert!(!old.is_empty());
         assert_eq!(old[0][..], [0x90, 0, 0, 0, LOGIN_FAILED_CLIENT as u8]);
         // 过新客户端 -> LOGIN_FAILED_SERVER
-        let new = login_sequence(&login_with(80), 1, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
+        let new = login_sequence(&login_with(80), 1, 2, 0, (0, 0, 0), (0.0, 0.0, 0.0), &WorldTime::default());
         assert!(!new.is_empty());
         assert_eq!(new[0][..], [0x90, 0, 0, 0, LOGIN_FAILED_SERVER as u8]);
     }

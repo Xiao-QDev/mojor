@@ -140,6 +140,11 @@ impl ChunkManager {
         let chunk = data
             .and_then(|data| blob::decode(chunk_x, chunk_z, &data))
             .unwrap_or_else(|| Chunk::empty(chunk_x, chunk_z));
+        // blob::decode 出来的区块 generated/populated/lit 都是 true：存档里的
+        // 光照是之前算好一并落盘的，直接下发即可，绝不能再排一次 Init。
+        // 否则 Init 会拿缺失邻居的 bedrock 重算，把存档里正确的光照覆盖掉，
+        // 区块还会卡在 light_init_in_flight 里不下发（表现为跑图地形全消失）。
+        // decode 失败兜底的空区块 lit=false，get() 后面的 ensure_* 会生成 + 排 Init。
         self.chunks.insert((chunk_x, chunk_z), chunk);
     }
 
@@ -317,16 +322,26 @@ impl ChunkManager {
             }
         }
 
+        // 关键修复：在下面 81/25 次 ensure_terrain 之前，先把目标区块的纯地形
+        // 抓成快照。那些 ensure 会填满 terrain 缓存并淘汰 FIFO 队首；当 target
+        // 恰好是"最老"的地形（跑图时反复访问同一批区块很常见）时，它会在装饰
+        // 中途被淘汰出 terrain。原实现到这里才 terrain.get(&key).expect(...)，
+        // 一旦 target 被淘汰就 panic（用户日志 chunk_manager.rs:333
+        // "目标区块的地形已经准备好"，旧版 328 行同处）。
+        // 提前克隆后装饰只读这份快照，彻底与缓存淘汰解耦，绝不 panic。
+        self.ensure_terrain(chunk_x, chunk_z);
+        let base_terrain = self
+            .terrain
+            .get(&key)
+            .expect("目标区块地形刚 ensure 过，必然存在")
+            .clone();
+
         let completed = {
             let mut chunk = if matches!(self.generator, Generator::Realistic(_)) {
                 // 树和村庄会跨区块写入。每个起源区块只装饰一次并缓存差异，
                 // 目标区块按 dx/dz 顺序合并 16 份落在自己身上的写入；同一区块
                 // 无论从哪个窗口加载，结果都完全一致，跨界的树不会被砍半。
-                let mut center = self
-                    .terrain
-                    .get(&key)
-                    .expect("目标区块的地形已经准备好")
-                    .clone();
+                let mut center = base_terrain;
                 for dx in -2..=1 {
                     for dz in -2..=1 {
                         let decoration = self.decoration_writes(chunk_x + dx, chunk_z + dz);
@@ -356,9 +371,7 @@ impl ChunkManager {
                         }
                     }
                 }
-                working
-                    .remove(&key)
-                    .unwrap_or_else(|| self.terrain[&key].clone())
+                working.remove(&key).unwrap_or(base_terrain)
             };
 
             chunk.generated = true;
@@ -396,6 +409,15 @@ impl ChunkManager {
     pub fn prepare_for_light(&mut self, chunk_x: i32, chunk_z: i32) {
         self.ensure_generated(chunk_x, chunk_z);
         self.ensure_populated(chunk_x, chunk_z);
+        // 已 generated/populated 但还没 lit 的半成品（装饰顺手铺的邻居、
+        // 或回执被丢弃过的区块）ensure_* 会直接返回，这里兜底补排一次 Init。
+        // 否则下发方的等光照队列会永久挂起。
+        let key = (chunk_x, chunk_z);
+        if self.chunks.get(&key).is_some_and(|chunk| !chunk.lit)
+            && !self.light_init_in_flight.contains(&key)
+        {
+            self.pending_light_init.insert(key);
+        }
     }
 
     // IO 池把区块 load+decode 回来之后塞进缓存
@@ -403,6 +425,8 @@ impl ChunkManager {
     pub fn insert_loaded_chunk(&mut self, chunk_x: i32, chunk_z: i32, chunk: Option<Chunk>) {
         match chunk {
             Some(chunk) => {
+                // IO 送回的 Some 区块同样来自 blob::decode，lit 已是 true，
+                // 光照随存档落盘，直接进缓存下发；不要再排 Init 重算覆盖光照。
                 self.chunks.insert((chunk_x, chunk_z), chunk);
             }
             None => {
@@ -783,15 +807,17 @@ impl ChunkManager {
         // Init 回执在光照没有变化时不含目标区块（不变脏就不打包）
         // 但任务本身已经完成 门槛照样要开 不然这个区块永远不下发
         let init_done = self.light_init_in_flight.remove(&owner);
+        if init_done {
+            if let Some(chunk) = self.chunks.get_mut(&owner) {
+                chunk.lit = true;
+            }
+        }
         for data in receipt.chunks {
             let key = (data.x, data.z);
             if let Some(chunk) = self.chunks.get_mut(&key) {
                 let (_, _, sky, light) = chunk.parts_mut();
                 sky.copy_from_slice(&data.sky_light);
                 light.copy_from_slice(&data.block_light);
-                if init_done && key == owner {
-                    chunk.lit = true;
-                }
                 self.dirty.insert(key);
             }
         }
@@ -1393,6 +1419,69 @@ mod tests {
         assert_eq!(reloaded.block(x, 5, z), 9);
         let _ = std::fs::remove_file(&path);
     }
+
+    // 存档 decode 出来的区块 lit=true（光照随存档落盘），直接进缓存下发。
+    // 绝不能再排一次 Init：否则 Init 拿缺失邻居重算、覆盖存档里正确的光照。
+    #[test]
+    fn decoded_chunk_downloads_without_extra_light_init() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.lit = true;
+        chunk.generated = true;
+        chunk.populated = true;
+        let mut manager = ChunkManager::new();
+        manager.insert_loaded_chunk(0, 0, Some(chunk));
+        assert!(manager.is_lit(0, 0));
+        assert!(!manager.pending_light_init.contains(&(0, 0)));
+    }
+
+    // 新生成区块的 Init 若光照无变化，回执 chunks 不含 owner；
+    // 但仍必须开 owner 的 lit，否则区块一直卡在下发门槛外（原始 bug）。
+    #[test]
+    fn init_empty_receipt_still_opens_owner_lit() {
+        let mut manager = ChunkManager::new();
+        manager.chunks.insert((0, 0), Chunk::empty(0, 0));
+        manager.pending_light_init.insert((0, 0));
+        assert!(!manager.is_lit(0, 0));
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let jobs = manager.take_light_jobs(&tx);
+        assert_eq!(jobs.len(), 1);
+        assert!(manager.light_init_in_flight.contains(&(0, 0)));
+
+        manager.apply_light_receipt(LightReceipt {
+            owner: (0, 0),
+            chunks: Vec::new(),
+        });
+        assert!(manager.is_lit(0, 0));
+        assert!(manager.light_init_in_flight.is_empty());
+    }
+
+    // 回归：populate 中途 target 地形被 FIFO 淘汰也不得 panic，且结果与传统路径一致。
+    // 用户日志 chunk_manager.rs:333 "目标区块的地形已经准备好" panic 就是这条
+    // 缓存踩踏；修复后装饰读提前抓取的快照，与缓存状态解耦。
+    #[test]
+    fn populate_survives_target_terrain_eviction() {
+        let seed = 20241115;
+        // 参考组：正常 populate 一个 Realistic 区块
+        let expected = {
+            let mut m = realistic_manager(seed);
+            normalized_chunk(&mut m, (0, 0))
+        };
+        // 实验组：先把 terrain 缓存填满并让 target 处于队首，
+        // 再 populate——中途 target 会被淘汰，修复后不应 panic 且结果一致。
+        let mut m = realistic_manager(seed);
+        for i in 0..TERRAIN_CACHE + 32 {
+            m.ensure_terrain(9000 + i as i32, 9000);
+        }
+        m.ensure_terrain(0, 0);
+        m.terrain_order.push_front((0, 0));
+        m.ensure_populated(0, 0);
+        assert!(m.chunks.contains_key(&(0, 0)));
+        // 装饰结果必须与缓存未受干扰时一致（地形快照解耦的正确性）
+        let got = normalized_chunk(&mut m, (0, 0));
+        assert_eq!(got, expected, "缓存淘汰不应改变装饰结果");
+    }
+
 }
 
 

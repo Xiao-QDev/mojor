@@ -327,6 +327,36 @@ impl Level {
             .add_drop(eid, item, block);
     }
 
+    // 重力方块下落实体交给方块属主分片生成
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_falling_block(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        eid: i64,
+        id: u8,
+        meta: u8,
+        creative: bool,
+    ) {
+        self.region(RegionId::of_block(x, z))
+            .add_falling_block(eid, x, y, z, id, meta, creative);
+    }
+
+    // 投射物由抛出点所在分片生成 global 分配好 eid 后回投
+    pub(crate) fn launch_projectile(
+        &mut self,
+        eid: i64,
+        kind: crate::entity::projectile::ProjectileKind,
+        position: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        speed: f32,
+    ) {
+        let id = RegionId::of_block(position.0.floor() as i32, position.2.floor() as i32);
+        self.region(id)
+            .launch_projectile(eid, kind, position, direction, speed);
+    }
+
     // 熔炉点燃/熄火 让方块属主分片真正改世界 id(61/62)
     pub(crate) fn set_furnace_lit(&mut self, x: i32, y: i32, z: i32, lit: bool) {
         let id = RegionId::of_block(x, z);

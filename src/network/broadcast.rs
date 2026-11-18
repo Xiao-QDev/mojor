@@ -50,6 +50,21 @@ impl NetworkState {
             .collect()
     }
 
+    // 把任意包广播给某个整数格坐标附近的玩家 受击动画等实体事件用
+    pub(crate) fn broadcast_at(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        bodies: Vec<Bytes>,
+        skip: Option<std::net::SocketAddr>,
+    ) -> Vec<SendCmd> {
+        self.viewers_of(x, y, z)
+            .filter(|peer| Some(*peer) != skip)
+            .map(|peer| reply(peer, bodies.clone()))
+            .collect()
+    }
+
     // 看得到这个位置的玩家 视野半径内
     fn viewers_of(&self, x: i32, y: i32, z: i32) -> impl Iterator<Item = SocketAddr> + '_ {
         let radius = (self.view_distance * 16) as f32;

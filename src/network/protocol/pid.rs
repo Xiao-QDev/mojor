@@ -8,6 +8,9 @@ pub const SET_TIME: u8 = 0x94;
 pub const START_GAME: u8 = 0x95;
 pub const ADD_PLAYER: u8 = 0x96;
 pub const REMOVE_PLAYER: u8 = 0x97;
+// 通用实体包 原版 getId()=10 线上 PID=10-114=0x98 下落方块实体用
+// 0x98 在原版与 PHP 核心都是 ADD_ENTITY 服务端此前空缺
+pub const ADD_ENTITY: u8 = 0x98;
 pub const REMOVE_ENTITY: u8 = 0x99;
 pub const ADD_ITEM_ENTITY: u8 = 0x9a;
 pub const TAKE_ITEM_ENTITY: u8 = 0x9b;
@@ -16,11 +19,16 @@ pub const MOVE_PLAYER: u8 = 0x9d;
 pub const REMOVE_BLOCK: u8 = 0x9e;
 pub const UPDATE_BLOCK: u8 = 0x9f;
 pub const LEVEL_EVENT: u8 = 0xa2;
+// 实体事件 原版 getId()=22 线上 0xa4 砸落伤害动画(event=2)用
+pub const ENTITY_EVENT: u8 = 0xa4;
+pub const MOB_EFFECT: u8 = 0xa5;
 pub const UPDATE_ATTRIBUTES: u8 = 0xa6;
 pub const USE_ITEM: u8 = 0xaa;
 pub const PLAYER_ACTION: u8 = 0xab;
 pub const SET_ENTITY_DATA: u8 = 0xad;
 pub const ANIMATE: u8 = 0xb2;
+// 设置血量 原版 getId()=34 线上 0xb0 下落方块砸伤玩家用
+pub const SET_HEALTH: u8 = 0xb0;
 pub const SET_SPAWN_POSITION: u8 = 0xb1;
 pub const RESPAWN: u8 = 0xb3;
 pub const ADVENTURE_SETTINGS: u8 = 0xbc;
