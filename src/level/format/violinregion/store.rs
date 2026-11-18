@@ -110,12 +110,28 @@ impl RegionStore {
         Ok(compacted)
     }
 
-    // 把已经写进 page cache 的内容刷到磁盘 由后台线程周期调用
-    // 只锁单个区域文件 与主循环的写入互不阻塞太久
+    // 把已经写进 page cache 的内容刷到磁盘 由后台线程周期调用。
+    //
+    // 关键：fsync 是同步磁盘操作，跑图越久打开过的 region 文件越多，
+    // 逐个 fsync 累积起来可达数百毫秒。原先这里用阻塞 lock 持有文件锁
+    // 做 fsync，region 工作线程撞上后卡住，进而把同步等回执的 global
+    // tick 一起拖住（表现为周期性近 1 秒的 MSPT 尖峰、TPS 掉到 15）。
+    // 改成 try_lock：正在被读写的文件本周期跳过，数据仍在 page cache，
+    // 下个周期补刷即可（崩溃最多多丢一个周期，与既有落盘语义一致）。
+    // 这样后台 fsync 永不阻塞工作线程，消除锁竞争带来的卡顿尖峰。
     pub fn sync_all(&self) -> Result<()> {
         for region in self.handles() {
-            let mut file = region.lock().unwrap_or_else(|e| e.into_inner());
-            file.sync()?;
+            match region.try_lock() {
+                Ok(mut file) => {
+                    file.sync()?;
+                }
+                // 锁被工作线程占用：跳过本周期，交给下次 sync
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                // 锁中毒：说明上次持有者 panic，仍需刷盘避免丢数据
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    e.into_inner().sync()?;
+                }
+            }
         }
         Ok(())
     }

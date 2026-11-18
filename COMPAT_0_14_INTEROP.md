@@ -173,3 +173,30 @@ Update）都排在一个 `light-engine` 线程上串行计算。多核机器上�
   1 worker 4.25s / 4 worker 2.11s（**约 2.0×**）/ 8 worker 2.16s。
   8 线程收益趋平是提交端串行 `Snapshot::grab` 成为新瓶颈（Amdahl），故默认封顶 8。
 - `level::` 全套 284 项测试通过，零失败。
+
+## 排查：跑图后 TPS 掉到 15（偶发近 1 秒 MSPT 尖峰）
+
+现象：跑一会儿图后 TPS 降到 15 且静止不恢复。`/tps` 显示 **MSPT avg 13.29ms / max 925.88ms**、
+最高分片利用率仅 15.3%。关键判断：**平均 MSPT 很低说明主循环平时不慢，是少数近 1 秒的
+周期性尖峰把平均 gap 拉垮**（15 TPS ⇔ avg gap≈66.7ms）。不是算力不足，而是周期性同步阻塞。
+
+排除项（已用测试实测）：
+- 距离场：单玩家跑 200 区块后 `loading` 稳定在视距规模(25)、队列排空、旧区块 level 抬到
+  不可达 → 旧区块能被摘票、分片能被 GC，不是距离场泄漏。
+- region 空闲回收链、`light_in_flight` 增减、compact 周期调用均核对无泄漏。
+
+嫌疑与处理（低风险）：后台 world-sync 线程每 12 秒 `loader.sync()` → `sync_all()` 原先
+**逐个阻塞持锁 fsync 所有打开过的 region 文件**。跑图越久打开的文件越多、fsync 累积越久；
+期间 region 工作线程撞锁被卡，进而拖住同步等回执的 global tick。改为 `try_lock`：
+正在被读写的文件本周期跳过、下周期补刷（数据仍在 page cache，落盘语义不变），
+后台 fsync 不再阻塞工作线程。`src/level/format/violinregion/store.rs`。
+
+诊断埋点（本次新增，仅在慢帧时打印、平时零开销）：
+- 主循环：gap/mspt 超 100ms 打印 `慢帧诊断`，含收包/业务包/network.tick 分段耗时；
+- `network.tick` 内：超 100ms 打印 updates/gc/drain/containers 分段；
+- 后台 sync：单次 fsync 超 100ms 打印 `慢帧诊断(后台 sync/fsync)`。
+
+**下一步需要实测定位**：部署本版跑 1–2 分钟，把日志里所有 `慢帧诊断` 行发回。
+- 若 `慢帧诊断(后台 sync/fsync)` 出现且 sync_ms≈900 → 确认 fsync，可进一步降频/增大 try_lock 跳过；
+- 若主循环 `net_tick_ms` 高但 `network.tick` 不高 → 卡在别处，看 packets_ms；
+- 若都低但 gap 高 → 卡在 tokio 调度/其他线程，需再查。

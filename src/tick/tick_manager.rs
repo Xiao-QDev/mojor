@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::Result;
 use crate::level::chunk_loader::ChunkLoader;
@@ -72,7 +72,12 @@ pub async fn run(
                     match sync_stop_rx.recv_timeout(SYNC_INTERVAL) {
                         Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                            let sync_start = Instant::now();
                             let _ = loader.sync();
+                            let sync_ms = sync_start.elapsed().as_millis();
+                            if sync_ms > 100 {
+                                warn!(sync_ms, "慢帧诊断(后台 sync/fsync)");
+                            }
                         }
                     }
                 }
@@ -84,6 +89,7 @@ pub async fn run(
         tokio::select! {
             _ = ticker.tick() => {
                 // 实际间隔比标称多出来的部分是上一拍拖的时间
+                let phase_start = Instant::now();
                 let gap = last_tick.elapsed();
                 last_tick = Instant::now();
                 tick_count += 1;
@@ -93,6 +99,7 @@ pub async fn run(
                 while let Ok(evt) = net_rx.try_recv() {
                     pending.push(evt);
                 }
+                let after_net_recv = phase_start.elapsed();
 
                 for evt in &pending {
                     match evt {
@@ -123,10 +130,13 @@ pub async fn run(
                     }
                 }
 
+                let after_packets = phase_start.elapsed();
+
                 // 网络状态机的周期工作 目前是分批下发区块
                 for cmd in network.tick().await {
                     let _ = cmd_tx.try_send(cmd);
                 }
+                let after_net_tick = phase_start.elapsed();
 
                 if tick_count.is_multiple_of(SAVE_INTERVAL_TICKS) {
                     // 异步投递 不阻塞主循环 region 自己分批编码写盘
@@ -136,7 +146,20 @@ pub async fn run(
                 // 系统性能采样在 tick::os 的独立线程里跑 主循环不参与
 
                 // 本拍耗时就是 MSPT 到这里本拍的活干完了 后面等的是下一拍的空闲
-                network.record_tick(gap, last_tick.elapsed());
+                let mspt = last_tick.elapsed();
+                // 慢帧诊断：平均 MSPT 很低但偶发近 1 秒尖峰时，打出各阶段耗时定位卡点。
+                // 只在明显超过一拍预算时打印，正常帧零开销、不刷屏。
+                if gap.as_millis() > 100 || mspt.as_millis() > 100 {
+                    warn!(
+                        gap_ms = gap.as_millis() as u64,
+                        mspt_ms = mspt.as_millis() as u64,
+                        recv_ms = after_net_recv.as_millis() as u64,
+                        packets_ms = after_packets.saturating_sub(after_net_recv).as_millis() as u64,
+                        net_tick_ms = after_net_tick.saturating_sub(after_packets).as_millis() as u64,
+                        "慢帧诊断"
+                    );
+                }
+                network.record_tick(gap, mspt);
             }
             Some(line) = console_rx.recv() => {
                 let output = network.run_command(&line);

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tracing::{info, warn};
@@ -414,6 +414,7 @@ impl NetworkState {
     // global region 一帧一次 刷新玩家目录 收各分片产出并展开下行
     // 世界 tick 都在分片线程里 这里不再算掉落物 也不再碰区块数据
     pub async fn tick(&mut self) -> Vec<SendCmd> {
+        let tick_start = Instant::now();
         let mut out = Vec::new();
 
         // 服务端世界时间照搬 Nukkit Level.checkTime 与 200 tick 一次 sendTime
@@ -434,6 +435,7 @@ impl NetworkState {
 
         // 距离场增量传播 照搬 DistanceManager.runAllUpdates 的每 tick 驱动
         self.chunk_tracker.run_updates(MAX_DISTANCE_UPDATES);
+        let after_updates = tick_start.elapsed();
         // 根变化就立刻重新标记 另外每秒无条件补一次
         // 补的这一次是给刚按需重建的分片 否则它收不到第一次标记
         self.gc_ticks += 1;
@@ -445,6 +447,7 @@ impl NetworkState {
             self.level.gc_files(&live);
             self.last_gc_roots = roots;
         }
+        let after_gc = tick_start.elapsed();
 
         let outbounds = self.level.drain_outbound();
         for item in outbounds {
@@ -469,8 +472,22 @@ impl NetworkState {
             }
         }
 
+        let after_drain = tick_start.elapsed();
         // 熔炉每 tick 烧制 槽位变化立即同步 进度条定期推给正在看这个容器的人
         out.extend(self.tick_containers());
+        let total = tick_start.elapsed();
+
+        // 慢帧诊断：仅在 network.tick 本身明显超时时打印，定位是哪一段拖慢。
+        if total.as_millis() > 100 {
+            warn!(
+                total_ms = total.as_millis() as u64,
+                updates_ms = after_updates.as_millis() as u64,
+                gc_ms = after_gc.saturating_sub(after_updates).as_millis() as u64,
+                drain_ms = after_drain.saturating_sub(after_gc).as_millis() as u64,
+                containers_ms = total.saturating_sub(after_drain).as_millis() as u64,
+                "慢帧诊断(network.tick)"
+            );
+        }
 
         out
     }
