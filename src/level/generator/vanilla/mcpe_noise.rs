@@ -52,8 +52,9 @@ impl McpeRandom {
     }
 
     /// `vcvt.f64.u32 -> *2^-32 -> vcvt.f32.f64`：中间落地成 f32
-    pub fn next_float(&mut self) -> f64 {
-        (self.genrand() as f64 / 4_294_967_296.0) as f32 as f64
+    /// `(float)((double)genrand * 2^-32)`
+    pub fn next_float(&mut self) -> f32 {
+        (self.genrand() as f64 * (1.0 / 4_294_967_296.0)) as f32
     }
 
     pub fn next_int(&mut self, n: u32) -> u32 {
@@ -65,31 +66,80 @@ impl McpeRandom {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 以下逐条照 x86 libminecraftpe.so 的实现移植，全部用 f32、保持同样的运算顺序，
+// 以保证与原版逐位一致（已在 unicorn 里直接调用原函数对拍）：
+//   ImprovedNoise::_calcValues  @0x7c5130   ImprovedNoise::_grad   @0x7c50b0
+//   ImprovedNoise::_grad2       @0x7c5020   ImprovedNoise::_lerp   @0x7c4ff0
+//   ImprovedNoise::_blendCubeCorners @0x7c51e0
+//   ImprovedNoise::_readArea    @0x7c56e0（含 Java 的 y 缓存怪癖与 ySize==1 的 2D 分支）
+//   PerlinNoise::getRegion      @0x7c6890 / 2D 包装 @0x7c6ad0
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct ImprovedNoise {
-    xo: f64,
-    yo: f64,
-    zo: f64,
-    p: [u8; 512],
+    xo: f32,
+    yo: f32,
+    zo: f32,
+    p: [i32; 512],
+}
+
+/// `_calcValues(v, &i, &fade)`：返回 (i & 255, 小数部分, fade)
+#[inline]
+fn calc(v: f32) -> (i32, f32, f32) {
+    let mut i = v as i32; // cvttss2si
+    let mut fi = i as f32;
+    if fi > v {
+        i -= 1;
+        fi = i as f32;
+    }
+    let f = v - fi;
+    let t = ((6.0f32 * f + -15.0) * f + 10.0) * f;
+    (i & 255, f, (f * f) * t)
 }
 
 #[inline]
-fn fade(t: f64) -> f64 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+fn lerp(t: f32, a: f32, b: f32) -> f32 {
+    (b - a) * t + a
 }
 
 #[inline]
-fn grad(hash: usize, x: f64, y: f64, z: f64) -> f64 {
+fn grad(hash: i32, x: f32, y: f32, z: f32) -> f32 {
     let h = hash & 15;
-    let u = if h < 8 { x } else { y };
-    let v = if h < 4 {
+    let mut u = if h < 8 { x } else { y };
+    let mut v = if h < 4 {
         y
-    } else if h == 12 || h == 14 {
+    } else if hash & 13 == 12 {
         x
     } else {
         z
     };
-    (if h & 1 != 0 { -u } else { u }) + (if h & 2 != 0 { -v } else { v })
+    if hash & 1 != 0 {
+        u = -u;
+    }
+    if hash & 2 != 0 {
+        v = -v;
+    }
+    v + u
+}
+
+#[inline]
+fn grad2(hash: i32, x: f32, z: f32) -> f32 {
+    let mut u = ((1 - ((hash & 8) >> 3)) as f32) * x;
+    let mut v = if hash & 15 <= 3 {
+        0.0
+    } else if hash & 13 == 12 {
+        x
+    } else {
+        z
+    };
+    if hash & 1 != 0 {
+        u = -u;
+    }
+    if hash & 2 != 0 {
+        v = -v;
+    }
+    u + v
 }
 
 impl ImprovedNoise {
@@ -97,54 +147,93 @@ impl ImprovedNoise {
         let xo = rnd.next_float() * 256.0;
         let yo = rnd.next_float() * 256.0;
         let zo = rnd.next_float() * 256.0;
-        let mut perm = [0u8; 256];
-        for (i, v) in perm.iter_mut().enumerate() {
-            *v = i as u8;
+        let mut p = [0i32; 512];
+        for (i, v) in p.iter_mut().take(256).enumerate() {
+            *v = i as i32;
         }
         for i in 0..256usize {
             let j = i + rnd.next_int((256 - i) as u32) as usize;
-            perm.swap(i, j);
+            p.swap(i, j);
+            p[i + 256] = p[i];
         }
-        let mut p = [0u8; 512];
-        p[..256].copy_from_slice(&perm);
-        p[256..].copy_from_slice(&perm);
         Self { xo, yo, zo, p }
     }
 
-    /// 坐标为“世界坐标 + offset”，与 Python `read_area_raw` 的合成方式一致
-    pub fn sample(&self, x: f64, y: f64, z: f64) -> f64 {
-        let x = x + self.xo;
-        let y = y + self.yo;
-        let z = z + self.zo;
-        let xf0 = x.floor();
-        let yf0 = y.floor();
-        let zf0 = z.floor();
-        let dx = x - xf0;
-        let dy = y - yf0;
-        let dz = z - zf0;
-        let ix = (xf0 as i64 & 255) as usize;
-        let iy = (yf0 as i64 & 255) as usize;
-        let iz = (zf0 as i64 & 255) as usize;
-        let u = fade(dx);
-        let v = fade(dy);
-        let w = fade(dz);
-        let p = |i: usize| self.p[i] as usize;
-        let a = p(ix) + iy;
-        let b = p(ix + 1) + iy;
-        let aa = p(a) + iz;
-        let ab = p(a + 1) + iz;
-        let ba = p(b) + iz;
-        let bb = p(b + 1) + iz;
-        let l1 = |t: f64, a: f64, b: f64| a + t * (b - a);
-        let x1 = l1(u, grad(p(aa), dx, dy, dz), grad(p(ba), dx - 1.0, dy, dz));
-        let x2 = l1(u, grad(p(ab), dx, dy - 1.0, dz), grad(p(bb), dx - 1.0, dy - 1.0, dz));
-        let y1 = l1(v, x1, x2);
-        let x3 = l1(u, grad(p(aa + 1), dx, dy, dz - 1.0),
-                  grad(p(ba + 1), dx - 1.0, dy, dz - 1.0));
-        let x4 = l1(u, grad(p(ab + 1), dx, dy - 1.0, dz - 1.0),
-                  grad(p(bb + 1), dx - 1.0, dy - 1.0, dz - 1.0));
-        let y2 = l1(v, x3, x4);
-        l1(w, y1, y2)
+    #[inline]
+    fn pp(&self, i: i32) -> i32 {
+        self.p[i as usize]
+    }
+
+    /// `_blendCubeCorners`：返回 (a, b, c, d) = 四条 x 向插值
+    #[inline]
+    fn blend(&self, fx: f32, fy: f32, fz: f32, ix: i32, iy: i32, iz: i32, tx: f32) -> (f32, f32, f32, f32) {
+        let a_ = self.pp(ix) + iy;
+        let aa = self.pp(a_) + iz;
+        let ab = self.pp(a_ + 1) + iz;
+        let b_ = self.pp(ix + 1) + iy;
+        let ba = self.pp(b_) + iz;
+        let bb = self.pp(b_ + 1) + iz;
+        let (x1, y1, z1) = (fx - 1.0, fy - 1.0, fz - 1.0);
+        let a = lerp(tx, grad(self.pp(aa), fx, fy, fz), grad(self.pp(ba), x1, fy, fz));
+        let b = lerp(tx, grad(self.pp(ab), fx, y1, fz), grad(self.pp(bb), x1, y1, fz));
+        let c = lerp(tx, grad(self.pp(aa + 1), fx, fy, z1), grad(self.pp(ba + 1), x1, fy, z1));
+        let d = lerp(tx, grad(self.pp(ab + 1), fx, y1, z1), grad(self.pp(bb + 1), x1, y1, z1));
+        (a, b, c, d)
+    }
+
+    /// `_readArea(out, pos, xs, ys, zs, scale, amp)`，out 布局 `[x][z][y]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_area(
+        &self,
+        out: &mut [f32],
+        pos: (f32, f32, f32),
+        xs: usize,
+        ys: usize,
+        zs: usize,
+        sc: (f32, f32, f32),
+        amp: f32,
+    ) {
+        let inv = 1.0f32 / amp;
+        if ys == 1 {
+            let mut idx = 0;
+            for i in 0..xs {
+                let (ix, fx, tx) = calc((i as f32 + pos.0) * sc.0 + self.xo);
+                let x1 = fx - 1.0;
+                for k in 0..zs {
+                    let (iz, fz, tz) = calc((k as f32 + pos.2) * sc.2 + self.zo);
+                    let aa = self.pp(self.pp(ix)) + iz;
+                    let ba = self.pp(self.pp(ix + 1)) + iz;
+                    let z1 = fz - 1.0;
+                    let l1 = lerp(tx, grad2(self.pp(aa), fx, fz), grad(self.pp(ba), x1, 0.0, fz));
+                    let l2 = lerp(tx, grad(self.pp(aa + 1), fx, 0.0, z1), grad(self.pp(ba + 1), x1, 0.0, z1));
+                    let v = lerp(tz, l1, l2);
+                    out[idx] += v * inv;
+                    idx += 1;
+                }
+            }
+            return;
+        }
+        let mut prev = -1i32;
+        let (mut a, mut b, mut c, mut d) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut idx = 0;
+        for i in 0..xs {
+            let (ix, fx, tx) = calc((i as f32 + pos.0) * sc.0 + self.xo);
+            for k in 0..zs {
+                let (iz, fz, tz) = calc((k as f32 + pos.2) * sc.2 + self.zo);
+                for j in 0..ys {
+                    let (iy, fy, ty) = calc((j as f32 + pos.1) * sc.1 + self.yo);
+                    if j == 0 || iy != prev {
+                        prev = iy;
+                        (a, b, c, d) = self.blend(fx, fy, fz, ix, iy, iz, tx);
+                    }
+                    let v1 = lerp(ty, a, b);
+                    let v2 = lerp(ty, c, d);
+                    let v = lerp(tz, v1, v2);
+                    out[idx] += v * inv;
+                    idx += 1;
+                }
+            }
+        }
     }
 }
 
@@ -160,46 +249,169 @@ impl OctavesNoise {
         }
     }
 
-    /// 下标 `x * (sz*sy) + z * sy + y`，与 Python 的 `(sx, sz, sy)` 形状一致
+    /// `PerlinNoise::getRegion(out, Vec3 pos, xs, ys, zs, Vec3 scale)`，布局 `[x][z][y]`
     pub fn get_region(
         &self,
-        pos: (f64, f64, f64),
-        sx: usize,
-        sy: usize,
-        sz: usize,
-        scale: (f64, f64, f64),
-    ) -> Vec<f64> {
-        let mut out = vec![0.0f64; sx * sz * sy];
-        let mut amp = 1.0f64;
+        pos: (f32, f32, f32),
+        xs: usize,
+        ys: usize,
+        zs: usize,
+        scale: (f32, f32, f32),
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; xs * ys * zs];
+        let mut amp = 1.0f32;
         for lvl in &self.levels {
-            let inv = 1.0 / amp;
-            for i in 0..sx {
-                let x = (pos.0 + i as f64) * scale.0 * amp;
-                for k in 0..sz {
-                    let z = (pos.2 + k as f64) * scale.2 * amp;
-                    let base = (i * sz + k) * sy;
-                    for j in 0..sy {
-                        let y = (pos.1 + j as f64) * scale.1 * amp;
-                        out[base + j] += lvl.sample(x, y, z) * inv;
-                    }
-                }
-            }
+            let sc = (scale.0 * amp, scale.1 * amp, scale.2 * amp);
+            lvl.read_area(&mut out, pos, xs, ys, zs, sc, amp);
             amp *= 0.5;
+        }
+        out
+    }
+
+    /// `PerlinNoise::getRegion(out, Vec2 pos, xs, zs, Vec2 scale, float)`：
+    /// 转成 3D 调用 pos=(x,10,z)、ys=1、scale=(sx,1,sz)，最后的 float 参数不使用
+    pub fn get_region_2d(&self, pos: (f32, f32), xs: usize, zs: usize, scale: (f32, f32)) -> Vec<f32> {
+        self.get_region((pos.0, 10.0, pos.1), xs, 1, zs, (scale.0, 1.0, scale.1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimplexNoise / PerlinSimplexNoise（地表噪声 +0x2c）
+//   SimplexNoise::SimplexNoise(Random&) @0x7c6eb0（初始化同 ImprovedNoise）
+//   SimplexNoise::_getValue(Vec2)       @0x7efb20
+//   SimplexNoise::_add(...)             @0x7eff00
+//   PerlinSimplexNoise::getRegion(Vec2) @0x7f0000
+// ---------------------------------------------------------------------------
+
+/// `SimplexNoise::F2/G2`（静态初始化写入 bss 的 f32 位模式）
+const F2: f32 = f32::from_bits(0x3ebb67ae);
+const G2: f32 = f32::from_bits(0x3e58658c);
+const GRAD3: [[i32; 3]; 12] = [
+    [1, 1, 0], [-1, 1, 0], [1, -1, 0], [-1, -1, 0],
+    [1, 0, 1], [-1, 0, 1], [1, 0, -1], [-1, 0, -1],
+    [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1],
+];
+
+#[derive(Clone)]
+pub struct SimplexNoise {
+    xo: f32,
+    yo: f32,
+    p: [i32; 512],
+}
+
+#[inline]
+fn fastfloor(v: f32) -> i32 {
+    (v as i32) - (v <= 0.0) as i32
+}
+
+impl SimplexNoise {
+    /// 与 ImprovedNoise 同样消耗 3 次 nextFloat + 256 次 nextInt，但三个偏移按**逆序**存放：
+    /// 第 1 次 → zo、第 2 次 → yo、第 3 次 → xo（已用原版对象内存核对）
+    pub fn new(rnd: &mut McpeRandom) -> Self {
+        let n = ImprovedNoise::new(rnd);
+        Self { xo: n.zo, yo: n.yo, p: n.p }
+    }
+
+    #[inline]
+    fn pp(&self, i: i32) -> i32 {
+        self.p[i as usize]
+    }
+
+    /// `_getValue(Vec2)`，含 ×70
+    pub fn value2(&self, x: f32, y: f32) -> f32 {
+        let s = (y + x) * F2;
+        let i = fastfloor(s + x);
+        let j = fastfloor(s + y);
+        let t = ((i + j) as f32) * G2;
+        let y0 = y - (j as f32 - t);
+        let x0 = x - (i as f32 - t);
+        let (i1, j1) = if x0 > y0 { (1, 0) } else { (0, 1) };
+        let y1 = (G2 - j1 as f32) + y0;
+        let x1 = (G2 - i1 as f32) + x0;
+        let g2m1 = (G2 + G2) + -1.0;
+        let y2 = y0 + g2m1;
+        let x2 = g2m1 + x0;
+        let ii = i & 255;
+        let jj = j & 255;
+        let gi0 = self.pp(self.pp(jj) + ii) % 12;
+        let gi1 = self.pp(self.pp(jj + j1) + ii + i1) % 12;
+        let gi2 = self.pp(ii + self.pp(jj + 1) + 1) % 12;
+        let corner = |t: f32, g: i32, x: f32, y: f32| -> f32 {
+            if t < 0.0 {
+                0.0
+            } else {
+                let t2 = t * t;
+                let gg = GRAD3[g as usize];
+                (t2 * t2) * ((gg[1] as f32) * y + (gg[0] as f32) * x)
+            }
+        };
+        let n0 = corner(0.5 - (y0 * y0 + x0 * x0), gi0, x0, y0);
+        let n1 = corner(0.5 - (y1 * y1 + x1 * x1), gi1, x1, y1);
+        let n2 = corner(0.5 - (y2 * y2 + x2 * x2), gi2, x2, y2);
+        ((n0 + n1) + n2) * 70.0
+    }
+
+    /// `_add(out, x, z, w, h, sx, sz, amp)`，out 布局 `[j*w + k]`
+    #[allow(clippy::too_many_arguments)]
+    fn add(&self, out: &mut [f32], x: f32, z: f32, w: usize, h: usize, sx: f32, sz: f32, amp: f32) {
+        for j in 0..h {
+            let yv = (j as f32 + z) * sz + self.yo;
+            for k in 0..w {
+                let xv = (k as f32 + x) * sx + self.xo;
+                out[j * w + k] += self.value2(xv, yv) * amp;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PerlinSimplexNoise {
+    pub levels: Vec<SimplexNoise>,
+}
+
+impl PerlinSimplexNoise {
+    pub fn new(rnd: &mut McpeRandom, octaves: usize) -> Self {
+        Self {
+            levels: (0..octaves).map(|_| SimplexNoise::new(rnd)).collect(),
+        }
+    }
+
+    /// `getValue(float x, float y)`（@0x7efe30）：Σ value2(x·f, y·f)/f，f 逐级减半，不加偏移
+    pub fn get_value(&self, x: f32, y: f32) -> f32 {
+        let mut sum = 0.0f32;
+        let mut f = 1.0f32;
+        for lvl in &self.levels {
+            let v = lvl.value2(x * f, y * f);
+            sum += v / f;
+            f *= 0.5;
+        }
+        sum
+    }
+
+    /// `getRegion(out, Vec2 pos, w, h, Vec2 scale, f1, f2)`，out `[z*w + x]`
+    pub fn get_region(&self, pos: (f32, f32), w: usize, h: usize, scale: (f32, f32), f1: f32, f2: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; w * h];
+        let (mut m1, mut m2) = (1.0f32, 1.0f32);
+        for lvl in &self.levels {
+            let amp = 0.55f32 / m2;
+            let k = m1 * m2;
+            lvl.add(&mut out, pos.0, pos.1, w, h, scale.0 * k, scale.1 * k, amp);
+            m1 *= f1;
+            m2 *= f2;
         }
         out
     }
 }
 
-/// MCPE 的 7 个噪声对象（构造顺序即随机数消耗顺序）
 #[derive(Clone)]
 pub struct NoiseStack {
-    pub min_limit: OctavesNoise,   // n16a, 16 八度, scale 684.412
-    pub max_limit: OctavesNoise,   // n16b, 16 八度, scale 684.412
-    pub main_noise: OctavesNoise,  // n8,   8 八度,  scale 684.412/80 · /160 · /80
-    pub surface: OctavesNoise,     // n4,   4 八度,  scale 0.0625（地表）
-    pub scale_noise: OctavesNoise, // n10,  10 八度, scale 1.121
-    pub depth_noise: OctavesNoise, // n16c, 16 八度, scale 200
-    pub mob_spawner: OctavesNoise, // n8b,  8 八度
+    pub min_limit: OctavesNoise,   // +0x20 PerlinNoise(16)
+    pub max_limit: OctavesNoise,   // +0x24 PerlinNoise(16)
+    pub main_noise: OctavesNoise,  // +0x28 PerlinNoise(8)
+    pub surface: PerlinSimplexNoise, // +0x2c PerlinSimplexNoise(4)
+    pub scale_noise: OctavesNoise, // +0x30 PerlinNoise(10)
+    pub depth_noise: OctavesNoise, // +0x34 PerlinNoise(16)
+    pub mob_spawner: OctavesNoise, // +0x38 PerlinNoise(8)
 }
 
 impl NoiseStack {
@@ -208,7 +420,7 @@ impl NoiseStack {
         let min_limit = OctavesNoise::new(&mut r, 16);
         let max_limit = OctavesNoise::new(&mut r, 16);
         let main_noise = OctavesNoise::new(&mut r, 8);
-        let surface = OctavesNoise::new(&mut r, 4);
+        let surface = PerlinSimplexNoise::new(&mut r, 4);
         let scale_noise = OctavesNoise::new(&mut r, 10);
         let depth_noise = OctavesNoise::new(&mut r, 16);
         let mob_spawner = OctavesNoise::new(&mut r, 8);
@@ -235,7 +447,7 @@ mod tests {
         assert_eq!(got, vec![1733503684, 3779099160, 3616625770, 2648414837]);
 
         let mut r = McpeRandom::new(1_152_860_609);
-        let f: Vec<f64> = (0..3).map(|_| r.next_float()).collect();
+        let f: Vec<f64> = (0..3).map(|_| r.next_float() as f64).collect();
         assert!((f[0] - 0.403612792).abs() < 1e-9, "{f:?}");
         assert!((f[1] - 0.879890084).abs() < 1e-9, "{f:?}");
         assert!((f[2] - 0.842061281).abs() < 1e-9, "{f:?}");
