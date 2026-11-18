@@ -1,3 +1,6 @@
+# 光照计算线程数：通过 VIOLIN_LIGHT_WORKERS 环境变量设置（正整数）
+# 不设置时按可用逻辑处理器数自动建池，封顶 8；全局共享，所有分片受益
+# 实测 4 线程相比单线程全量光照吞吐约 2 倍
 # 后台区块加载线程数 0 = 按可用逻辑处理器(vCPU)数 上限固定为该数
 io-workers = 0
 # tokio worker 线程数 0 = 按 vCPU 目前通过 TOKIO_WORKER_THREADS 环境变量生效

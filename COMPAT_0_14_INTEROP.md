@@ -143,3 +143,33 @@ let completed = {
 验证：新增回归测试 `populate_survives_target_terrain_eviction`，断言在缓存被填满、
 目标处于淘汰压力下 populate 不 panic 且装饰结果与无干扰时逐字节一致；
 `chunk_manager::tests` 28 项全通过（含跨区块装饰一致性、RTG 村庄顺序无关性）。
+
+## 优化：光照引擎多线程化（吃满多核）
+
+问题：原光照引擎是**全服单线程**——所有 region 的光照任务（新区块全量 Init、挖方块增量
+Update）都排在一个 `light-engine` 线程上串行计算。多核机器上其余核心对此无能为力，
+跑图/大批量地形生成时光照成为单核瓶颈，拖慢区块下发。
+
+改造（`src/level/light/service.rs`）：
+- 单 worker 改为 worker 池：`std::sync::mpsc` 共享队列 + N 个 `light-engine-{i}` 线程，
+  与既有 `ChunkIoPool` 同款模式。任务自带独立 `Snapshot`，各 worker 并行纯 CPU 计算，
+  算完把回执发回发起 region，仍由 region 线程单线程 `apply_light_receipt` 写回——
+  并行只发生在无共享状态的计算阶段，不触碰任何 region/ChunkManager 状态。
+- 默认 worker 数按可用逻辑处理器数自动建池，封顶 8（重 CPU 任务避免超配争抢）；
+  可用环境变量 `VIOLIN_LIGHT_WORKERS=<n>` 覆盖。`start()` 保持无参签名，所有调用点零改动。
+
+并行安全性核对：
+- 光照模块无 `static` / `thread_local` / 共享可变状态，`Engine::init` / `update_blocks`
+  是纯函数；
+- 回执一律发回发起 region 单线程应用，不跨线程碰 ChunkManager；
+- 同一区块 Init 回执到达前不会排 Update（`take_light_jobs` 的 `light_init_in_flight`
+  守卫），同块任务不会并行乱序；跨块任务互不依赖。
+
+验证：
+- 新增 `parallel_matches_serial_results`：同一批快照用 1 worker 与 8 worker 计算，
+  owner 与每块 sky/block 光照 nibble **逐字节一致**，证明并行不改变结果。
+- 新增 `worker_pool_returns_receipts_to_own_channel`：多回执通道不串台、不丢失。
+- 吞吐基准 `bench_parallel_throughput`（`--ignored` 手动运行）：256 块全量光照，
+  1 worker 4.25s / 4 worker 2.11s（**约 2.0×**）/ 8 worker 2.16s。
+  8 线程收益趋平是提交端串行 `Snapshot::grab` 成为新瓶颈（Amdahl），故默认封顶 8。
+- `level::` 全套 284 项测试通过，零失败。
