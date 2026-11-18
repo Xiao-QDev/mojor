@@ -72,14 +72,16 @@ fn add_feature(rnd: &mut McpeRandom, b: &mut Blocks, cx: i32, cz: i32, x: i32, z
     }
     let n = r3 % ((r2 % ((r1 % 40) + 1)) + 1);
     for _ in 0..n {
-        let g1 = rnd.genrand();
-        let g2 = rnd.genrand();
-        let g3 = rnd.genrand();
-        let g4 = rnd.genrand();
+        // 0.14.1 源码是三条独立语句：先 x、再 y（内层先抽）、后 z。
+        //（x86 0.14.3 把它们写成 Vec3 构造参数，GCC 从右往左求值成了 z、y、x。）
+        let gx = rnd.genrand();
+        let gy_in = rnd.genrand();
+        let gy = rnd.genrand();
+        let gz = rnd.genrand();
         let pos = (
-            ((g4 & 15) as i32).wrapping_add(x << 4) as f32,
-            (g3 % ((g2 % 120) + 8)) as f32,
-            ((g1 & 15) as i32).wrapping_add(z << 4) as f32,
+            ((gx & 15) as i32).wrapping_add(x << 4) as f32,
+            (gy % ((gy_in % 120) + 8)) as f32,
+            ((gz & 15) as i32).wrapping_add(z << 4) as f32,
         );
         let mut tunnels = 1;
         if rnd.genrand() & 3 == 0 {
