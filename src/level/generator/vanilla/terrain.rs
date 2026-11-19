@@ -4,7 +4,7 @@ use crate::level::generator::biome;
 use crate::level::generator::genlayer::BiomeGen;
 use crate::level::generator::blocks::{AIR, STILL_WATER, STONE};
 use crate::level::generator::mcpe_noise::NoiseStack;
-use crate::level::generator::populator::{self, ore};
+
 use crate::level::generator::vanilla::surface::SurfaceBuilder;
 use crate::level::generator::random::NukkitRandom;
 use crate::level::generator::world::GenWorld;
@@ -109,6 +109,7 @@ pub struct TerrainGenerator {
     biomes: BiomeGen,
     surface: SurfaceBuilder,
     random: NukkitRandom,
+    deco: crate::level::generator::vanilla::decorator::DecoState,
 }
 
 // biome 链内部有可变随机状态，clone 时重建一份而不是共享
@@ -120,6 +121,7 @@ impl Clone for TerrainGenerator {
             biomes: BiomeGen::new(self.seed as i64),
             surface: self.surface.clone(),
             random: self.random.clone(),
+            deco: Default::default(),
         }
     }
 }
@@ -136,6 +138,7 @@ impl TerrainGenerator {
             biomes,
             surface: SurfaceBuilder::new(seed),
             random,
+            deco: Default::default(),
         }
     }
 
@@ -384,26 +387,16 @@ impl TerrainGenerator {
         // loadChunk：无限世界（RandomLevelSource ctor 的 bool = 0）在地表之后挖洞穴
         if stage >= 2 {
             crate::level::generator::vanilla::caves::apply(chunk, chunk_x, chunk_z, self.seed);
+            // loadChunk 末尾 recalcHeightmap：postProcess 期间读的就是这份高度图
+            crate::level::generator::vanilla::decorate::recalc_heightmap(chunk);
         }
     }
 
     pub fn populate_chunk(&mut self, world: &mut GenWorld, chunk_x: i32, chunk_z: i32) {
-        // RandomLevelSource::postProcess（已移植部分：湖、岩浆湖、结冰）
-        crate::level::generator::vanilla::decorate::post_process(world, chunk_x, chunk_z, self.seed, false);
-
-        // TODO: 以下仍是旧的 Nukkit 风格装饰，待换成原版 biome 装饰器
-        self.random.set_seed(self.chunk_seed(chunk_x, chunk_z));
-
-        ore::populate(world, chunk_x, chunk_z, &mut self.random);
-
-        let biome_id = world
-            .chunk(chunk_x, chunk_z)
-            .map(|chunk| chunk.biome_id(7, 7))
-            .unwrap_or(0);
-        let def = biome::biome(biome_id);
-        for spec in def.populators {
-            populator::run_spec(spec, world, chunk_x, chunk_z, &mut self.random);
-        }
+        // RandomLevelSource::postProcess
+        crate::level::generator::vanilla::decorate::post_process(
+            world, chunk_x, chunk_z, self.seed, false, &mut self.deco,
+        );
     }
 }
 

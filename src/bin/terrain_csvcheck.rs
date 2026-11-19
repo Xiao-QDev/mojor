@@ -39,9 +39,10 @@ fn main() {
             let mut world = GenWorld::new(&mut all);
             g.generate_chunk(&mut world, cx, cz);
         }
+        let mut deco = mojor::level::generator::vanilla::decorator::DecoState::new();
         let mut world = GenWorld::new(&mut all);
         for &(cx, cz) in &chunk_keys {
-            mojor::level::generator::vanilla::decorate::post_process(&mut world, cx, cz, seed, false);
+            mojor::level::generator::vanilla::decorate::post_process(&mut world, cx, cz, seed, false, &mut deco);
         }
     }
     for &(cx, cz) in &chunk_keys {

@@ -1,13 +1,14 @@
 //! 装饰阶段 = `RandomLevelSource::postProcess`，按 MCPE 0.14.1 重建源码移植
 //! （`src/common/world/level/levelgen/RandomLevelSource.cpp`、`feature/LakeFeature.cpp`）。
 //!
-//! 已移植：湖 / 岩浆湖、结冰。
-//! 未移植：村庄、废弃矿井、要塞、神殿（结构内部会重新播种，不影响后面 decorate 的随机数）、
-//! 地牢、biome 装饰器（矿石、树、花草……）、_fixWaterAlongEdges、液体 tick。
+//! 已移植：湖 / 岩浆湖、结冰、biome 装饰器（`decorator.rs`）、_fixWaterAlongEdges、液体 tick。
+//! 未移植：村庄、废弃矿井、要塞、神殿（结构内部会重新播种，不影响后面 decorate 的随机数）、地牢。
 
 use crate::level::generator::blocks::{AIR, DIRT, GRASS, ICE, STILL_LAVA, STILL_WATER, STONE, WATER};
 use crate::level::generator::mcpe_noise::McpeRandom;
 use crate::level::generator::world::GenWorld;
+use super::features::Src;
+use super::liquid;
 
 const LAVA: u8 = 10;
 const DESERT: u8 = 2;
@@ -72,7 +73,14 @@ fn temperature(id: u8) -> f32 {
 }
 
 /// `RandomLevelSource::postProcess` 中已移植的部分
-pub fn post_process(world: &mut GenWorld, chunk_x: i32, chunk_z: i32, seed: u32, skip_caves: bool) {
+pub fn post_process(
+    world: &mut GenWorld,
+    chunk_x: i32,
+    chunk_z: i32,
+    seed: u32,
+    skip_caves: bool,
+    deco: &mut super::decorator::DecoState,
+) {
     let base_x = chunk_x << 4;
     let base_z = chunk_z << 4;
     // source.getBiome(chunk->getMax())：区块的最大角
@@ -120,6 +128,68 @@ pub fn post_process(world: &mut GenWorld, chunk_x: i32, chunk_z: i32, seed: u32,
             if (id == STILL_WATER || id == WATER) && world.meta(x, y, z) == 0 {
                 world.set_block_with_meta(x, y, z, ICE, 0);
             }
+        }
+    }
+
+    // decorate：rng.setSeed(seed ^ (cz*j1 + cx*i1))
+    let mut rng = McpeRandom::new(seed);
+    let i1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
+    let j1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
+    let mix = (chunk_z as u32).wrapping_mul(j1).wrapping_add((chunk_x as u32).wrapping_mul(i1));
+    let mut rng = McpeRandom::new(seed ^ mix);
+    let mut src = Src::new(world, chunk_x, chunk_z);
+    super::decorator::decorate(deco, &mut src, &mut rng, biome, (base_x, 0, base_z));
+    fix_water_along_edges(&mut src, &mut rng);
+    liquid::tick_all(&mut src);
+    if let Some(chunk) = src.world.chunk_mut(chunk_x, chunk_z) {
+        recalc_heightmap(chunk);
+    }
+}
+
+/// `RandomLevelSource::_fixWaterAlongEdges`
+fn fix_water_along_edges(s: &mut Src, r: &mut McpeRandom) {
+    let (bx, bz) = (s.cx << 4, s.cz << 4);
+    let mut edges = Vec::with_capacity(60);
+    for z in 0..16 {
+        edges.push((0, z));
+    }
+    for x in 1..15 {
+        edges.push((x, 0));
+        edges.push((x, 15));
+    }
+    for z in 0..16 {
+        edges.push((15, z));
+    }
+    for (dx, dz) in edges {
+        let (x, z) = (bx + dx, bz + dz);
+        let height = s.heightmap(x, z);
+        let mut prev_solid = true;
+        for y in 0..height {
+            if s.get(x, y, z) == STILL_WATER {
+                if prev_solid {
+                    prev_solid = false;
+                    s.set(x, y, z, WATER, 0);
+                    liquid::queue_add(s, (x, y, z), WATER, 1, r);
+                }
+            } else {
+                prev_solid = true;
+            }
+        }
+    }
+}
+
+/// `LevelChunk::recalcHeightmap` 的高度图部分（按 mLightBlock）
+pub fn recalc_heightmap(chunk: &mut crate::level::format::chunk::Chunk) {
+    for x in 0..16usize {
+        for z in 0..16usize {
+            let mut h = 127usize;
+            while super::blockprops::light_block(chunk.block(x, h - 1, z)) == 0 {
+                h -= 1;
+                if h == 0 {
+                    break;
+                }
+            }
+            chunk.set_height(x, z, h as u8);
         }
     }
 }
