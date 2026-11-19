@@ -40,8 +40,28 @@ fn main() {
             g.generate_chunk(&mut world, cx, cz);
         }
         let mut deco = mojor::level::generator::vanilla::decorator::DecoState::new();
+        // ORDER：装饰顺序（xz 默认 / zx / center / origin / cx,cz）
+        let mut order = chunk_keys.clone();
+        match std::env::var("ORDER").as_deref() {
+            Ok("zx") => order.sort_by_key(|&(x, z)| (z, x)),
+            Ok("center") | Ok("origin") => {
+                let (mx, mz) = if std::env::var("ORDER").as_deref() == Ok("origin") {
+                    (0, 0)
+                } else {
+                    let n = order.len() as i64;
+                    ((order.iter().map(|k| k.0 as i64).sum::<i64>() / n) as i32, (order.iter().map(|k| k.1 as i64).sum::<i64>() / n) as i32)
+                };
+                order.sort_by_key(|&(x, z)| ((x - mx) * (x - mx) + (z - mz) * (z - mz), x, z));
+            }
+            Ok(v) if v.contains(',') => {
+                let p: Vec<i32> = v.split(',').map(|t| t.parse().unwrap()).collect();
+                order.sort_by_key(|&(x, z)| ((x - p[0]) * (x - p[0]) + (z - p[1]) * (z - p[1]), x, z));
+            }
+            _ => {}
+        }
+        let chunk_keys_order = order;
         let mut world = GenWorld::new(&mut all);
-        for &(cx, cz) in &chunk_keys {
+        for &(cx, cz) in &chunk_keys_order {
             mojor::level::generator::vanilla::decorate::post_process(&mut world, cx, cz, seed, false, &mut deco);
         }
     }
