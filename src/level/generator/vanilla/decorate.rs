@@ -72,6 +72,9 @@ fn temperature(id: u8) -> f32 {
     }
 }
 
+/// 对拍用：1 = 在 decorate 之前返回，2 = decorate 之后立即返回（不跑液体 tick）
+pub static DEBUG_STOP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// `RandomLevelSource::postProcess` 中已移植的部分
 pub fn post_process(
     world: &mut GenWorld,
@@ -131,14 +134,25 @@ pub fn post_process(
         }
     }
 
+    let stop = DEBUG_STOP.load(std::sync::atomic::Ordering::Relaxed);
+    if stop == 1 {
+        return;
+    }
     // decorate：rng.setSeed(seed ^ (cz*j1 + cx*i1))
     let mut rng = McpeRandom::new(seed);
     let i1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
     let j1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
     let mix = (chunk_z as u32).wrapping_mul(j1).wrapping_add((chunk_x as u32).wrapping_mul(i1));
     let mut rng = McpeRandom::new(seed ^ mix);
+    if std::env::var("TRACE2").is_ok() {
+        let mut t = rng.clone();
+        println!("START {:#x} {:?}", seed ^ mix, (0..3).map(|_| t.genrand()).collect::<Vec<_>>());
+    }
     let mut src = Src::new(world, chunk_x, chunk_z);
     super::decorator::decorate(deco, &mut src, &mut rng, biome, (base_x, 0, base_z));
+    if stop == 2 {
+        return;
+    }
     fix_water_along_edges(&mut src, &mut rng);
     liquid::tick_all(&mut src);
     if let Some(chunk) = src.world.chunk_mut(chunk_x, chunk_z) {

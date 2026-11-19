@@ -6,12 +6,24 @@
 //! * `ImprovedNoise`：3 个 offset = `nextFloat()*256`，再 256 次 `nextInt(256-i)` 洗牌
 //! * 多八度第 i 层：坐标与 scale 都乘 `0.5^i`，输出乘 `2^i`（div 约定）
 
+#[derive(Clone)]
 pub struct McpeRandom {
     mt: [u32; 624],
     mti: usize,
 }
 
 impl McpeRandom {
+    /// 对拍用：MT 状态下标
+    pub fn mti(&self) -> usize {
+        self.mti
+    }
+
+    /// 全零状态（genrand 恒为 0）。BlockTickingQueue 的 Random 原版用时间做种子，
+    /// 只影响岩浆 tick 的延迟；这里取确定的全零，与模拟器对拍时零初始化的队列一致。
+    pub fn zero_state() -> Self {
+        Self { mt: [0u32; 624], mti: 624 }
+    }
+
     pub fn new(seed: u32) -> Self {
         let mut mt = [0u32; 624];
         mt[0] = seed;

@@ -36,7 +36,7 @@ impl TickQueue {
             heap: Vec::new(),
             current: 0,
             insta: false,
-            rng: McpeRandom::new(0),
+            rng: McpeRandom::zero_state(),
         }
     }
 

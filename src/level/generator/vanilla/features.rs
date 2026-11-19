@@ -11,6 +11,60 @@ use crate::level::generator::world::GenWorld;
 
 pub const PI: f32 = 3.14159274;
 
+static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 构造参数里几个 `nextInt` 的求值顺序：ARM 版（真实存档，0.14.1，重建源码的语句顺序）从左到右；
+/// x86 版 0.14.3（模拟器对拍用）从右到左。默认 ARM。
+pub static X86_ORDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn x86_order() -> bool {
+    X86_ORDER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ARM_SWAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// ARM 版里哪些调用点同样是先 z 后 x（位掩码，按 [`xyz`] 的 site 编号）
+pub fn arm_swap_mask() -> u64 {
+    *ARM_SWAP.get_or_init(|| {
+        std::env::var("ARM_SWAP").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(ARM_SWAP_DEFAULT)
+    })
+}
+
+/// ARM 版（真实存档）里实测为"先 z"的调用点
+pub const ARM_SWAP_DEFAULT: u64 = 0;
+
+/// 按目标平台的求值顺序取三个分量（源码顺序 x、y、z）。`site` 为调用点编号。
+#[inline]
+pub fn xyz<A, B, C>(
+    site: u32,
+    r: &mut McpeRandom,
+    fx: impl FnOnce(&mut McpeRandom) -> A,
+    fy: impl FnOnce(&mut McpeRandom) -> B,
+    fz: impl FnOnce(&mut McpeRandom) -> C,
+) -> (A, B, C) {
+    if x86_order() || arm_swap_mask() >> site & 1 != 0 {
+        let z = fz(r);
+        let y = fy(r);
+        let x = fx(r);
+        (x, y, z)
+    } else {
+        let x = fx(r);
+        let y = fy(r);
+        let z = fz(r);
+        (x, y, z)
+    }
+}
+
+/// 对拍用：环境变量 TRACE=1 时打印 Feature::place 调用（与 decocheck.py 的 TRACE 同格式）
+#[inline]
+pub fn trace(name: &str, p: (i32, i32, i32), r: &McpeRandom) {
+    if *TRACE.get_or_init(|| std::env::var("TRACE").is_ok()) {
+        let mut t = r.clone();
+        println!("TRACE {name} ({}, {}, {}) {} {}", p.0, p.1, p.2, r.mti(), t.genrand());
+    }
+}
+
 /// `Math::sin` / `Math::cos`：65536 项查表
 pub struct SinTable(Box<[f32; 65536]>);
 
@@ -250,6 +304,7 @@ pub fn can_survive(s: &Src, id: u8, x: i32, y: i32, z: i32) -> bool {
 
 /// `OreFeature::place`
 pub fn ore(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8, data: u8, size: i32) {
+    trace("OreFeature", pos, r);
     let angle = r.next_float() * PI;
     let sx = msin(angle) * size as f32 / 8.0;
     let sz = mcos(angle) * size as f32 / 8.0;
@@ -297,6 +352,7 @@ pub fn ore(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8, dat
 
 /// `SandFeature::place`（沙子、砂砾）
 pub fn sand_disk(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8, radius: u32) -> bool {
+    trace("SandFeature", pos, r);
     if s.mat(pos.0, pos.1, pos.2) != mat::WATER {
         return false;
     }
@@ -319,6 +375,7 @@ pub fn sand_disk(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u
 
 /// `ClayFeature::place`
 pub fn clay(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, count: u32) -> bool {
+    trace("ClayFeature", pos, r);
     let id = s.get(pos.0, pos.1, pos.2);
     if bp::material(id) != mat::WATER && id != CLAY {
         return false;
@@ -339,6 +396,18 @@ pub fn clay(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, count: u32) -
     true
 }
 
+/// 同 spread8，但 x86 版是先 z、再 y、后 x（见 [`xyz`]）
+#[inline]
+fn spread8_zyx(site: u32, r: &mut McpeRandom) -> (i32, i32, i32) {
+    xyz(
+        site,
+        r,
+        |r| r.next_int(8) as i32 - r.next_int(8) as i32,
+        |r| r.next_int(4) as i32 - r.next_int(4) as i32,
+        |r| r.next_int(8) as i32 - r.next_int(8) as i32,
+    )
+}
+
 #[inline]
 fn spread8(r: &mut McpeRandom) -> (i32, i32, i32) {
     let dx = r.next_int(8) as i32 - r.next_int(8) as i32;
@@ -349,8 +418,9 @@ fn spread8(r: &mut McpeRandom) -> (i32, i32, i32) {
 
 /// `FlowerFeature::placeFlower`
 pub fn place_flower(s: &mut Src, pos: (i32, i32, i32), id: u8, data: u8, r: &mut McpeRandom) {
+    trace("placeFlower", pos, r);
     for _ in 0..64 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(11, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if !s.is_empty(x, y, z) {
             continue;
@@ -364,6 +434,9 @@ pub fn place_flower(s: &mut Src, pos: (i32, i32, i32), id: u8, data: u8, r: &mut
 
 /// `TallGrassFeature::place(source, pos, random, count, range)`
 pub fn tall_grass(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, data: u8, count: i32, range: u32) {
+    if count == 90 {
+        trace("TallGrassFeature", pos, r);
+    }
     let (px, mut py, pz) = pos;
     loop {
         let id = s.get(px, py, pz);
@@ -373,9 +446,12 @@ pub fn tall_grass(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, data: u
         py -= 1;
     }
     for _ in 0..count {
-        let dx = r.next_int(range) as i32 - r.next_int(range) as i32;
-        let dy = r.next_int(4) as i32 - r.next_int(4) as i32;
-        let dz = r.next_int(range) as i32 - r.next_int(range) as i32;
+        let (dx, dy, dz) = xyz(
+            17,            r,
+            |r| r.next_int(range) as i32 - r.next_int(range) as i32,
+            |r| r.next_int(4) as i32 - r.next_int(4) as i32,
+            |r| r.next_int(range) as i32 - r.next_int(range) as i32,
+        );
         let (x, y, z) = (px + dx, py + dy, pz + dz);
         if s.get(x, y, z) == AIR && can_survive(s, TALLGRASS, x, y, z) {
             s.set(x, y, z, TALLGRASS, data);
@@ -387,7 +463,7 @@ pub fn tall_grass(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, data: u
 pub fn double_plant(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, data: u8) -> bool {
     let mut placed = false;
     for _ in 0..64 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(10, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if s.is_empty(x, y, z)
             && y <= 125
@@ -405,6 +481,7 @@ pub fn double_plant(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, data:
 
 /// `DeadBushFeature::place`
 pub fn dead_bush(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("DeadBushFeature", pos, r);
     let (px, mut py, pz) = pos;
     let mut m: Option<u8> = None;
     while m.map_or(true, |m| m == mat::AIR || m == mat::LEAVES) && py > 0 {
@@ -412,7 +489,7 @@ pub fn dead_bush(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
         py -= 1;
     }
     for _ in 0..4 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(13, r);
         let (x, y, z) = (px + dx, py + dy, pz + dz);
         if s.is_empty(x, y, z) && can_survive(s, DEADBUSH, x, y, z) {
             s.set(x, y, z, DEADBUSH, 0);
@@ -437,12 +514,15 @@ fn reed_ok(s: &Src, x: i32, y: i32, z: i32) -> bool {
 
 /// `ReedsFeature::place`
 pub fn reeds(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("ReedsFeature", pos, r);
     for _ in 0..20 {
-        let d1 = r.next_int(4) as i32;
-        let d2 = r.next_int(4) as i32;
-        let d3 = r.next_int(4) as i32;
-        let d4 = r.next_int(4) as i32;
-        let (x, y, z) = (pos.0 + d1 - d2, pos.1, pos.2 + d3 - d4);
+        let (dx, _, dz) = xyz(
+            18,            r,
+            |r| r.next_int(4) as i32 - r.next_int(4) as i32,
+            |_| (),
+            |r| r.next_int(4) as i32 - r.next_int(4) as i32,
+        );
+        let (x, y, z) = (pos.0 + dx, pos.1, pos.2 + dz);
         if !s.is_empty(x, y, z) {
             continue;
         }
@@ -480,8 +560,9 @@ fn cactus_ok(s: &Src, x: i32, y: i32, z: i32) -> bool {
 
 /// `CactusFeature::place`
 pub fn cactus(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("CactusFeature", pos, r);
     for _ in 0..10 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(14, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if s.is_empty(x, y, z) {
             let inner = r.next_int(3) + 1;
@@ -497,8 +578,9 @@ pub fn cactus(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
 
 /// `PumpkinFeature::place`
 pub fn pumpkin(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("PumpkinFeature", pos, r);
     for _ in 0..64 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(15, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if s.is_empty(x, y, z) && s.get(x, y - 1, z) == GRASS && {
             let id = s.get(x, y, z);
@@ -512,8 +594,9 @@ pub fn pumpkin(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
 
 /// `MelonFeature::place`
 pub fn melon(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("MelonFeature", pos, r);
     for _ in 0..64 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(16, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if base_may_place(s, x, y, z) && s.get(x, y - 1, z) == GRASS {
             s.set(x, y, z, MELON, 0);
@@ -523,8 +606,9 @@ pub fn melon(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
 
 /// `WaterlilyFeature::place`
 pub fn waterlily(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("WaterlilyFeature", pos, r);
     for _ in 0..10 {
-        let (dx, dy, dz) = spread8(r);
+        let (dx, dy, dz) = spread8_zyx(12, r);
         let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
         if s.is_empty(x, y, z) && base_may_place(s, x, y, z) && s.get(x, y - 1, z) == STILL_WATER {
             s.set(x, y, z, WATERLILY, 0);
@@ -534,6 +618,7 @@ pub fn waterlily(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
 
 /// `SpringFeature::place`
 pub fn spring(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8) {
+    trace("SpringFeature", pos, r);
     let (x, y, z) = pos;
     if s.get(x, y + 1, z) != STONE || s.get(x, y - 1, z) != STONE {
         return;
@@ -564,6 +649,7 @@ pub fn spring(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8) 
 
 /// `BlockBlobFeature::place`
 pub fn block_blob(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: u8, radius: i32) -> bool {
+    trace("BlockBlobFeature", pos, r);
     let (mut x, mut y, mut z) = pos;
     while y > 3 {
         if !s.is_empty(x, y - 1, z) {
@@ -595,9 +681,12 @@ pub fn block_blob(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: 
                 }
             }
         }
-        let ox = -(radius + 1) + r.next_int((2 + radius * 2) as u32) as i32;
-        let oy = r.next_int(2) as i32;
-        let oz = -(radius + 1) + r.next_int((2 + radius * 2) as u32) as i32;
+        let (ox, oy, oz) = xyz(
+            19,            r,
+            |r| -(radius + 1) + r.next_int((2 + radius * 2) as u32) as i32,
+            |r| r.next_int(2) as i32,
+            |r| -(radius + 1) + r.next_int((2 + radius * 2) as u32) as i32,
+        );
         x += ox;
         y -= oy;
         z += oz;
@@ -608,6 +697,7 @@ pub fn block_blob(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, block: 
 
 /// `IcePatchFeature::place`
 pub fn ice_patch(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom, radius: u32) -> bool {
+    trace("IcePatchFeature", pos, r);
     let (px, mut py, pz) = pos;
     while s.is_empty(px, py, pz) && py > 2 {
         py -= 1;
@@ -638,6 +728,7 @@ fn ice_spike_ok(id: u8) -> bool {
 
 /// `IceSpikeFeature::place`
 pub fn ice_spike(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) -> bool {
+    trace("IceSpikeFeature", pos, r);
     let (bx, mut by, bz) = pos;
     while s.is_empty(bx, by, bz) && by > 2 {
         by -= 1;
@@ -764,6 +855,7 @@ fn huge_mushroom_soil(id: u8) -> bool {
 
 /// `HugeMushroomFeature::place`（type = -1：随机）
 pub fn huge_mushroom(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) -> bool {
+    trace("HugeMushroomFeature", pos, r);
     let (ox, mut oy, oz) = pos;
     let kind = r.next_int(2) as i32;
     let mut height = r.next_int(3) as i32 + 4;
@@ -902,6 +994,7 @@ fn vine_neighbor_ok(id: u8) -> bool {
 
 /// `VinesFeature::place`
 pub fn vines(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) {
+    trace("VinesFeature", pos, r);
     const FACING_DIRECTION: [i32; 6] = [255, 255, 2, 0, 1, 3];
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
     let (mut x, mut y, mut z) = pos;
@@ -962,6 +1055,24 @@ pub enum Tree {
 }
 
 pub fn place_tree(s: &mut Src, tree: Tree, pos: (i32, i32, i32), r: &mut McpeRandom) -> bool {
+    let name = match tree {
+        Tree::Oak => "OakFeature",
+        Tree::Birch { .. } => "BirchFeature",
+        Tree::Spruce => "SpruceFeature",
+        Tree::Pine => "PineFeature",
+        Tree::Roof => "RoofTreeFeature",
+        Tree::MegaPine { .. } => "MegaPineTreeFeature",
+        Tree::Fancy => "FancyTreeFeature",
+        Tree::Swamp => "SwampTreeFeature",
+        Tree::GroundBush => "GroundBushFeature",
+        Tree::Jungle => "JungleTreeFeature",
+        Tree::MegaJungle => "MegaJungleTreeFeature",
+        Tree::Savanna => "SavannaTreeFeature",
+        Tree::HugeMushroom => "",
+    };
+    if !name.is_empty() {
+        trace(name, pos, r);
+    }
     match tree {
         Tree::Oak => {
             let h = r.next_int(3) as i32 + 4;
@@ -1477,6 +1588,9 @@ fn ground_bush(s: &mut Src, pos: (i32, i32, i32), r: &mut McpeRandom) -> bool {
         py -= 1;
     }
     let ground = s.get(px, py, pz);
+    if std::env::var("TRACE2").is_ok() {
+        println!("BUSH ground {ground} at y {py} start {:?} col {:?}", pos, (55..70).map(|y| s.get(px, y, pz)).collect::<Vec<_>>());
+    }
     if ground == DIRT || ground == GRASS {
         s.set(px, py, pz, LOG, 3);
         for y in py..py + 3 {

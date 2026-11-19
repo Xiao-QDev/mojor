@@ -1,7 +1,7 @@
 //! `BiomeDecorator::decorate` 与各 biome 的 decorate / getTreeFeature / getGrassFeature /
 //! getRandomFlowerTypeAndData 覆写（MCPE 0.14.1 `biome/*.cpp`）。
 
-use super::features::{self as f, Src, Tree};
+use super::features::{self as f, xyz, Src, Tree};
 use crate::level::generator::mcpe_noise::{McpeRandom, PerlinSimplexNoise};
 
 /// 一个 biome 的 BiomeDecorator 计数器
@@ -120,7 +120,11 @@ pub fn biome_info(id: u8) -> (Kind, Counters) {
             c.clay = 1;
             Kind::Swamp
         }
-        12 | 13 => Kind::Ice { spikes: false },
+        12 | 13 => {
+            // 重建源码里没有，原版二进制（tools/mcpe_emu/biome_deco.py）是 0.01
+            c.tree_density = 0.01;
+            Kind::Ice { spikes: false }
+        }
         140 => Kind::Ice { spikes: true },
         14 | 15 => {
             c.tree_density = -100.0;
@@ -365,15 +369,20 @@ fn depth_span(
     max_y: i32,
 ) {
     for _ in 0..count {
-        let dx = r.next_int(16) as i32;
-        let dy = r.next_int((max_y - min_y) as u32) as i32 + min_y;
-        let dz = r.next_int(16) as i32;
+        // 三个 nextInt 写在 BlockPos 构造参数里：求值顺序随平台（见 features::xyz）
+        let (dx, dy, dz) = xyz(
+            0,
+            r,
+            |r| r.next_int(16) as i32,
+            |r| r.next_int((max_y - min_y) as u32) as i32 + min_y,
+            |r| r.next_int(16) as i32,
+        );
         f::ore(s, (o.0 + dx, o.1 + dy, o.2 + dz), r, ore.0, ore.1, ore.2);
     }
 }
 
 /// `BiomeDecorator::decorateOres`
-fn decorate_ores(s: &mut Src, r: &mut McpeRandom, o: (i32, i32, i32)) {
+fn decorate_ores(s: &mut Src, r: &mut McpeRandom, o: (i32, i32, i32), mesa: bool) {
     depth_span(s, r, o, 10, (f::DIRT, 0, 33), 0, 128);
     depth_span(s, r, o, 8, (f::GRAVEL, 0, 33), 0, 128);
     if r.next_int(16) == 0 {
@@ -388,17 +397,27 @@ fn decorate_ores(s: &mut Src, r: &mut McpeRandom, o: (i32, i32, i32)) {
     depth_span(s, r, o, 8, (73, 0, 8), 0, 16);
     depth_span(s, r, o, 1, (56, 0, 8), 0, 16);
     // decorateDepthAverage(lapis, 16, 16)
-    let dx = r.next_int(16) as i32;
-    let a = r.next_int(16) as i32;
-    let b = r.next_int(16) as i32;
-    let dy = a + b + 16 - 16;
-    let dz = r.next_int(16) as i32;
+    let (dx, dy, dz) = xyz(
+        1,
+        r,
+        |r| r.next_int(16) as i32,
+        |r| {
+            let a = r.next_int(16) as i32;
+            let b = r.next_int(16) as i32;
+            a + b + 16 - 16
+        },
+        |r| r.next_int(16) as i32,
+    );
     f::ore(s, (o.0 + dx, o.1 + dy, o.2 + dz), r, 21, 0, 7);
+    // MesaBiome::Decorator::decorateOres：额外 20 次金矿
+    if mesa {
+        depth_span(s, r, o, 20, (14, 0, 9), 32, 80);
+    }
 }
 
 /// `BiomeDecorator::decorate(source, random, biome, origin, skipCaves, FLT_MAX)`
 fn decorator_decorate(st: &DecoState, s: &mut Src, r: &mut McpeRandom, c: &Counters, kind: Kind, o: (i32, i32, i32)) {
-    decorate_ores(s, r, o);
+    decorate_ores(s, r, o, kind == Kind::Mesa);
     for _ in 0..c.sand {
         let x = o.0 + r.next_int(16) as i32;
         let z = o.2 + r.next_int(16) as i32;
@@ -435,8 +454,8 @@ fn decorator_decorate(st: &DecoState, s: &mut Src, r: &mut McpeRandom, c: &Count
         }
         for _ in 0..trees {
             let tree = tree_feature(kind, r);
-            let x = o.0 + 1 + r.next_int(14) as i32;
-            let z = o.2 + 1 + r.next_int(14) as i32;
+            // _getRandomTreePosition
+            let (x, _, z) = xyz(2, r, |r| o.0 + 1 + r.next_int(14) as i32, |_| (), |r| o.2 + 1 + r.next_int(14) as i32);
             let pos = (x, s.heightmap(x, z), z);
             f::place_tree(s, tree, pos, r);
             f::tall_grass(s, pos, r, 1, 23, 3);
@@ -540,21 +559,41 @@ fn decorator_decorate(st: &DecoState, s: &mut Src, r: &mut McpeRandom, c: &Count
     }
     // distance = FLT_MAX：泉水总是生成
     for _ in 0..50 {
-        let x = o.0 + r.next_int(16) as i32;
-        let inner = r.next_int(120) + 8;
-        let y = r.next_int(inner) as i32;
-        let z = o.2 + r.next_int(16) as i32;
+        let (x, y, z) = xyz(
+            3,
+            r,
+            |r| o.0 + r.next_int(16) as i32,
+            |r| {
+                let inner = r.next_int(120) + 8;
+                r.next_int(inner) as i32
+            },
+            |r| o.2 + r.next_int(16) as i32,
+        );
         f::spring(s, (x, o.1 + y, z), r, f::FLOWING_WATER);
     }
     for _ in 0..20 {
-        let x = o.0 + r.next_int(16) as i32;
-        let a = r.next_int(112) + 8;
-        let b = r.next_int(a) + 8;
-        let y = r.next_int(b) as i32;
-        let z = o.2 + r.next_int(16) as i32;
+        let (x, y, z) = xyz(
+            4,
+            r,
+            |r| o.0 + r.next_int(16) as i32,
+            |r| {
+                let a = r.next_int(112) + 8;
+                let b = r.next_int(a) + 8;
+                r.next_int(b) as i32
+            },
+            |r| o.2 + r.next_int(16) as i32,
+        );
         f::spring(s, (x, o.1 + y, z), r, f::FLOWING_LAVA);
     }
-    // FoliageColor::buildGrassColor：每列一次 nextInt(8)，之后不再用这个随机数，略
+    // FoliageColor::buildGrassColor：每列一次 nextInt(8)（只改草色）。
+    // 丛林、山地、沙漠的 decorate 在这之后还要继续用这个随机数，所以必须照样消耗。
+    if std::env::var("TRACE2").is_ok() {
+        let mut t = r.clone();
+        println!("PRERAW {} {:?}", r.mti(), (0..4).map(|_| t.genrand()).collect::<Vec<_>>());
+    }
+    for _ in 0..256 {
+        r.next_int(8);
+    }
 }
 
 /// `biome->decorate(&source, random, chunkMin, skipCaves=false, FLT_MAX)`
@@ -645,15 +684,13 @@ pub fn decorate(st: &mut DecoState, s: &mut Src, r: &mut McpeRandom, biome: u8, 
             if t == 1 || t == 2 {
                 let count = r.next_int(3);
                 for _ in 0..count {
-                    let dx = r.next_int(16) as i32;
-                    let dz = r.next_int(16) as i32;
+                    let (dx, _, dz) = xyz(6, r, |r| r.next_int(16) as i32, |_| (), |r| r.next_int(16) as i32);
                     let (x, z) = (o.0 + dx, o.2 + dz);
                     let pos = (x, s.heightmap(x, z), z);
                     f::block_blob(s, pos, r, f::MOSSY_COBBLE, 0);
                 }
             }
-            let dx = r.next_int(16) as i32;
-            let dz = r.next_int(16) as i32;
+            let (dx, _, dz) = xyz(5, r, |r| r.next_int(16) as i32, |_| (), |r| r.next_int(16) as i32);
             let (x, z) = (o.0 + dx, o.2 + dz);
             let pos = (x, s.heightmap(x, z), z);
             f::double_plant(s, pos, r, 3);
@@ -684,22 +721,19 @@ pub fn decorate(st: &mut DecoState, s: &mut Src, r: &mut McpeRandom, biome: u8, 
             let c = st.counters(biome);
             decorator_decorate(st, s, r, &c, kind, o);
             if r.next_int(500) == 0 {
-                let dx = r.next_int(16) as i32;
-                let dz = r.next_int(16) as i32;
+                let (dx, _, dz) = xyz(9, r, |r| r.next_int(16) as i32, |_| (), |r| r.next_int(16) as i32);
                 f::desert_well(s, (o.0 + dx, o.1 + 128, o.2 + dz));
             }
         }
         Kind::Ice { spikes } => {
             if spikes {
                 for _ in 0..3 {
-                    let x = o.0 + r.next_int(16) as i32;
-                    let z = o.2 + r.next_int(16) as i32;
+                    let (x, _, z) = xyz(7, r, |r| o.0 + r.next_int(16) as i32, |_| (), |r| o.2 + r.next_int(16) as i32);
                     let pos = (x, s.heightmap(x, z), z);
                     f::ice_spike(s, pos, r);
                 }
                 for _ in 0..2 {
-                    let x = o.0 + r.next_int(16) as i32;
-                    let z = o.2 + r.next_int(16) as i32;
+                    let (x, _, z) = xyz(8, r, |r| o.0 + r.next_int(16) as i32, |_| (), |r| o.2 + r.next_int(16) as i32);
                     let pos = (x, s.heightmap(x, z), z);
                     f::ice_patch(s, pos, r, 4);
                 }
@@ -710,6 +744,10 @@ pub fn decorate(st: &mut DecoState, s: &mut Src, r: &mut McpeRandom, biome: u8, 
         Kind::Jungle { .. } => {
             let c = st.counters(biome);
             decorator_decorate(st, s, r, &c, kind, o);
+            if std::env::var("TRACE2").is_ok() {
+                let mut t = r.clone();
+                println!("RAW {:?}", (0..8).map(|_| t.genrand()).collect::<Vec<_>>());
+            }
             let dx = r.next_int(16) as i32;
             let dz = r.next_int(16) as i32;
             let (x, z) = (o.0 + dx, o.2 + dz);
