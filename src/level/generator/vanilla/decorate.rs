@@ -115,6 +115,13 @@ pub fn post_process(
         }
     }
 
+    // 结构：村庄、矿井、要塞、神殿尚未移植（见 structures.rs）；地牢在结冰之前
+    {
+        let mut monster_rng = McpeRandom::new(seed ^ structure_mix(seed, chunk_x, chunk_z));
+        let mut src = Src::new(world, chunk_x, chunk_z);
+        super::structures::dungeons(&mut src, &mut monster_rng, base_x, base_z);
+    }
+
     // 结冰：每列最高的"挡雨"方块下面一格若是静止水（数据 0）且 biome 温度 ≤ 0.15 → 冰
     for dx in 0..16 {
         for dz in 0..16 {
@@ -139,15 +146,7 @@ pub fn post_process(
         return;
     }
     // decorate：rng.setSeed(seed ^ (cz*j1 + cx*i1))
-    let mut rng = McpeRandom::new(seed);
-    let i1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
-    let j1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
-    let mix = (chunk_z as u32).wrapping_mul(j1).wrapping_add((chunk_x as u32).wrapping_mul(i1));
-    let mut rng = McpeRandom::new(seed ^ mix);
-    if std::env::var("TRACE2").is_ok() {
-        let mut t = rng.clone();
-        println!("START {:#x} {:?}", seed ^ mix, (0..3).map(|_| t.genrand()).collect::<Vec<_>>());
-    }
+    let mut rng = McpeRandom::new(seed ^ structure_mix(seed, chunk_x, chunk_z));
     let mut src = Src::new(world, chunk_x, chunk_z);
     super::decorator::decorate(deco, &mut src, &mut rng, biome, (base_x, 0, base_z));
     if stop == 2 {
@@ -158,6 +157,14 @@ pub fn post_process(
     if let Some(chunk) = src.world.chunk_mut(chunk_x, chunk_z) {
         recalc_heightmap(chunk);
     }
+}
+
+/// `cz*j1 + cx*i1`：结构与装饰共用的区块种子（i1、j1 由世界种子的两次 nextInt 得到）
+fn structure_mix(seed: u32, chunk_x: i32, chunk_z: i32) -> u32 {
+    let mut rng = McpeRandom::new(seed);
+    let i1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
+    let j1 = ((rng.genrand() >> 1) as i32 / 2 * 2 + 1) as u32;
+    (chunk_z as u32).wrapping_mul(j1).wrapping_add((chunk_x as u32).wrapping_mul(i1))
 }
 
 /// `RandomLevelSource::_fixWaterAlongEdges`
